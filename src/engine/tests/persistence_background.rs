@@ -7673,6 +7673,449 @@ fn real_post_flush_publication_invalidates_a_retained_compaction_fence_before_ma
 }
 
 #[test]
+fn finite_background_flush_finishes_post_flush_clean_fence_before_staging_a_root() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let mut options = base_storage_test_options(TimestampPrecision::Seconds, None);
+    options.retention_enforced = false;
+    options.background_threads_enabled = false;
+    options.maintenance_max_items_per_pass = 1;
+    options.maintenance_max_bytes_per_pass = 1024 * 1024;
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        1,
+        None,
+        Some(lane_path.clone()),
+        None,
+        1,
+        options,
+    )
+    .unwrap();
+
+    storage
+        .insert_rows(&[Row::new(
+            "bounded_flush_clean_fence",
+            DataPoint::new(1, 1.0),
+        )])
+        .unwrap();
+    assert_eq!(storage.chunks.pending_sealed_chunks.read().len(), 1);
+
+    let marker_dir = temp_dir
+        .path()
+        .join(super::super::maintenance::POST_FLUSH_REPLACEMENT_DIR_NAME);
+    std::fs::create_dir_all(&marker_dir).unwrap();
+    std::fs::write(marker_dir.join("operator-owned"), b"keep").unwrap();
+
+    let staged_roots = Arc::new(AtomicUsize::new(0));
+    storage.set_persist_post_publish_hook({
+        let staged_roots = Arc::clone(&staged_roots);
+        move |roots| {
+            staged_roots.fetch_add(roots.len(), Ordering::SeqCst);
+        }
+    });
+
+    let first = storage
+        .persist_segment_background_bounded_with_outcome()
+        .unwrap();
+    assert!(!first.persisted);
+    assert_eq!(first.segments, 0);
+    assert_eq!(staged_roots.load(Ordering::SeqCst), 0);
+    assert!(load_segments_for_level(&lane_path, 0).unwrap().is_empty());
+    assert!(storage.chunks.persisted_chunk_watermarks.read().is_empty());
+    assert_eq!(storage.chunks.pending_sealed_chunks.read().len(), 1);
+    assert!(storage
+        .coordination
+        .background_post_flush_clean_fence_cursor
+        .lock()
+        .has_active_scan());
+    let clean_fence_staging_bytes = storage
+        .memory_observability_snapshot()
+        .remote_catalog_staging_bytes;
+    assert!(
+        clean_fence_staging_bytes > 0,
+        "the partial clean fence must retain its accounted directory cursor"
+    );
+
+    let second = storage
+        .persist_segment_background_bounded_with_outcome()
+        .unwrap();
+    assert!(second.persisted);
+    assert_eq!(second.segments, 1);
+    assert_eq!(second.chunks, 1);
+    assert_eq!(staged_roots.load(Ordering::SeqCst), 1);
+    assert_eq!(load_segments_for_level(&lane_path, 0).unwrap().len(), 1);
+    assert_eq!(storage.chunks.persisted_chunk_watermarks.read().len(), 1);
+    assert!(storage.chunks.pending_sealed_chunks.read().is_empty());
+    assert!(!storage
+        .coordination
+        .background_post_flush_clean_fence_cursor
+        .lock()
+        .has_active_scan());
+    assert_eq!(
+        storage
+            .memory_observability_snapshot()
+            .remote_catalog_staging_bytes,
+        0,
+        "the terminal fence must release its retained cursor before publication"
+    );
+
+    storage.clear_persist_post_publish_hook();
+    storage.close().unwrap();
+}
+
+#[test]
+fn expert_unlimited_background_flush_fences_before_staging_a_root() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let mut options = base_storage_test_options(TimestampPrecision::Seconds, None);
+    options.retention_enforced = false;
+    options.background_threads_enabled = false;
+    options.maintenance_max_items_per_pass = usize::MAX;
+    options.maintenance_max_bytes_per_pass = u64::MAX;
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        1,
+        None,
+        Some(lane_path.clone()),
+        None,
+        1,
+        options,
+    )
+    .unwrap();
+
+    storage
+        .insert_rows(&[Row::new(
+            "unlimited_flush_clean_fence",
+            DataPoint::new(1, 1.0),
+        )])
+        .unwrap();
+    let marker_dir = temp_dir
+        .path()
+        .join(super::super::maintenance::POST_FLUSH_REPLACEMENT_DIR_NAME);
+    std::fs::create_dir_all(&marker_dir).unwrap();
+    let marker_path = marker_dir.join("transaction-0000000000000001-0000000000000002.json");
+    std::fs::write(&marker_path, b"pending").unwrap();
+
+    let staged_roots = Arc::new(AtomicUsize::new(0));
+    storage.set_persist_post_publish_hook({
+        let staged_roots = Arc::clone(&staged_roots);
+        move |roots| {
+            staged_roots.fetch_add(roots.len(), Ordering::SeqCst);
+        }
+    });
+
+    let error = storage
+        .persist_segment_background_bounded_with_outcome()
+        .expect_err("a pending replacement must fence unlimited flush before root staging");
+    assert!(error
+        .to_string()
+        .contains("durable post-flush replacement is pending"));
+    assert_eq!(staged_roots.load(Ordering::SeqCst), 0);
+    assert!(load_segments_for_level(&lane_path, 0).unwrap().is_empty());
+    assert!(storage.chunks.persisted_chunk_watermarks.read().is_empty());
+    assert_eq!(storage.chunks.pending_sealed_chunks.read().len(), 1);
+    assert!(!storage
+        .coordination
+        .background_post_flush_clean_fence_cursor
+        .lock()
+        .has_active_scan());
+    assert_eq!(
+        storage
+            .memory_observability_snapshot()
+            .remote_catalog_staging_bytes,
+        0
+    );
+
+    std::fs::remove_file(marker_path).unwrap();
+
+    let outcome = storage
+        .persist_segment_background_bounded_with_outcome()
+        .unwrap();
+    assert!(outcome.persisted);
+    assert_eq!(outcome.chunks, 1);
+    assert_eq!(staged_roots.load(Ordering::SeqCst), 1);
+    assert_eq!(load_segments_for_level(&lane_path, 0).unwrap().len(), 1);
+    assert!(!storage
+        .coordination
+        .background_post_flush_clean_fence_cursor
+        .lock()
+        .has_active_scan());
+    assert_eq!(
+        storage
+            .memory_observability_snapshot()
+            .remote_catalog_staging_bytes,
+        0
+    );
+
+    storage.clear_persist_post_publish_hook();
+    storage.close().unwrap();
+}
+
+#[test]
+fn expert_unlimited_reduced_remainder_retains_the_exhaustive_post_flush_fence() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let mut options = base_storage_test_options(TimestampPrecision::Seconds, None);
+    options.retention_enforced = false;
+    options.background_threads_enabled = false;
+    options.maintenance_max_items_per_pass = usize::MAX;
+    options.maintenance_max_bytes_per_pass = u64::MAX;
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        1,
+        None,
+        Some(lane_path.clone()),
+        None,
+        1,
+        options,
+    )
+    .unwrap();
+
+    storage
+        .insert_rows(&[Row::new(
+            "unlimited_reduced_remainder_clean_fence",
+            DataPoint::new(1, 1.0),
+        )])
+        .unwrap();
+    let marker_dir = temp_dir
+        .path()
+        .join(super::super::maintenance::POST_FLUSH_REPLACEMENT_DIR_NAME);
+    std::fs::create_dir_all(&marker_dir).unwrap();
+    std::fs::write(marker_dir.join("operator-owned"), b"keep").unwrap();
+
+    let staged_roots = Arc::new(AtomicUsize::new(0));
+    storage.set_persist_post_publish_hook({
+        let staged_roots = Arc::clone(&staged_roots);
+        move |roots| {
+            staged_roots.fetch_add(roots.len(), Ordering::SeqCst);
+        }
+    });
+
+    let outcome = storage
+        .persist_segment_background_bounded_with_limits(usize::MAX - 1, u64::MAX - 1)
+        .unwrap();
+    assert!(outcome.persisted);
+    assert_eq!(outcome.chunks, 1);
+    assert_eq!(outcome.segments, 1);
+    assert_eq!(staged_roots.load(Ordering::SeqCst), 1);
+    assert_eq!(load_segments_for_level(&lane_path, 0).unwrap().len(), 1);
+    assert!(storage.chunks.pending_sealed_chunks.read().is_empty());
+    assert!(!storage
+        .coordination
+        .background_post_flush_clean_fence_cursor
+        .lock()
+        .has_active_scan());
+    assert_eq!(
+        storage
+            .memory_observability_snapshot()
+            .remote_catalog_staging_bytes,
+        0
+    );
+
+    storage.clear_persist_post_publish_hook();
+    storage.close().unwrap();
+}
+
+#[test]
+fn finite_unknown_dirty_catalog_finishes_post_flush_clean_fence_before_scanning() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let storage = bounded_catalog_refresh_storage(&lane_path, 2, 1, 1024 * 1024);
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("bounded_catalog_clean_fence", &[])
+        .unwrap()
+        .series_id;
+    write_numeric_segment_to_path(&lane_path, &registry, series_id, 0, 1, &[(1, 1.0)]);
+
+    let marker_dir = temp_dir
+        .path()
+        .join(super::super::maintenance::POST_FLUSH_REPLACEMENT_DIR_NAME);
+    std::fs::create_dir_all(&marker_dir).unwrap();
+    std::fs::write(marker_dir.join("operator-owned"), b"keep").unwrap();
+
+    let inventory_scans = Arc::new(AtomicUsize::new(0));
+    storage.set_full_inventory_scan_hook({
+        let inventory_scans = Arc::clone(&inventory_scans);
+        move || {
+            inventory_scans.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    storage
+        .persisted
+        .persisted_index_dirty
+        .store(true, Ordering::SeqCst);
+
+    storage
+        .sync_persisted_segments_from_disk_if_dirty()
+        .unwrap();
+    assert!(storage
+        .persisted
+        .persisted_index_dirty
+        .load(Ordering::SeqCst));
+    assert!(storage
+        .persisted
+        .persisted_index
+        .read()
+        .segments_by_root
+        .is_empty());
+    assert_eq!(inventory_scans.load(Ordering::SeqCst), 0);
+    assert!(storage
+        .coordination
+        .background_post_flush_clean_fence_cursor
+        .lock()
+        .has_active_scan());
+    let clean_fence_staging_bytes = storage
+        .memory_observability_snapshot()
+        .remote_catalog_staging_bytes;
+    assert!(
+        clean_fence_staging_bytes > 0,
+        "the partial clean fence must retain its accounted directory cursor"
+    );
+
+    storage
+        .sync_persisted_segments_from_disk_if_dirty()
+        .unwrap();
+    assert_eq!(
+        inventory_scans.load(Ordering::SeqCst),
+        1,
+        "the terminal fence wake should start exactly one bounded catalog cycle"
+    );
+    assert!(storage
+        .persisted
+        .persisted_index_dirty
+        .load(Ordering::SeqCst));
+    assert!(storage
+        .persisted
+        .persisted_index
+        .read()
+        .segments_by_root
+        .is_empty());
+    assert!(!storage
+        .coordination
+        .background_post_flush_clean_fence_cursor
+        .lock()
+        .has_active_scan());
+    let catalog_staging_bytes = storage
+        .memory_observability_snapshot()
+        .remote_catalog_staging_bytes;
+    assert_eq!(
+        catalog_staging_bytes,
+        storage.modeled_unknown_dirty_catalog_retained_bytes_for_test(),
+        "the terminal fence must release its reservation before the catalog cursor owns the staging counter"
+    );
+
+    storage.clear_full_inventory_scan_hook();
+    storage.close().unwrap();
+    assert_eq!(
+        storage
+            .memory_observability_snapshot()
+            .remote_catalog_staging_bytes,
+        0,
+        "close must release the retained catalog cursor"
+    );
+}
+
+#[test]
+fn closing_catalog_refresh_cannot_recreate_a_reset_post_flush_clean_fence() {
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use std::thread;
+
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let storage = Arc::new(bounded_catalog_refresh_storage(
+        &lane_path,
+        1,
+        1,
+        1024 * 1024,
+    ));
+    let marker_dir = temp_dir
+        .path()
+        .join(super::super::maintenance::POST_FLUSH_REPLACEMENT_DIR_NAME);
+    std::fs::create_dir_all(&marker_dir).unwrap();
+    std::fs::write(marker_dir.join("operator-owned"), b"keep").unwrap();
+    storage
+        .persisted
+        .persisted_index_dirty
+        .store(true, Ordering::SeqCst);
+
+    let compaction_guard = storage.compaction_gate();
+    assert_eq!(
+        storage
+            .advance_finite_post_flush_clean_fence(temp_dir.path(), 1, 1024 * 1024)
+            .unwrap(),
+        super::super::maintenance::BackgroundPostFlushCleanFenceStep::EnvelopeConsumed
+    );
+    assert!(storage
+        .coordination
+        .background_post_flush_clean_fence_cursor
+        .lock()
+        .has_active_scan());
+
+    let (refresh_pre_gate_tx, refresh_pre_gate_rx) = mpsc::channel();
+    storage.set_catalog_refresh_pre_compaction_gate_hook(move || {
+        refresh_pre_gate_tx.send(()).unwrap();
+    });
+    let refresh_storage = Arc::clone(&storage);
+    let refresh =
+        thread::spawn(move || refresh_storage.sync_persisted_segments_from_disk_if_dirty());
+    refresh_pre_gate_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("catalog refresh did not reach its pre-compaction-gate boundary");
+
+    storage.start_close_transition().unwrap();
+    storage.reset_background_post_flush_clean_fence_cursor();
+    assert!(!storage
+        .coordination
+        .background_post_flush_clean_fence_cursor
+        .lock()
+        .has_active_scan());
+    assert_eq!(
+        storage
+            .memory_observability_snapshot()
+            .remote_catalog_staging_bytes,
+        0,
+        "the close-side reset must release the retained clean-fence reservation"
+    );
+    drop(compaction_guard);
+
+    refresh
+        .join()
+        .expect("catalog refresh thread panicked")
+        .unwrap();
+    assert!(!storage
+        .coordination
+        .background_post_flush_clean_fence_cursor
+        .lock()
+        .has_active_scan());
+    assert_eq!(
+        storage
+            .memory_observability_snapshot()
+            .remote_catalog_staging_bytes,
+        0,
+        "a refresh that waited behind close must not recreate a finite clean-fence cursor"
+    );
+
+    storage.clear_catalog_refresh_pre_compaction_gate_hook();
+    assert!(storage
+        .finish_close_transition(Err(TsinkError::Other(
+            "roll back the synthetic close transition".to_string(),
+        )))
+        .is_err());
+    storage.close().unwrap();
+}
+
+#[test]
 fn background_post_flush_maintenance_applies_known_dirty_diff_before_inventory_scan() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;

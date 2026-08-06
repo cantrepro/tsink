@@ -1478,15 +1478,20 @@ fn validate_async_metadata_result(
     let required =
         crate::engine::engine::modeled_metric_series_vec_retained_bytes(&detailed.series);
     let Some(reservation) = detailed.take_memory_reservation() else {
+        drop(detailed);
         return Err(incomplete_async_metadata_accounting(operation));
     };
     if reservation.bytes() < required {
-        return Err(incomplete_async_metadata_accounting(operation));
+        let error = incomplete_async_metadata_accounting(operation);
+        // `detailed` no longer owns the detached guard. Destroy the series before releasing it;
+        // implicit reverse local-drop order would release `reservation` first.
+        drop(detailed);
+        drop(reservation);
+        return Err(error);
     }
-    Ok(SelectSeriesExecutionResult::accounted(
-        std::mem::take(&mut detailed.series),
-        reservation,
-    ))
+    let series = detailed.into_series();
+    // The detailed result stores `series` before its guard, preserving payload-before-guard drop.
+    Ok(SelectSeriesExecutionResult::accounted(series, reservation))
 }
 
 fn validate_async_row_scan_result(
@@ -1495,15 +1500,19 @@ fn validate_async_row_scan_result(
 ) -> Result<QueryRowsExecutionResult> {
     let required = crate::modeled_query_rows_retained_bytes(&detailed.page.rows);
     let Some(reservation) = detailed.take_memory_reservation() else {
+        drop(detailed);
         return Err(incomplete_async_row_scan_accounting(operation));
     };
     if reservation.bytes() < required {
-        return Err(incomplete_async_row_scan_accounting(operation));
+        let error = incomplete_async_row_scan_accounting(operation);
+        // Keep the detached guard live until the page has been destroyed on every error path.
+        drop(detailed);
+        drop(reservation);
+        return Err(error);
     }
-    Ok(QueryRowsExecutionResult::accounted(
-        detailed.into_page(),
-        reservation,
-    ))
+    let page = detailed.into_page();
+    // The detailed result stores `page` before its guard, preserving payload-before-guard drop.
+    Ok(QueryRowsExecutionResult::accounted(page, reservation))
 }
 
 impl ReadCommand {

@@ -4,15 +4,17 @@ use reqwest::blocking::Client;
 use ring::hmac;
 use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::{self, RsaPublicKeyComponents, UnparsedPublicKey};
+use serde::ser::SerializeSeq;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, RwLock};
+use std::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tsink::engine::fs_utils::write_file_atomically_and_sync_parent;
+use tsink::{QueryBudgetError, QueryExecution, QueryMemoryReservation};
 
 pub const RBAC_AUTH_VERIFIED_HEADER: &str = "x-tsink-rbac-verified";
 pub const RBAC_AUTH_PRINCIPAL_ID_HEADER: &str = "x-tsink-auth-principal-id";
@@ -22,6 +24,8 @@ pub const RBAC_AUTH_PROVIDER_HEADER: &str = "x-tsink-auth-provider";
 pub const RBAC_AUTH_SUBJECT_HEADER: &str = "x-tsink-auth-subject";
 
 const RBAC_AUDIT_CAPACITY: usize = 256;
+const RBAC_AUDIT_STATUS_ALLOCATION_ALLOWANCE_BYTES: u64 = 64;
+const RBAC_STATE_STATUS_ALLOCATION_ALLOWANCE_BYTES: u64 = 64;
 const OIDC_CLOCK_SKEW_SECONDS: u64 = 60;
 const SERVICE_ACCOUNT_TOKEN_BYTES: usize = 32;
 const OIDC_HTTP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -404,6 +408,10 @@ pub struct RbacRegistry {
     state: RwLock<RbacRuntimeState>,
     audit: Mutex<VecDeque<RbacAuditEntry>>,
     audit_seq: AtomicU64,
+    #[cfg(test)]
+    audit_snapshot_entry_clones: AtomicU64,
+    #[cfg(test)]
+    state_snapshot_source_path_clones: AtomicU64,
 }
 
 #[derive(Default)]
@@ -545,6 +553,279 @@ pub struct RbacOidcClaimMappingSnapshot {
     pub bindings: Vec<RbacBindingSnapshot>,
 }
 
+#[derive(Debug)]
+#[must_use = "dropping the RBAC state view releases its read locks and query reservation"]
+pub(crate) struct BorrowedRbacStateSnapshot<'a> {
+    // Field order is intentional: destroy the only owned output before releasing its guard.
+    source_path: Option<String>,
+    _reservation: QueryMemoryReservation,
+    state: RwLockReadGuard<'a, RbacRuntimeState>,
+    audit: MutexGuard<'a, VecDeque<RbacAuditEntry>>,
+}
+
+impl BorrowedRbacStateSnapshot<'_> {
+    #[cfg(test)]
+    fn accounted_bytes(&self) -> u64 {
+        self._reservation.bytes()
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum RbacStateSnapshotError {
+    QueryBudget(QueryBudgetError),
+    StateLockPoisoned,
+    AuditLockPoisoned,
+}
+
+impl From<QueryBudgetError> for RbacStateSnapshotError {
+    fn from(error: QueryBudgetError) -> Self {
+        Self::QueryBudget(error)
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BorrowedRbacStateView<'a> {
+    // The legacy handler first converted the public snapshot into `serde_json::Value`, whose map
+    // keys are sorted. Declaration order here deliberately preserves those raw response bytes.
+    audit_entries: usize,
+    enabled: bool,
+    last_loaded_unix_ms: u64,
+    oidc_providers: BorrowedRbacOidcProviders<'a>,
+    principals: BorrowedRbacPrincipals<'a>,
+    roles: BorrowedRbacRoles<'a>,
+    service_accounts: BorrowedRbacServiceAccounts<'a>,
+    source_path: Option<&'a str>,
+}
+
+impl Serialize for BorrowedRbacStateSnapshot<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        BorrowedRbacStateView {
+            audit_entries: self.audit.len(),
+            enabled: true,
+            last_loaded_unix_ms: self.state.last_loaded_unix_ms,
+            oidc_providers: BorrowedRbacOidcProviders(&self.state.oidc_providers),
+            principals: BorrowedRbacPrincipals(&self.state.principals),
+            roles: BorrowedRbacRoles(&self.state.roles),
+            service_accounts: BorrowedRbacServiceAccounts(&self.state.service_accounts),
+            source_path: self.source_path.as_deref(),
+        }
+        .serialize(serializer)
+    }
+}
+
+struct BorrowedRbacRoles<'a>(&'a BTreeMap<String, RoleRuntime>);
+
+impl Serialize for BorrowedRbacRoles<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for (name, role) in self.0 {
+            sequence.serialize_element(&BorrowedRbacRole {
+                grants: BorrowedRbacGrants(&role.grants),
+                name,
+            })?;
+        }
+        sequence.end()
+    }
+}
+
+#[derive(Serialize)]
+struct BorrowedRbacRole<'a> {
+    grants: BorrowedRbacGrants<'a>,
+    name: &'a str,
+}
+
+struct BorrowedRbacGrants<'a>(&'a [GrantRuntime]);
+
+impl Serialize for BorrowedRbacGrants<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for grant in self.0 {
+            sequence.serialize_element(&BorrowedRbacGrant {
+                action: &grant.action,
+                resource: &grant.resource,
+            })?;
+        }
+        sequence.end()
+    }
+}
+
+#[derive(Serialize)]
+struct BorrowedRbacGrant<'a> {
+    action: &'a RbacAction,
+    resource: &'a RbacResource,
+}
+
+struct BorrowedRbacPrincipals<'a>(&'a BTreeMap<String, PrincipalRuntime>);
+
+impl Serialize for BorrowedRbacPrincipals<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for (id, principal) in self.0 {
+            sequence.serialize_element(&BorrowedRbacPrincipal {
+                bindings: BorrowedRbacBindings(&principal.bindings),
+                disabled: principal.disabled,
+                id,
+            })?;
+        }
+        sequence.end()
+    }
+}
+
+#[derive(Serialize)]
+struct BorrowedRbacPrincipal<'a> {
+    bindings: BorrowedRbacBindings<'a>,
+    disabled: bool,
+    id: &'a str,
+}
+
+struct BorrowedRbacBindings<'a>(&'a [BindingRuntime]);
+
+impl Serialize for BorrowedRbacBindings<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for binding in self.0 {
+            sequence.serialize_element(&BorrowedRbacBinding {
+                role: &binding.role,
+                scopes: &binding.scopes,
+            })?;
+        }
+        sequence.end()
+    }
+}
+
+#[derive(Serialize)]
+struct BorrowedRbacBinding<'a> {
+    role: &'a str,
+    scopes: &'a [RbacResource],
+}
+
+struct BorrowedRbacServiceAccounts<'a>(&'a BTreeMap<String, ServiceAccountRuntime>);
+
+impl Serialize for BorrowedRbacServiceAccounts<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for (id, account) in self.0 {
+            sequence.serialize_element(&BorrowedRbacServiceAccount {
+                bindings: BorrowedRbacBindings(&account.bindings),
+                created_unix_ms: account.created_unix_ms,
+                description: account.description.as_deref(),
+                disabled: account.disabled,
+                id,
+                last_rotated_unix_ms: account.last_rotated_unix_ms,
+                updated_unix_ms: account.updated_unix_ms,
+            })?;
+        }
+        sequence.end()
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BorrowedRbacServiceAccount<'a> {
+    bindings: BorrowedRbacBindings<'a>,
+    created_unix_ms: u64,
+    description: Option<&'a str>,
+    disabled: bool,
+    id: &'a str,
+    last_rotated_unix_ms: u64,
+    updated_unix_ms: u64,
+}
+
+struct BorrowedRbacOidcProviders<'a>(&'a BTreeMap<String, OidcProviderRuntime>);
+
+impl Serialize for BorrowedRbacOidcProviders<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for provider in self.0.values() {
+            sequence.serialize_element(&BorrowedRbacOidcProvider {
+                audiences: &provider.audiences,
+                claim_mappings: BorrowedRbacOidcClaimMappings(&provider.claim_mappings),
+                issuer: &provider.issuer,
+                jwks_url: provider.jwks_url.as_deref(),
+                key_ids: BorrowedRbacOidcKeyIds(&provider.keys),
+                name: &provider.name,
+                username_claim: provider.username_claim.as_deref(),
+            })?;
+        }
+        sequence.end()
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BorrowedRbacOidcProvider<'a> {
+    audiences: &'a [String],
+    claim_mappings: BorrowedRbacOidcClaimMappings<'a>,
+    issuer: &'a str,
+    jwks_url: Option<&'a str>,
+    key_ids: BorrowedRbacOidcKeyIds<'a>,
+    name: &'a str,
+    username_claim: Option<&'a str>,
+}
+
+struct BorrowedRbacOidcKeyIds<'a>(&'a [OidcKeyRuntime]);
+
+impl Serialize for BorrowedRbacOidcKeyIds<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for key in self.0 {
+            sequence.serialize_element(key.descriptor_str())?;
+        }
+        sequence.end()
+    }
+}
+
+struct BorrowedRbacOidcClaimMappings<'a>(&'a [OidcClaimMappingRuntime]);
+
+impl Serialize for BorrowedRbacOidcClaimMappings<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for mapping in self.0 {
+            sequence.serialize_element(&BorrowedRbacOidcClaimMapping {
+                bindings: BorrowedRbacBindings(&mapping.bindings),
+                claim: &mapping.claim,
+                value: &mapping.value,
+            })?;
+        }
+        sequence.end()
+    }
+}
+
+#[derive(Serialize)]
+struct BorrowedRbacOidcClaimMapping<'a> {
+    bindings: BorrowedRbacBindings<'a>,
+    claim: &'a str,
+    value: &'a str,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RbacAuditEntry {
@@ -569,6 +850,53 @@ pub struct RbacAuditEntry {
     pub subject: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+}
+
+/// Recent RBAC audit entries whose dynamic allocations remain charged to the caller's query.
+#[derive(Debug)]
+#[must_use = "dropping the RBAC audit snapshot releases its query-memory reservation"]
+pub(crate) struct AccountedRbacAuditSnapshot {
+    // Field order is intentional: entries must be dropped before their accounting guard.
+    entries: Vec<RbacAuditEntry>,
+    _reservation: QueryMemoryReservation,
+}
+
+impl AccountedRbacAuditSnapshot {
+    #[cfg(test)]
+    fn accounted_bytes(&self) -> u64 {
+        self._reservation.bytes()
+    }
+}
+
+impl std::ops::Deref for AccountedRbacAuditSnapshot {
+    type Target = [RbacAuditEntry];
+
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum RbacAuditSnapshotError {
+    QueryBudget(QueryBudgetError),
+    AuditLockPoisoned,
+}
+
+impl std::fmt::Display for RbacAuditSnapshotError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::QueryBudget(error) => write!(formatter, "{error}"),
+            Self::AuditLockPoisoned => formatter.write_str("RBAC audit lock is poisoned"),
+        }
+    }
+}
+
+impl std::error::Error for RbacAuditSnapshotError {}
+
+impl From<QueryBudgetError> for RbacAuditSnapshotError {
+    fn from(error: QueryBudgetError) -> Self {
+        Self::QueryBudget(error)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -625,6 +953,10 @@ impl RbacRegistry {
             state: RwLock::new(state),
             audit: Mutex::new(VecDeque::with_capacity(RBAC_AUDIT_CAPACITY)),
             audit_seq: AtomicU64::new(0),
+            #[cfg(test)]
+            audit_snapshot_entry_clones: AtomicU64::new(0),
+            #[cfg(test)]
+            state_snapshot_source_path_clones: AtomicU64::new(0),
         };
         registry.push_audit_entry(RbacAuditEntryInput {
             event: "reload".to_string(),
@@ -952,6 +1284,83 @@ impl RbacRegistry {
         }
     }
 
+    /// Borrows the complete public RBAC state under the caller's query execution.
+    ///
+    /// Roles, principals, service accounts, and OIDC state serialize directly under the state
+    /// read lock. Only the display form of the optional source path is owned; it is measured and
+    /// reserved before conversion. The audit count is sampled last under the established
+    /// state-then-audit lock order, matching [`Self::state_snapshot`].
+    pub(crate) fn borrowed_state_snapshot_with_execution(
+        &self,
+        execution: &QueryExecution,
+    ) -> Result<BorrowedRbacStateSnapshot<'_>, RbacStateSnapshotError> {
+        execution.checkpoint()?;
+        let state = self
+            .state
+            .read()
+            .map_err(|_| RbacStateSnapshotError::StateLockPoisoned)?;
+        execution.checkpoint()?;
+
+        let peak_bytes = state
+            .source_path
+            .as_deref()
+            .map(modeled_rbac_state_path_peak_bytes)
+            .unwrap_or(0);
+        let mut reservation = execution.reserve_memory(peak_bytes)?;
+        execution.checkpoint()?;
+        let source_path = state
+            .source_path
+            .as_deref()
+            .map(|path| self.clone_state_snapshot_path(path));
+        execution.checkpoint()?;
+        let audit = self
+            .audit
+            .lock()
+            .map_err(|_| RbacStateSnapshotError::AuditLockPoisoned)?;
+        execution.checkpoint()?;
+
+        let retained_bytes = source_path
+            .as_ref()
+            .map(modeled_rbac_state_string_bytes)
+            .unwrap_or(0);
+        assert!(
+            retained_bytes <= peak_bytes,
+            "RBAC state retained-memory model exceeded its pre-allocation reservation"
+        );
+        reservation.resize(retained_bytes)?;
+        Ok(BorrowedRbacStateSnapshot {
+            source_path,
+            _reservation: reservation,
+            state,
+            audit,
+        })
+    }
+
+    fn clone_state_snapshot_path(&self, path: &Path) -> String {
+        #[cfg(test)]
+        self.state_snapshot_source_path_clones
+            .fetch_add(1, Ordering::Relaxed);
+        if let Some(value) = path.to_str() {
+            let mut cloned = String::with_capacity(value.len());
+            cloned.push_str(value);
+            cloned
+        } else {
+            path.display().to_string()
+        }
+    }
+
+    #[cfg(test)]
+    fn reset_state_snapshot_source_path_clones(&self) {
+        self.state_snapshot_source_path_clones
+            .store(0, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn state_snapshot_source_path_clones(&self) -> u64 {
+        self.state_snapshot_source_path_clones
+            .load(Ordering::Relaxed)
+    }
+
     pub fn state_snapshot(&self) -> RbacStateSnapshot {
         let state = self
             .state
@@ -1103,6 +1512,87 @@ impl RbacRegistry {
             limit.min(audit.len())
         };
         audit.iter().rev().take(count).cloned().collect()
+    }
+
+    /// Captures the selected recent audit entries after reserving their full dynamic output.
+    ///
+    /// The audit lock remains held through measurement and cloning, preserving the legacy
+    /// snapshot's newest-first, single-generation behavior. No output String or Vec is cloned or
+    /// allocated until the complete projection has been charged to `execution`.
+    pub(crate) fn audit_snapshot_with_execution(
+        &self,
+        limit: usize,
+        execution: &QueryExecution,
+    ) -> Result<AccountedRbacAuditSnapshot, RbacAuditSnapshotError> {
+        execution.checkpoint()?;
+        let audit = self
+            .audit
+            .lock()
+            .map_err(|_| RbacAuditSnapshotError::AuditLockPoisoned)?;
+        execution.checkpoint()?;
+        let count = if limit == 0 {
+            audit.len()
+        } else {
+            limit.min(audit.len())
+        };
+        let mut retained_bytes = modeled_rbac_audit_vec_bytes::<RbacAuditEntry>(count);
+        for entry in audit.iter().rev().take(count) {
+            execution.checkpoint()?;
+            retained_bytes =
+                retained_bytes.saturating_add(modeled_rbac_audit_entry_retained_bytes(entry));
+        }
+        let mut reservation = execution.reserve_memory(retained_bytes)?;
+        execution.checkpoint()?;
+
+        let mut entries = Vec::with_capacity(count);
+        for entry in audit.iter().rev().take(count) {
+            execution.checkpoint()?;
+            entries.push(self.clone_audit_snapshot_entry(entry));
+        }
+        drop(audit);
+        execution.checkpoint()?;
+        reservation.resize(modeled_rbac_audit_snapshot_bytes(
+            &entries,
+            entries.capacity(),
+        ))?;
+        Ok(AccountedRbacAuditSnapshot {
+            entries,
+            _reservation: reservation,
+        })
+    }
+
+    fn clone_audit_snapshot_entry(&self, entry: &RbacAuditEntry) -> RbacAuditEntry {
+        #[cfg(test)]
+        self.audit_snapshot_entry_clones
+            .fetch_add(1, Ordering::Relaxed);
+        RbacAuditEntry {
+            sequence: entry.sequence,
+            timestamp_unix_ms: entry.timestamp_unix_ms,
+            event: entry.event.as_str().to_owned(),
+            outcome: entry.outcome.as_str().to_owned(),
+            principal_id: entry.principal_id.as_deref().map(ToOwned::to_owned),
+            role: entry.role.as_deref().map(ToOwned::to_owned),
+            action: entry.action,
+            resource: entry.resource.as_ref().map(|resource| RbacResource {
+                kind: resource.kind,
+                name: resource.name.as_str().to_owned(),
+            }),
+            code: entry.code.as_str().to_owned(),
+            auth_method: entry.auth_method.as_deref().map(ToOwned::to_owned),
+            provider: entry.provider.as_deref().map(ToOwned::to_owned),
+            subject: entry.subject.as_deref().map(ToOwned::to_owned),
+            detail: entry.detail.as_deref().map(ToOwned::to_owned),
+        }
+    }
+
+    #[cfg(test)]
+    fn reset_audit_snapshot_entry_clones(&self) {
+        self.audit_snapshot_entry_clones.store(0, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn audit_snapshot_entry_clones(&self) -> u64 {
+        self.audit_snapshot_entry_clones.load(Ordering::Relaxed)
     }
 
     fn mutate_config<M, T, F, S>(&self, mutator: F, selector: S) -> Result<T, String>
@@ -1988,12 +2478,16 @@ fn claim_values(claims: &JsonValue, name: &str) -> Vec<String> {
 }
 
 impl OidcKeyRuntime {
-    fn descriptor(&self) -> String {
+    fn descriptor_str(&self) -> &str {
         match self {
             Self::Rsa { kid, .. } | Self::EcP256 { kid, .. } | Self::Oct { kid, .. } => {
-                kid.clone().unwrap_or_else(|| "<unnamed>".to_string())
+                kid.as_deref().unwrap_or("<unnamed>")
             }
         }
+    }
+
+    fn descriptor(&self) -> String {
+        self.descriptor_str().to_string()
     }
 
     fn matches_kid(&self, requested: Option<&str>) -> bool {
@@ -2014,6 +2508,177 @@ impl OidcKeyRuntime {
             }
         }
     }
+}
+
+fn modeled_rbac_state_str_bytes(value: &str) -> u64 {
+    if value.is_empty() {
+        return 0;
+    }
+    u64::try_from(value.len())
+        .unwrap_or(u64::MAX)
+        .saturating_add(RBAC_STATE_STATUS_ALLOCATION_ALLOWANCE_BYTES)
+}
+
+fn modeled_rbac_state_string_bytes(value: &String) -> u64 {
+    if value.capacity() == 0 {
+        return 0;
+    }
+    u64::try_from(value.capacity())
+        .unwrap_or(u64::MAX)
+        .saturating_add(RBAC_STATE_STATUS_ALLOCATION_ALLOWANCE_BYTES)
+}
+
+fn modeled_rbac_state_path_peak_bytes(path: &Path) -> u64 {
+    if let Some(value) = path.to_str() {
+        return modeled_rbac_state_str_bytes(value);
+    }
+    u64::try_from(path.as_os_str().len())
+        .unwrap_or(u64::MAX)
+        .saturating_mul(8)
+        .saturating_add(RBAC_STATE_STATUS_ALLOCATION_ALLOWANCE_BYTES.saturating_mul(2))
+}
+
+fn modeled_rbac_audit_vec_bytes<T>(capacity: usize) -> u64 {
+    if capacity == 0 {
+        return 0;
+    }
+    u64::try_from(capacity)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(u64::try_from(std::mem::size_of::<T>()).unwrap_or(u64::MAX))
+        .saturating_add(RBAC_AUDIT_STATUS_ALLOCATION_ALLOWANCE_BYTES)
+}
+
+fn modeled_rbac_audit_str_bytes(value: &str) -> u64 {
+    if value.is_empty() {
+        return 0;
+    }
+    u64::try_from(value.len())
+        .unwrap_or(u64::MAX)
+        .saturating_add(RBAC_AUDIT_STATUS_ALLOCATION_ALLOWANCE_BYTES)
+}
+
+fn modeled_rbac_audit_string_bytes(value: &String) -> u64 {
+    if value.capacity() == 0 {
+        return 0;
+    }
+    u64::try_from(value.capacity())
+        .unwrap_or(u64::MAX)
+        .saturating_add(RBAC_AUDIT_STATUS_ALLOCATION_ALLOWANCE_BYTES)
+}
+
+fn modeled_rbac_audit_entry_retained_bytes(entry: &RbacAuditEntry) -> u64 {
+    modeled_rbac_audit_str_bytes(&entry.event)
+        .saturating_add(modeled_rbac_audit_str_bytes(&entry.outcome))
+        .saturating_add(
+            entry
+                .principal_id
+                .as_deref()
+                .map(modeled_rbac_audit_str_bytes)
+                .unwrap_or(0),
+        )
+        .saturating_add(
+            entry
+                .role
+                .as_deref()
+                .map(modeled_rbac_audit_str_bytes)
+                .unwrap_or(0),
+        )
+        .saturating_add(
+            entry
+                .resource
+                .as_ref()
+                .map(|resource| modeled_rbac_audit_str_bytes(&resource.name))
+                .unwrap_or(0),
+        )
+        .saturating_add(modeled_rbac_audit_str_bytes(&entry.code))
+        .saturating_add(
+            entry
+                .auth_method
+                .as_deref()
+                .map(modeled_rbac_audit_str_bytes)
+                .unwrap_or(0),
+        )
+        .saturating_add(
+            entry
+                .provider
+                .as_deref()
+                .map(modeled_rbac_audit_str_bytes)
+                .unwrap_or(0),
+        )
+        .saturating_add(
+            entry
+                .subject
+                .as_deref()
+                .map(modeled_rbac_audit_str_bytes)
+                .unwrap_or(0),
+        )
+        .saturating_add(
+            entry
+                .detail
+                .as_deref()
+                .map(modeled_rbac_audit_str_bytes)
+                .unwrap_or(0),
+        )
+}
+
+fn modeled_rbac_audit_snapshot_bytes(entries: &[RbacAuditEntry], entries_capacity: usize) -> u64 {
+    modeled_rbac_audit_vec_bytes::<RbacAuditEntry>(entries_capacity).saturating_add(
+        entries.iter().fold(0u64, |bytes, entry| {
+            bytes
+                .saturating_add(modeled_rbac_audit_string_bytes(&entry.event))
+                .saturating_add(modeled_rbac_audit_string_bytes(&entry.outcome))
+                .saturating_add(
+                    entry
+                        .principal_id
+                        .as_ref()
+                        .map(modeled_rbac_audit_string_bytes)
+                        .unwrap_or(0),
+                )
+                .saturating_add(
+                    entry
+                        .role
+                        .as_ref()
+                        .map(modeled_rbac_audit_string_bytes)
+                        .unwrap_or(0),
+                )
+                .saturating_add(
+                    entry
+                        .resource
+                        .as_ref()
+                        .map(|resource| modeled_rbac_audit_string_bytes(&resource.name))
+                        .unwrap_or(0),
+                )
+                .saturating_add(modeled_rbac_audit_string_bytes(&entry.code))
+                .saturating_add(
+                    entry
+                        .auth_method
+                        .as_ref()
+                        .map(modeled_rbac_audit_string_bytes)
+                        .unwrap_or(0),
+                )
+                .saturating_add(
+                    entry
+                        .provider
+                        .as_ref()
+                        .map(modeled_rbac_audit_string_bytes)
+                        .unwrap_or(0),
+                )
+                .saturating_add(
+                    entry
+                        .subject
+                        .as_ref()
+                        .map(modeled_rbac_audit_string_bytes)
+                        .unwrap_or(0),
+                )
+                .saturating_add(
+                    entry
+                        .detail
+                        .as_ref()
+                        .map(modeled_rbac_audit_string_bytes)
+                        .unwrap_or(0),
+                )
+        }),
+    )
 }
 
 fn now_unix_ms() -> u64 {
@@ -2040,6 +2705,630 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
     use tempfile::TempDir;
+    use tsink::{QueryBudget, QueryBudgetLimits, QueryLimitReason, QueryWorkLimits};
+
+    fn state_projection_registry() -> (TempDir, RbacRegistry) {
+        let temp_dir = TempDir::new().expect("RBAC state tempdir should build");
+        let path = temp_dir.path().join("rbac-state-α.json");
+        let secret_b64 = URL_SAFE_NO_PAD.encode(b"state-projection-secret");
+        let config = format!(
+            r#"{{
+                "roles": {{
+                    "reader": {{
+                        "grants": [{{
+                            "action": "read",
+                            "resource": {{"kind": "tenant", "name": "team-\"-α"}}
+                        }}]
+                    }}
+                }},
+                "principals": [{{
+                    "id": "operator",
+                    "token": "operator-token",
+                    "bindings": [{{
+                        "role": "reader",
+                        "scopes": [{{"kind": "tenant", "name": "team-a"}}]
+                    }}]
+                }}],
+                "serviceAccounts": [{{
+                    "id": "automation",
+                    "token": "automation-token",
+                    "description": "automation-\"-α",
+                    "createdUnixMs": 11,
+                    "updatedUnixMs": 12,
+                    "lastRotatedUnixMs": 13,
+                    "bindings": [{{"role": "reader"}}]
+                }}],
+                "oidcProviders": [{{
+                    "name": "corp",
+                    "issuer": "https://issuer.example/α",
+                    "audiences": ["tsink", "metrics-\""],
+                    "usernameClaim": "email",
+                    "jwks": [{{
+                        "kid": "shared-key",
+                        "alg": "HS256",
+                        "kty": "oct",
+                        "k": "{secret_b64}"
+                    }}],
+                    "claimMappings": [{{
+                        "claim": "groups",
+                        "value": "metrics-*",
+                        "bindings": [{{
+                            "role": "reader",
+                            "scopes": [{{"kind": "tenant", "name": "team-a"}}]
+                        }}]
+                    }}]
+                }}]
+            }}"#
+        );
+        fs::write(&path, config).expect("RBAC state config should write");
+        let registry = RbacRegistry::load_from_path(&path)
+            .expect("RBAC state projection registry should load");
+        registry.reset_state_snapshot_source_path_clones();
+        (temp_dir, registry)
+    }
+
+    #[test]
+    fn state_projection_preserves_legacy_bytes_and_holds_source_locks() {
+        let (_temp_dir, registry) = state_projection_registry();
+        let expected = serde_json::to_vec(
+            &serde_json::to_value(registry.state_snapshot())
+                .expect("legacy RBAC state should convert to a value"),
+        )
+        .expect("legacy RBAC state value should serialize");
+        registry.reset_state_snapshot_source_path_clones();
+        let budget = QueryBudget::new(QueryBudgetLimits::default()).expect("budget should build");
+        let execution = budget.begin_query().expect("RBAC state query should admit");
+        let projected = registry
+            .borrowed_state_snapshot_with_execution(&execution)
+            .expect("borrowed RBAC state should build");
+
+        assert_eq!(
+            serde_json::to_vec(&projected).expect("borrowed RBAC state should serialize"),
+            expected
+        );
+        assert_eq!(registry.state_snapshot_source_path_clones(), 1);
+        assert_eq!(
+            execution.snapshot().memory_reserved_bytes,
+            projected.accounted_bytes()
+        );
+        assert!(registry.state.try_write().is_err());
+        assert!(registry.audit.try_lock().is_err());
+        drop(projected);
+        assert!(registry.state.try_write().is_ok());
+        assert!(registry.audit.try_lock().is_ok());
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        drop(execution);
+        let after = budget.snapshot();
+        assert_eq!(after.active_queries, 0);
+        assert_eq!(after.shared_reserved_memory_bytes, 0);
+        assert_eq!(after.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn state_projection_enforces_exact_path_memory_before_clone() {
+        let (_temp_dir, registry) = state_projection_registry();
+        let calibration_budget =
+            QueryBudget::new(QueryBudgetLimits::default()).expect("budget should build");
+        let calibration = calibration_budget
+            .begin_query()
+            .expect("calibration query should admit");
+        let calibrated = registry
+            .borrowed_state_snapshot_with_execution(&calibration)
+            .expect("calibration RBAC state should build");
+        let required = calibrated.accounted_bytes();
+        assert!(required > 0);
+        assert_eq!(
+            calibration_budget
+                .snapshot()
+                .peak_shared_reserved_memory_bytes,
+            required
+        );
+        drop(calibrated);
+        drop(calibration);
+
+        registry.reset_state_snapshot_source_path_clones();
+        let exact_budget = QueryBudget::new(QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(required),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(required),
+                ..QueryWorkLimits::default()
+            },
+        })
+        .expect("exact state budget should build");
+        let exact = exact_budget
+            .begin_query()
+            .expect("exact state query should admit");
+        let exact_snapshot = registry
+            .borrowed_state_snapshot_with_execution(&exact)
+            .expect("exact state path memory should pass");
+        assert_eq!(exact_snapshot.accounted_bytes(), required);
+        assert_eq!(registry.state_snapshot_source_path_clones(), 1);
+        drop(exact_snapshot);
+        drop(exact);
+
+        registry.reset_state_snapshot_source_path_clones();
+        let below_budget = QueryBudget::new(QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(required),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(required.saturating_sub(1)),
+                ..QueryWorkLimits::default()
+            },
+        })
+        .expect("below-boundary state budget should build");
+        let below = below_budget
+            .begin_query()
+            .expect("below-boundary state query should admit");
+        let error = registry
+            .borrowed_state_snapshot_with_execution(&below)
+            .expect_err("one byte below the state path memory must reject before cloning");
+        match error {
+            RbacStateSnapshotError::QueryBudget(QueryBudgetError::LimitExceeded(exceeded)) => {
+                assert_eq!(exceeded.reason, QueryLimitReason::PerQueryMemoryBytes);
+                assert_eq!(exceeded.current, 0);
+                assert_eq!(exceeded.requested, required);
+            }
+            other => panic!("unexpected RBAC state projection error: {other:?}"),
+        }
+        assert_eq!(registry.state_snapshot_source_path_clones(), 0);
+        assert_eq!(below.snapshot().memory_reserved_bytes, 0);
+        assert_eq!(below_budget.snapshot().peak_shared_reserved_memory_bytes, 0);
+        drop(below);
+
+        for budget in [calibration_budget, exact_budget, below_budget] {
+            let after = budget.snapshot();
+            assert_eq!(after.active_queries, 0);
+            assert_eq!(after.shared_reserved_memory_bytes, 0);
+            assert_eq!(after.accounting_invariant_violations_total, 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_projection_invalid_utf8_path_preserves_legacy_bytes_and_exact_clone_boundary() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp_dir = TempDir::new().expect("invalid-path RBAC state tempdir should build");
+        let invalid_name =
+            std::ffi::OsString::from_vec(b"rbac-state-invalid-\xff-config.json".to_vec());
+        let path = temp_dir.path().join(invalid_name);
+        // Some Unix filesystems reject non-UTF-8 names even though `OsString` can represent them.
+        // Build the normal runtime state from JSON while injecting the path at the private source
+        // boundary so the display conversion itself is exercised portably across Unix targets.
+        let registry = RbacRegistry::from_json_source("{}", Some(path))
+            .expect("invalid-path RBAC registry should build");
+        let expected = serde_json::to_vec(
+            &serde_json::to_value(registry.state_snapshot())
+                .expect("legacy invalid-path RBAC state should convert to a value"),
+        )
+        .expect("legacy invalid-path RBAC state value should serialize");
+        registry.reset_state_snapshot_source_path_clones();
+
+        let calibration_budget = QueryBudget::new(QueryBudgetLimits::default())
+            .expect("calibration budget should build");
+        let calibration = calibration_budget
+            .begin_query()
+            .expect("invalid-path calibration query should admit");
+        let calibrated = registry
+            .borrowed_state_snapshot_with_execution(&calibration)
+            .expect("invalid-path calibration snapshot should build");
+        assert_eq!(
+            serde_json::to_vec(&calibrated)
+                .expect("borrowed invalid-path RBAC state should serialize"),
+            expected
+        );
+        let retained = calibrated.accounted_bytes();
+        let required = calibration_budget
+            .snapshot()
+            .peak_shared_reserved_memory_bytes;
+        assert!(
+            required > retained,
+            "invalid UTF-8 display conversion should retain less than its conservative transient peak"
+        );
+        assert_eq!(registry.state_snapshot_source_path_clones(), 1);
+        drop(calibrated);
+        assert_eq!(calibration.snapshot().memory_reserved_bytes, 0);
+        drop(calibration);
+
+        registry.reset_state_snapshot_source_path_clones();
+        let exact_budget = QueryBudget::new(QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(required),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(required),
+                ..QueryWorkLimits::default()
+            },
+        })
+        .expect("exact invalid-path state budget should build");
+        let exact = exact_budget
+            .begin_query()
+            .expect("exact invalid-path state query should admit");
+        let exact_snapshot = registry
+            .borrowed_state_snapshot_with_execution(&exact)
+            .expect("the exact invalid-path conversion peak should pass");
+        assert_eq!(
+            exact_budget.snapshot().peak_shared_reserved_memory_bytes,
+            required
+        );
+        assert_eq!(exact_snapshot.accounted_bytes(), retained);
+        assert_eq!(registry.state_snapshot_source_path_clones(), 1);
+        drop(exact_snapshot);
+        assert_eq!(exact.snapshot().memory_reserved_bytes, 0);
+        drop(exact);
+
+        registry.reset_state_snapshot_source_path_clones();
+        let below_budget = QueryBudget::new(QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(required),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(required.saturating_sub(1)),
+                ..QueryWorkLimits::default()
+            },
+        })
+        .expect("below-boundary invalid-path state budget should build");
+        let below = below_budget
+            .begin_query()
+            .expect("below-boundary invalid-path state query should admit");
+        let error = registry
+            .borrowed_state_snapshot_with_execution(&below)
+            .expect_err("one byte below the invalid-path peak must reject before cloning");
+        match error {
+            RbacStateSnapshotError::QueryBudget(QueryBudgetError::LimitExceeded(exceeded)) => {
+                assert_eq!(exceeded.reason, QueryLimitReason::PerQueryMemoryBytes);
+                assert_eq!(exceeded.current, 0);
+                assert_eq!(exceeded.requested, required);
+            }
+            other => panic!("unexpected invalid-path RBAC state projection error: {other:?}"),
+        }
+        assert_eq!(registry.state_snapshot_source_path_clones(), 0);
+        assert_eq!(below.snapshot().memory_reserved_bytes, 0);
+        assert_eq!(below_budget.snapshot().peak_shared_reserved_memory_bytes, 0);
+        assert!(registry.state.try_write().is_ok());
+        drop(below);
+
+        for budget in [calibration_budget, exact_budget, below_budget] {
+            let after = budget.snapshot();
+            assert_eq!(after.active_queries, 0);
+            assert_eq!(after.shared_reserved_memory_bytes, 0);
+            assert_eq!(after.accounting_invariant_violations_total, 0);
+        }
+    }
+
+    #[test]
+    fn state_projection_honors_precancellation_and_poisoned_audit_cleanup() {
+        let (_temp_dir, registry) = state_projection_registry();
+        let budget = QueryBudget::new(QueryBudgetLimits::default()).expect("budget should build");
+        let token = tsink::QueryCancellationToken::new();
+        let execution = budget
+            .begin_query_with_token(token.clone())
+            .expect("cancelled state query should admit");
+        token.cancel();
+        let error = registry
+            .borrowed_state_snapshot_with_execution(&execution)
+            .expect_err("pre-cancelled state projection should stop");
+        assert!(matches!(
+            error,
+            RbacStateSnapshotError::QueryBudget(QueryBudgetError::Cancelled)
+        ));
+        assert_eq!(registry.state_snapshot_source_path_clones(), 0);
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        drop(execution);
+
+        let registry = Arc::new(registry);
+        let poison_target = Arc::clone(&registry);
+        assert!(thread::spawn(move || {
+            let _audit = poison_target
+                .audit
+                .lock()
+                .expect("audit lock should initially be healthy");
+            panic!("poison RBAC state audit lock");
+        })
+        .join()
+        .is_err());
+        registry.reset_state_snapshot_source_path_clones();
+        let poison_budget =
+            QueryBudget::new(QueryBudgetLimits::default()).expect("poison budget should build");
+        let poison_execution = poison_budget
+            .begin_query()
+            .expect("poison query should admit");
+        let error = registry
+            .borrowed_state_snapshot_with_execution(&poison_execution)
+            .expect_err("poisoned audit lock should return a structured error");
+        assert!(matches!(error, RbacStateSnapshotError::AuditLockPoisoned));
+        assert_eq!(registry.state_snapshot_source_path_clones(), 1);
+        assert_eq!(poison_execution.snapshot().memory_reserved_bytes, 0);
+        drop(poison_execution);
+
+        let after = budget.snapshot();
+        assert_eq!(after.active_queries, 0);
+        assert_eq!(after.shared_reserved_memory_bytes, 0);
+        assert_eq!(after.cancellations_total, 1);
+        assert_eq!(after.accounting_invariant_violations_total, 0);
+        let after = poison_budget.snapshot();
+        assert_eq!(after.active_queries, 0);
+        assert_eq!(after.shared_reserved_memory_bytes, 0);
+        assert_eq!(after.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn state_projection_reports_poisoned_state_before_clone_without_residue() {
+        let (_temp_dir, registry) = state_projection_registry();
+        let registry = Arc::new(registry);
+        let poison_target = Arc::clone(&registry);
+        assert!(thread::spawn(move || {
+            let _state = poison_target
+                .state
+                .write()
+                .expect("state lock should initially be healthy");
+            panic!("poison RBAC registry state lock");
+        })
+        .join()
+        .is_err());
+        registry.reset_state_snapshot_source_path_clones();
+
+        let budget = QueryBudget::new(QueryBudgetLimits::default())
+            .expect("poisoned-state budget should build");
+        let execution = budget
+            .begin_query()
+            .expect("poisoned-state query should admit");
+        let error = registry
+            .borrowed_state_snapshot_with_execution(&execution)
+            .expect_err("poisoned state lock should return a structured error");
+        assert!(matches!(error, RbacStateSnapshotError::StateLockPoisoned));
+        assert_eq!(registry.state_snapshot_source_path_clones(), 0);
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        assert_eq!(budget.snapshot().peak_shared_reserved_memory_bytes, 0);
+        drop(execution);
+
+        let after = budget.snapshot();
+        assert_eq!(after.active_queries, 0);
+        assert_eq!(after.shared_reserved_memory_bytes, 0);
+        assert_eq!(after.accounting_invariant_violations_total, 0);
+    }
+
+    fn audit_projection_registry() -> RbacRegistry {
+        let registry = RbacRegistry::from_json_str("{}").expect("empty RBAC config should parse");
+        let entries = VecDeque::from([
+            RbacAuditEntry {
+                sequence: 11,
+                timestamp_unix_ms: 101,
+                event: "oldest-event".to_string(),
+                outcome: "success".to_string(),
+                principal_id: None,
+                role: None,
+                action: None,
+                resource: None,
+                code: "oldest-code".to_string(),
+                auth_method: None,
+                provider: None,
+                subject: None,
+                detail: None,
+            },
+            RbacAuditEntry {
+                // Sequence allocation happens before the audit mutex in production, so deque
+                // insertion order can legitimately disagree with numeric sequence order.
+                sequence: 99,
+                timestamp_unix_ms: 102,
+                event: "decision-\\\"-\\n".to_string(),
+                outcome: "allow".to_string(),
+                principal_id: Some("principal-α".to_string()),
+                role: Some("role-reader".to_string()),
+                action: Some(RbacAction::Read),
+                resource: Some(RbacResource::tenant("tenant-\\\"-\\n")),
+                code: "authorized".to_string(),
+                auth_method: Some("oidc".to_string()),
+                provider: Some("provider-example".to_string()),
+                subject: Some("subject-example".to_string()),
+                detail: Some("detail-\\\"-\\n".to_string()),
+            },
+            RbacAuditEntry {
+                sequence: 13,
+                timestamp_unix_ms: 103,
+                event: "newest-event".to_string(),
+                outcome: "deny".to_string(),
+                principal_id: Some("newest-principal".to_string()),
+                role: None,
+                action: Some(RbacAction::Write),
+                resource: Some(RbacResource::admin("rbac-audit")),
+                code: "forbidden".to_string(),
+                auth_method: Some("token".to_string()),
+                provider: None,
+                subject: None,
+                detail: Some("newest detail".to_string()),
+            },
+        ]);
+        *registry
+            .audit
+            .lock()
+            .expect("audit fixture lock should be available") = entries;
+        registry.audit_seq.store(13, Ordering::Relaxed);
+        registry.reset_audit_snapshot_entry_clones();
+        registry
+    }
+
+    #[test]
+    fn audit_projection_preserves_legacy_limit_order_and_all_optional_values() {
+        let registry = audit_projection_registry();
+        let expected_limited = registry.audit_snapshot(2);
+        let budget = QueryBudget::new(QueryBudgetLimits::default()).expect("budget should build");
+        let execution = budget.begin_query().expect("audit query should admit");
+
+        let projected = registry
+            .audit_snapshot_with_execution(2, &execution)
+            .expect("accounted audit snapshot should succeed");
+        assert_eq!(
+            serde_json::to_value(&*projected).expect("projected audit should serialize"),
+            serde_json::to_value(&expected_limited).expect("legacy audit should serialize")
+        );
+        assert_eq!(projected.len(), 2);
+        assert_eq!(projected[0].sequence, 13);
+        assert_eq!(projected[1].sequence, 99);
+        assert_eq!(projected[1].provider.as_deref(), Some("provider-example"));
+        assert_eq!(registry.audit_snapshot_entry_clones(), 2);
+        assert_eq!(
+            execution.snapshot().memory_reserved_bytes,
+            projected.accounted_bytes()
+        );
+        drop(projected);
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+
+        registry.reset_audit_snapshot_entry_clones();
+        let all = registry
+            .audit_snapshot_with_execution(0, &execution)
+            .expect("zero limit should preserve the legacy unlimited behavior");
+        assert_eq!(
+            serde_json::to_value(&*all).expect("accounted unlimited audit should serialize"),
+            serde_json::to_value(registry.audit_snapshot(0))
+                .expect("legacy unlimited audit should serialize")
+        );
+        assert_eq!(registry.audit_snapshot_entry_clones(), 3);
+        drop(all);
+        drop(execution);
+        let after = budget.snapshot();
+        assert_eq!(after.active_queries, 0);
+        assert_eq!(after.shared_reserved_memory_bytes, 0);
+        assert_eq!(after.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn audit_projection_enforces_exact_memory_before_entry_clones() {
+        let calibration_registry = audit_projection_registry();
+        let calibration_budget =
+            QueryBudget::new(QueryBudgetLimits::default()).expect("budget should build");
+        let calibration = calibration_budget
+            .begin_query()
+            .expect("calibration audit query should admit");
+        let calibrated = calibration_registry
+            .audit_snapshot_with_execution(0, &calibration)
+            .expect("calibration audit snapshot should succeed");
+        let exact_bytes = calibrated.accounted_bytes();
+        assert!(exact_bytes > 0);
+        assert_eq!(calibration.snapshot().memory_reserved_bytes, exact_bytes);
+        assert_eq!(calibration_registry.audit_snapshot_entry_clones(), 3);
+        drop(calibrated);
+        drop(calibration);
+
+        let exact_registry = audit_projection_registry();
+        let exact_budget = QueryBudget::new(QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(exact_bytes),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(exact_bytes),
+                ..QueryWorkLimits::default()
+            },
+        })
+        .expect("exact audit budget should build");
+        let exact = exact_budget
+            .begin_query()
+            .expect("exact audit query should admit");
+        let exact_snapshot = exact_registry
+            .audit_snapshot_with_execution(0, &exact)
+            .expect("exact modeled audit limit should pass");
+        assert_eq!(exact_snapshot.accounted_bytes(), exact_bytes);
+        assert_eq!(exact_registry.audit_snapshot_entry_clones(), 3);
+        drop(exact_snapshot);
+        drop(exact);
+
+        let below_registry = audit_projection_registry();
+        let below_budget = QueryBudget::new(QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(exact_bytes),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(exact_bytes.saturating_sub(1)),
+                ..QueryWorkLimits::default()
+            },
+        })
+        .expect("below-boundary audit budget should build");
+        let below = below_budget
+            .begin_query()
+            .expect("below-boundary audit query should admit");
+        let error = below_registry
+            .audit_snapshot_with_execution(0, &below)
+            .expect_err("one byte below the exact audit output must reject");
+        match error {
+            RbacAuditSnapshotError::QueryBudget(QueryBudgetError::LimitExceeded(exceeded)) => {
+                assert_eq!(exceeded.reason, QueryLimitReason::PerQueryMemoryBytes);
+                assert_eq!(exceeded.current, 0);
+                assert_eq!(exceeded.requested, exact_bytes);
+            }
+            other => panic!("unexpected RBAC audit projection error: {other}"),
+        }
+        assert_eq!(
+            below_registry.audit_snapshot_entry_clones(),
+            0,
+            "failed reservation must precede the first audit-entry clone"
+        );
+        assert_eq!(below.snapshot().memory_reserved_bytes, 0);
+        assert_eq!(below_budget.snapshot().peak_shared_reserved_memory_bytes, 0);
+        drop(below);
+
+        for budget in [calibration_budget, exact_budget, below_budget] {
+            let after = budget.snapshot();
+            assert_eq!(after.active_queries, 0);
+            assert_eq!(after.shared_reserved_memory_bytes, 0);
+            assert_eq!(after.accounting_invariant_violations_total, 0);
+        }
+    }
+
+    #[test]
+    fn audit_projection_honors_precancellation_without_residue() {
+        let registry = audit_projection_registry();
+        let budget = QueryBudget::new(QueryBudgetLimits::default()).expect("budget should build");
+        let token = tsink::QueryCancellationToken::new();
+        let execution = budget
+            .begin_query_with_token(token.clone())
+            .expect("cancelled audit query should admit");
+        token.cancel();
+
+        let error = registry
+            .audit_snapshot_with_execution(0, &execution)
+            .expect_err("pre-cancelled audit snapshot should stop before locking or cloning");
+        assert!(matches!(
+            error,
+            RbacAuditSnapshotError::QueryBudget(QueryBudgetError::Cancelled)
+        ));
+        assert_eq!(registry.audit_snapshot_entry_clones(), 0);
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        drop(execution);
+        let after = budget.snapshot();
+        assert_eq!(after.active_queries, 0);
+        assert_eq!(after.shared_reserved_memory_bytes, 0);
+        assert_eq!(after.cancellations_total, 1);
+        assert_eq!(after.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn audit_projection_reports_a_poisoned_lock_without_residue() {
+        let registry = Arc::new(audit_projection_registry());
+        let poisoned_registry = Arc::clone(&registry);
+        assert!(thread::spawn(move || {
+            let _guard = poisoned_registry
+                .audit
+                .lock()
+                .expect("audit lock should initially be available");
+            panic!("poison the RBAC audit lock");
+        })
+        .join()
+        .is_err());
+
+        let budget = QueryBudget::new(QueryBudgetLimits::default()).expect("budget should build");
+        let execution = budget
+            .begin_query()
+            .expect("poisoned-lock audit query should admit");
+        let error = registry
+            .audit_snapshot_with_execution(0, &execution)
+            .expect_err("poisoned RBAC audit lock should return a structured error");
+        assert!(matches!(error, RbacAuditSnapshotError::AuditLockPoisoned));
+        assert_eq!(registry.audit_snapshot_entry_clones(), 0);
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        assert_eq!(budget.snapshot().peak_shared_reserved_memory_bytes, 0);
+        drop(execution);
+        let after = budget.snapshot();
+        assert_eq!(after.active_queries, 0);
+        assert_eq!(after.shared_reserved_memory_bytes, 0);
+        assert_eq!(after.accounting_invariant_violations_total, 0);
+    }
 
     #[test]
     fn service_account_metrics_snapshot_is_copy_and_matches_full_snapshot() {

@@ -16,18 +16,6 @@ where
     condition()
 }
 
-fn memory_required_for_rejected_write(storage: &ChunkStorage, rows: &[Row]) -> usize {
-    storage
-        .memory
-        .budget_bytes
-        .store(1, std::sync::atomic::Ordering::Release);
-    match storage.insert_rows(rows) {
-        Ok(()) => panic!("expected calibrated admission write to exceed the memory budget"),
-        Err(TsinkError::MemoryBudgetExceeded { required, .. }) => required,
-        Err(err) => panic!("expected memory budget error during calibration, got {err:?}"),
-    }
-}
-
 #[test]
 fn timestamp_precision_changes_retention_unit_conversion() {
     let seconds_storage = StorageBuilder::new()
@@ -356,6 +344,8 @@ fn close_cancels_writer_waiting_for_admission_pressure() {
         .unwrap(),
     );
 
+    let before = storage.observability_snapshot();
+    let blocked_relief = storage.memory.admission_backpressure_lock.lock();
     let writer_storage = Arc::clone(&storage);
     let writer = std::thread::spawn(move || {
         writer_storage.insert_rows(&[Row::new(
@@ -371,7 +361,30 @@ fn close_cancels_writer_waiting_for_admission_pressure() {
                 .observability_snapshot()
                 .flush
                 .admission_backpressure_delays_total
-                > 0
+                > before.flush.admission_backpressure_delays_total
+        },
+    ));
+    assert_eq!(
+        storage
+            .observability_snapshot()
+            .flush
+            .admission_pressure_relief_requests_total,
+        before.flush.admission_pressure_relief_requests_total,
+        "a failed serialized relief attempt must not be counted as a request",
+    );
+    drop(blocked_relief);
+    assert!(wait_for_condition(
+        Duration::from_secs(1),
+        Duration::from_millis(5),
+        || {
+            storage
+                .observability_snapshot()
+                .flush
+                .admission_pressure_relief_requests_total
+                >= before
+                    .flush
+                    .admission_pressure_relief_requests_total
+                    .saturating_add(2)
         },
     ));
 
@@ -483,15 +496,16 @@ fn memory_pressure_relief_rejects_safely_with_busy_writer_permit() {
 }
 
 #[test]
-fn memory_admission_backpressure_uses_background_flush_without_sealing_current_head() {
+fn memory_admission_backpressure_repeats_bounded_flush_until_relief() {
+    const ESTIMATED_GROWTH_BYTES: usize = 4096;
+
     let temp_dir = TempDir::new().unwrap();
-    // Keep the background-eligible old head substantially larger than the current heads. That
-    // leaves a real admission window after the old head is finalized even when fixed retained
-    // components such as the WAL writer buffer are charged to the same budget.
+    // Keep two background-eligible old heads substantially larger than the current head. The
+    // calibrated budget fits only after two item-bounded worker passes, so one lost wake cannot
+    // accidentally satisfy this test.
     let first_blob = "a".repeat(32 * 1024);
-    let second_blob = "b".repeat(4096);
+    let second_blob = "b".repeat(24 * 1024);
     let third_blob = "c".repeat(4096);
-    let fourth_blob = "d".repeat(4096);
     let build_storage = |root: &TempDir, write_timeout: Duration| {
         let wal = FramedWal::open(root.path().join(WAL_DIR_NAME), WalSyncMode::PerAppend).unwrap();
         ChunkStorage::new_with_data_path_and_options(
@@ -523,7 +537,10 @@ fn memory_admission_backpressure_uses_background_flush_without_sealing_current_h
                 wal_size_limit_bytes: u64::MAX,
                 admission_poll_interval: Duration::from_millis(5),
                 compaction_interval: DEFAULT_COMPACTION_INTERVAL,
-                maintenance_max_items_per_pass: 1_024,
+                // One active-series inspection plus the two chunks that share this write
+                // batch's WAL interval. WAL ordering safely defers the first attempt until the
+                // second old head has also been finalized.
+                maintenance_max_items_per_pass: 3,
                 maintenance_max_bytes_per_pass: 256 * 1024 * 1024,
                 background_threads_enabled: false,
                 background_fail_fast: false,
@@ -546,57 +563,61 @@ fn memory_admission_backpressure_uses_background_flush_without_sealing_current_h
                 )
             })
             .collect::<Vec<_>>();
-        rows.extend([
+        rows.extend((11..=18).map(|timestamp| {
             Row::new(
                 "memory_backpressure_head_guard",
-                DataPoint::new(11, second_blob.clone()),
-            ),
-            Row::new(
-                "memory_backpressure_head_guard",
-                DataPoint::new(21, third_blob.clone()),
-            ),
-        ]);
+                DataPoint::new(timestamp, second_blob.clone()),
+            )
+        }));
+        rows.push(Row::new(
+            "memory_backpressure_head_guard",
+            DataPoint::new(21, third_blob.clone()),
+        ));
         rows
+    };
+    let run_relief_pass = |storage: &ChunkStorage| {
+        let selected = storage
+            .flush_background_eligible_active_with_selection()
+            .unwrap();
+        storage
+            .persist_segment_background_bounded_with_limits(
+                storage
+                    .runtime
+                    .maintenance_max_items_per_pass
+                    .saturating_sub(selected.inspected_items),
+                storage
+                    .runtime
+                    .maintenance_max_bytes_per_pass
+                    .saturating_sub(selected.input_bytes),
+            )
+            .unwrap()
     };
     let calibration_dir = TempDir::new().unwrap();
     let calibration = build_storage(&calibration_dir, Duration::ZERO);
     calibration.insert_rows(&initial_rows()).unwrap();
-    let fourth_row = Row::new(
-        "memory_backpressure_head_guard",
-        DataPoint::new(22, fourth_blob.clone()),
-    );
-    let pre_relief_required =
-        memory_required_for_rejected_write(&calibration, std::slice::from_ref(&fourth_row));
-    calibration
-        .memory
-        .budget_bytes
-        .store(u64::MAX, std::sync::atomic::Ordering::Release);
-    calibration.flush_background_eligible_active().unwrap();
-
-    // Admission has multiple exact boundaries: the retained-growth estimate that triggers
-    // backpressure and the later transient write-staging peak. Follow structured `required`
-    // values until the complete post-relief write fits instead of calibrating only the first.
-    let mut post_relief_required = 1usize;
-    loop {
-        calibration.memory.budget_bytes.store(
-            u64::try_from(post_relief_required).unwrap_or(u64::MAX),
-            std::sync::atomic::Ordering::Release,
-        );
-        match calibration.insert_rows(std::slice::from_ref(&fourth_row)) {
-            Ok(()) => break,
-            Err(TsinkError::MemoryBudgetExceeded { budget, required }) => {
-                assert_eq!(budget, post_relief_required);
-                assert!(required > post_relief_required);
-                post_relief_required = required;
-            }
-            Err(error) => panic!("unexpected post-relief calibration failure: {error}"),
-        }
-    }
+    assert_engine_memory_usage_reconciled(&calibration);
     assert!(
-        post_relief_required < pre_relief_required,
-        "background-eligible flush should reduce admission memory requirement: pre={pre_relief_required} post={post_relief_required}",
+        !run_relief_pass(&calibration).persisted,
+        "the first pass must defer the open WAL dependency window",
     );
-    let target_budget = post_relief_required;
+    assert_engine_memory_usage_reconciled(&calibration);
+    let after_first_relief_bytes = calibration.memory.used_bytes.load(Ordering::Acquire);
+    assert!(
+        !run_relief_pass(&calibration).persisted,
+        "the current head shares the initial WAL frame, so persistence must remain deferred",
+    );
+    assert_engine_memory_usage_reconciled(&calibration);
+    let after_second_relief_bytes = calibration.memory.used_bytes.load(Ordering::Acquire);
+    assert!(
+        after_second_relief_bytes < after_first_relief_bytes,
+        "the second bounded pass must reclaim additional retained memory",
+    );
+    let estimated_growth_bytes = u64::try_from(ESTIMATED_GROWTH_BYTES).unwrap();
+    let target_budget = after_second_relief_bytes.saturating_add(estimated_growth_bytes);
+    assert!(
+        after_first_relief_bytes.saturating_add(estimated_growth_bytes) > target_budget,
+        "one bounded pass must remain above the exact admission threshold",
+    );
 
     let storage = std::sync::Arc::new(build_storage(&temp_dir, Duration::from_secs(1)));
 
@@ -614,7 +635,7 @@ fn memory_admission_backpressure_uses_background_flush_without_sealing_current_h
         let active = storage.active_shard(series_id).read();
         let state = active.get(&series_id).unwrap();
         assert_eq!(state.partition_head_count(), 3);
-        assert_eq!(state.point_count(), 10);
+        assert_eq!(state.point_count(), 17);
     }
 
     storage
@@ -623,10 +644,17 @@ fn memory_admission_backpressure_uses_background_flush_without_sealing_current_h
     storage
         .memory
         .budget_bytes
-        .store(target_budget as u64, std::sync::atomic::Ordering::Release);
+        .store(target_budget, std::sync::atomic::Ordering::Release);
 
-    storage
-        .insert_rows(std::slice::from_ref(&fourth_row))
+    let prepare = storage.write_prepare_context();
+    prepare
+        .admission
+        .enforce_admission_controls(
+            prepare.memory_budget,
+            prepare.wal,
+            ESTIMATED_GROWTH_BYTES,
+            0,
+        )
         .unwrap();
 
     assert!(
@@ -635,9 +663,9 @@ fn memory_admission_backpressure_uses_background_flush_without_sealing_current_h
                 .observability_snapshot()
                 .flush
                 .active_flushed_chunks_total
-                > before.flush.active_flushed_chunks_total
+                >= before.flush.active_flushed_chunks_total.saturating_add(2)
         }),
-        "background flush should finalize an older head while relieving admission pressure",
+        "repeated pressure wakes should finalize both older heads",
     );
 
     let after = storage.observability_snapshot();
@@ -647,7 +675,10 @@ fn memory_admission_backpressure_uses_background_flush_without_sealing_current_h
     );
     assert!(
         after.flush.admission_pressure_relief_requests_total
-            > before.flush.admission_pressure_relief_requests_total
+            >= before
+                .flush
+                .admission_pressure_relief_requests_total
+                .saturating_add(2)
     );
     assert!(
         after.flush.admission_pressure_relief_observed_total
@@ -658,23 +689,35 @@ fn memory_admission_backpressure_uses_background_flush_without_sealing_current_h
             > before.memory.pressure.backpressure_events_total
     );
     assert_eq!(after.memory.pressure.active_backpressured_writers, 0);
-    assert_eq!(
-        after.memory.pressure.rejections_total,
-        before.memory.pressure.rejections_total
-    );
+    let rejection_delta = after
+        .memory
+        .pressure
+        .rejections_total
+        .saturating_sub(before.memory.pressure.rejections_total);
+    let pipeline_error_delta = after
+        .flush
+        .pipeline_errors_total
+        .saturating_sub(before.flush.pipeline_errors_total);
+    let persist_error_delta = after
+        .flush
+        .persist_errors_total
+        .saturating_sub(before.flush.persist_errors_total);
+    assert_eq!(rejection_delta, pipeline_error_delta);
+    assert_eq!(pipeline_error_delta, persist_error_delta);
     assert!(
-        after.flush.active_flushed_chunks_total > before.flush.active_flushed_chunks_total,
-        "background flush should finalize a non-current head instead of fragmenting the live head",
+        after.flush.active_flushed_chunks_total
+            >= before.flush.active_flushed_chunks_total.saturating_add(2),
+        "each pressure wake must remain one bounded pass while the writer makes progress",
     );
     {
         let active = storage.active_shard(series_id).read();
         let state = active.get(&series_id).unwrap();
-        assert!(state.partition_head_count() < 3);
+        assert_eq!(state.partition_head_count(), 1);
         let current_partition_id = state.current_partition_id.unwrap();
         assert_eq!(
             state.partition_heads[&current_partition_id].builder.len(),
-            2,
-            "admission pressure must keep the current partial head intact while appending the new point",
+            1,
+            "admission pressure must keep the current partial head intact",
         );
     }
     assert_eq!(
@@ -683,13 +726,15 @@ fn memory_admission_backpressure_uses_background_flush_without_sealing_current_h
             .unwrap(),
         (1..=8)
             .map(|timestamp| DataPoint::new(timestamp, first_blob.clone()))
-            .chain([
-                DataPoint::new(11, second_blob),
-                DataPoint::new(21, third_blob),
-                DataPoint::new(22, fourth_blob),
-            ])
+            .chain((11..=18).map(|timestamp| { DataPoint::new(timestamp, second_blob.clone()) }))
+            .chain([DataPoint::new(21, third_blob)])
             .collect::<Vec<_>>()
     );
+    storage
+        .memory
+        .budget_bytes
+        .store(u64::MAX, Ordering::Release);
+    storage.close().unwrap();
 }
 
 #[test]

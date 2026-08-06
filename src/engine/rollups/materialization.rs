@@ -1,5 +1,5 @@
 use super::runtime::pending_materialized_through;
-use super::state_journal::RollupSourceStateEvent;
+use super::state_journal::{RollupSourceStateEvent, RollupStateJournalWriter};
 use super::*;
 use crate::engine::storage_engine::query_exec::{
     modeled_point_output_upper_bound_bytes, modeled_points_retained_bytes,
@@ -23,9 +23,73 @@ struct RollupPolicyPageStateUpdate<'a> {
     error: Option<String>,
 }
 
+#[cfg(test)]
+thread_local! {
+    static ROLLUP_SOURCE_PAGE_STATE_LOOKUPS: std::cell::Cell<u64> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+fn reset_rollup_source_page_state_lookups() {
+    ROLLUP_SOURCE_PAGE_STATE_LOOKUPS.with(|lookups| lookups.set(0));
+}
+
+#[cfg(test)]
+fn rollup_source_page_state_lookups() -> u64 {
+    ROLLUP_SOURCE_PAGE_STATE_LOOKUPS.with(std::cell::Cell::get)
+}
+
 impl RollupStateStoreContext<'_> {
+    /// Reads only the selected source's materialization state.
+    ///
+    /// The caller holds `rollup_run_lock`, which serializes policy changes, historical-write
+    /// invalidation, deletes, and source checkpoint publication. Keep the two guards short and
+    /// disjoint so query reads, materialized writes, and durable journal I/O never run while a
+    /// whole state component is locked.
+    fn source_materialization_state(
+        self,
+        policy_id: &str,
+        source_key: &str,
+    ) -> (i64, Option<PendingRollupMaterialization>) {
+        #[cfg(test)]
+        ROLLUP_SOURCE_PAGE_STATE_LOOKUPS.with(|lookups| {
+            lookups.set(lookups.get().saturating_add(1));
+        });
+
+        let checkpoint = self
+            .state
+            .checkpoints
+            .read()
+            .get(policy_id)
+            .and_then(|entries| entries.get(source_key))
+            .copied()
+            .unwrap_or(i64::MIN);
+        let pending = self
+            .state
+            .pending_materializations
+            .read()
+            .get(policy_id)
+            .and_then(|entries| entries.get(source_key))
+            .cloned();
+        (checkpoint, pending)
+    }
+
+    fn source_state_journal_writer(
+        self,
+        journal: &mut Option<RollupStateJournalWriter>,
+    ) -> Result<&mut RollupStateJournalWriter> {
+        if journal.is_none() {
+            *journal = Some(self.begin_source_state_journal_writer()?);
+        }
+        Ok(journal
+            .as_mut()
+            .expect("lazy rollup state journal writer was initialized"))
+    }
+
     fn stage_pending_rollup_materialization(
         self,
+        journal: &mut Option<RollupStateJournalWriter>,
         policy_id: &str,
         source_key: &str,
         pending: PendingRollupMaterialization,
@@ -45,18 +109,13 @@ impl RollupStateStoreContext<'_> {
             checkpoint,
             &pending,
         );
-        self.persist_source_state_event(event)?;
-        self.state
-            .pending_materializations
-            .write()
-            .entry(policy_id.to_string())
-            .or_default()
-            .insert(source_key.to_string(), pending);
+        self.persist_source_state_event(self.source_state_journal_writer(journal)?, event)?;
         Ok(())
     }
 
     fn commit_rollup_source_materialization(
         self,
+        journal: &mut Option<RollupStateJournalWriter>,
         policy_id: &str,
         source_key: &str,
         generation: u64,
@@ -69,23 +128,7 @@ impl RollupStateStoreContext<'_> {
             generation,
             materialized_through,
         );
-        self.persist_source_state_event(event)?;
-        self.state
-            .checkpoints
-            .write()
-            .entry(policy_id.to_string())
-            .or_default()
-            .insert(source_key.to_string(), materialized_through);
-        let mut pending_materializations = self.state.pending_materializations.write();
-        let remove_policy = pending_materializations
-            .get_mut(policy_id)
-            .is_some_and(|entries| {
-                entries.remove(source_key);
-                entries.is_empty()
-            });
-        if remove_policy {
-            pending_materializations.remove(policy_id);
-        }
+        self.persist_source_state_event(self.source_state_journal_writer(journal)?, event)?;
         Ok(())
     }
 
@@ -681,32 +724,16 @@ fn run_rollup_policy_sources_once(
 
     let generation = store.policy_generation(&policy.id);
     let rollup_metric = rollup_metric_name(policy, generation);
-    let existing_checkpoints = store
-        .state
-        .checkpoints
-        .read()
-        .get(&policy.id)
-        .cloned()
-        .unwrap_or_default();
-    let existing_pending = store
-        .state
-        .pending_materializations
-        .read()
-        .get(&policy.id)
-        .cloned()
-        .unwrap_or_default();
-    let mut updated_checkpoints = existing_checkpoints.clone();
+    let mut journal = None;
     let mut checkpoint_changed = false;
     let mut first_source_error = None;
 
     for source in sources {
         let source_result = (|| -> std::result::Result<(), PolicySourceRunError> {
-            let checkpoint = existing_checkpoints
-                .get(&source.source_key)
-                .copied()
-                .unwrap_or(i64::MIN);
-            let target_end = existing_pending
-                .get(&source.source_key)
+            let (checkpoint, pending) =
+                store.source_materialization_state(&policy.id, &source.source_key);
+            let target_end = pending
+                .as_ref()
                 .filter(|pending| pending.generation == generation)
                 .map(|pending| pending.materialized_through.max(stable_end))
                 .unwrap_or(stable_end);
@@ -780,6 +807,7 @@ fn run_rollup_policy_sources_once(
                 if !rows.is_empty() {
                     store
                         .stage_pending_rollup_materialization(
+                            &mut journal,
                             &policy.id,
                             &source.source_key,
                             PendingRollupMaterialization {
@@ -806,9 +834,9 @@ fn run_rollup_policy_sources_once(
                 drop(rows_reservation);
             }
 
-            updated_checkpoints.insert(source.source_key.clone(), target_end);
             store
                 .commit_rollup_source_materialization(
+                    &mut journal,
                     &policy.id,
                     &source.source_key,
                     generation,
@@ -830,29 +858,10 @@ fn run_rollup_policy_sources_once(
         }
     }
 
-    if checkpoint_changed {
-        store
-            .state
-            .checkpoints
-            .write()
-            .insert(policy.id.clone(), updated_checkpoints.clone());
-        report.checkpoint_changed = true;
-    }
-
-    let mut min_through = None::<i64>;
-    let mut materialized_series = 0u64;
-    for source in sources {
-        if let Some(materialized_through) = updated_checkpoints.get(&source.source_key).copied() {
-            materialized_series = materialized_series.saturating_add(1);
-            min_through = Some(
-                min_through
-                    .map(|current| current.min(materialized_through))
-                    .unwrap_or(materialized_through),
-            );
-        }
-    }
-    report.materialized_series = materialized_series;
-    report.materialized_through = min_through;
+    report.checkpoint_changed = checkpoint_changed;
+    let page_coverage = rollup_policy_page_coverage(store, &policy.id, sources);
+    report.materialized_series = page_coverage.materialized_series;
+    report.materialized_through = page_coverage.materialized_through;
     if let Some(error) = first_source_error {
         Err(PolicySourceRunError::Isolated(error))
     } else {
@@ -1477,6 +1486,455 @@ mod transformation_memory_tests {
             self.rows.lock().extend(rows.iter().cloned());
             Ok(WriteResult::new(crate::WriteAcknowledgement::Durable))
         }
+    }
+
+    #[test]
+    fn bounded_page_reads_only_selected_source_state() {
+        let runtime = RollupRuntimeState::new_with_disk_budget(None, None);
+        let store = RollupStateStoreContext { state: &runtime };
+        let policy = RollupPolicy {
+            id: "bounded-page-state".to_string(),
+            metric: "cpu_usage".to_string(),
+            match_labels: Vec::new(),
+            interval: 1_000,
+            aggregation: Aggregation::Avg,
+            bucket_origin: 0,
+        };
+        let source = RollupSourceSeries {
+            series_id: 1,
+            source_key: source_series_key(&policy.metric, &[]),
+            labels: Vec::new(),
+        };
+        let mut policy_checkpoints = BTreeMap::new();
+        let mut policy_pending = BTreeMap::new();
+        for index in 0_i64..4_096 {
+            let source_key = format!("unrelated-source-{index:04}");
+            policy_checkpoints.insert(source_key.clone(), index);
+            policy_pending.insert(
+                source_key,
+                PendingRollupMaterialization {
+                    checkpoint: index,
+                    materialized_through: index.saturating_add(1_000),
+                    generation: 0,
+                },
+            );
+        }
+        policy_checkpoints.insert(source.source_key.clone(), 2_000);
+        store.install_snapshot(RollupRuntimeSnapshot {
+            policies: vec![policy.clone()],
+            checkpoints: HashMap::from([(policy.id.clone(), policy_checkpoints)]),
+            pending_materializations: HashMap::from([(policy.id.clone(), policy_pending)]),
+            pending_delete_invalidations: Vec::new(),
+            generations: HashMap::from([(policy.id.clone(), 0)]),
+            policy_stats: BTreeMap::new(),
+        });
+        let reads = FixedSourceReads {
+            budget: crate::QueryBudget::new(QueryBudgetLimits::default()).unwrap(),
+            points: Vec::new(),
+        };
+        let registry = RwLock::new(SeriesRegistry::new());
+        let writes = CapturingRollupWrites::default();
+        let semaphore = crate::concurrency::Semaphore::new(1);
+        let write_permit = semaphore.acquire();
+
+        reset_rollup_source_page_state_lookups();
+        let report = match run_rollup_policy_sources_once(
+            store,
+            RollupSourceReadContext {
+                registry: RollupRegistryReadContext {
+                    registry: &registry,
+                },
+                ops: &reads,
+            },
+            RollupMaterializedWriteContext {
+                ops: &writes,
+                write_permit: &write_permit,
+                write_batch_limits: crate::WriteBatchLimits::default(),
+            },
+            &policy,
+            2_000,
+            std::slice::from_ref(&source),
+            false,
+        ) {
+            Ok(report) => report,
+            Err(error) => panic!("bounded page state lookup failed: {}", error.error()),
+        };
+
+        assert_eq!(rollup_source_page_state_lookups(), 1);
+        assert_eq!(report.matched_series, 1);
+        assert_eq!(report.materialized_series, 1);
+        assert_eq!(report.materialized_through, Some(2_000));
+        assert!(!report.checkpoint_changed);
+        assert_eq!(
+            runtime
+                .checkpoints
+                .read()
+                .get(&policy.id)
+                .map(BTreeMap::len),
+            Some(4_097)
+        );
+        assert_eq!(
+            runtime
+                .pending_materializations
+                .read()
+                .get(&policy.id)
+                .map(BTreeMap::len),
+            Some(4_096)
+        );
+        assert!(writes.rows.lock().is_empty());
+    }
+
+    #[test]
+    fn page_local_lookup_preserves_pending_retry_target() {
+        let data_dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(data_dir.path().join(ROLLUP_DIR_NAME)).unwrap();
+        let runtime =
+            RollupRuntimeState::new_with_disk_budget(Some(data_dir.path().to_path_buf()), None);
+        let store = RollupStateStoreContext { state: &runtime };
+        let policy = RollupPolicy {
+            id: "pending-retry-target".to_string(),
+            metric: "cpu_usage".to_string(),
+            match_labels: Vec::new(),
+            interval: 1_000,
+            aggregation: Aggregation::Avg,
+            bucket_origin: 0,
+        };
+        let source = RollupSourceSeries {
+            series_id: 1,
+            source_key: source_series_key(&policy.metric, &[]),
+            labels: Vec::new(),
+        };
+        store.install_snapshot(RollupRuntimeSnapshot {
+            policies: vec![policy.clone()],
+            checkpoints: HashMap::from([(
+                policy.id.clone(),
+                BTreeMap::from([(source.source_key.clone(), 1_000)]),
+            )]),
+            pending_materializations: HashMap::from([(
+                policy.id.clone(),
+                BTreeMap::from([(
+                    source.source_key.clone(),
+                    PendingRollupMaterialization {
+                        checkpoint: 1_000,
+                        materialized_through: 4_000,
+                        generation: 0,
+                    },
+                )]),
+            )]),
+            pending_delete_invalidations: Vec::new(),
+            generations: HashMap::from([(policy.id.clone(), 0)]),
+            policy_stats: BTreeMap::new(),
+        });
+        let reads = FixedSourceReads {
+            budget: crate::QueryBudget::new(QueryBudgetLimits::default()).unwrap(),
+            points: Vec::new(),
+        };
+        let registry = RwLock::new(SeriesRegistry::new());
+        let writes = CapturingRollupWrites::default();
+        let semaphore = crate::concurrency::Semaphore::new(1);
+        let write_permit = semaphore.acquire();
+
+        reset_rollup_source_page_state_lookups();
+        let report = match run_rollup_policy_sources_once(
+            store,
+            RollupSourceReadContext {
+                registry: RollupRegistryReadContext {
+                    registry: &registry,
+                },
+                ops: &reads,
+            },
+            RollupMaterializedWriteContext {
+                ops: &writes,
+                write_permit: &write_permit,
+                write_batch_limits: crate::WriteBatchLimits::default(),
+            },
+            &policy,
+            2_000,
+            std::slice::from_ref(&source),
+            false,
+        ) {
+            Ok(report) => report,
+            Err(error) => panic!("pending retry target failed: {}", error.error()),
+        };
+
+        assert_eq!(rollup_source_page_state_lookups(), 1);
+        assert!(report.checkpoint_changed);
+        assert_eq!(report.materialized_series, 1);
+        assert_eq!(report.materialized_through, Some(4_000));
+        assert_eq!(
+            runtime
+                .checkpoints
+                .read()
+                .get(&policy.id)
+                .and_then(|entries| entries.get(&source.source_key))
+                .copied(),
+            Some(4_000)
+        );
+        assert!(runtime.pending_materializations.read().is_empty());
+        assert!(writes.rows.lock().is_empty());
+    }
+
+    #[test]
+    fn earlier_success_survives_later_isolated_failure_in_page_coverage() {
+        let data_dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(data_dir.path().join(ROLLUP_DIR_NAME)).unwrap();
+        let runtime =
+            RollupRuntimeState::new_with_disk_budget(Some(data_dir.path().to_path_buf()), None);
+        let store = RollupStateStoreContext { state: &runtime };
+        let policy = RollupPolicy {
+            id: "partial-page-coverage".to_string(),
+            metric: "cpu_usage".to_string(),
+            match_labels: Vec::new(),
+            interval: 1_000,
+            aggregation: Aggregation::Avg,
+            bucket_origin: 0,
+        };
+        let sources = [
+            RollupSourceSeries {
+                series_id: 1,
+                source_key: "cpu_usage{host=\"a\"}".to_string(),
+                labels: vec![Label::new("host", "a")],
+            },
+            RollupSourceSeries {
+                series_id: 2,
+                source_key: "cpu_usage{host=\"b\"}".to_string(),
+                labels: vec![Label::new("host", "b")],
+            },
+        ];
+        store.install_snapshot(RollupRuntimeSnapshot {
+            policies: vec![policy.clone()],
+            checkpoints: HashMap::new(),
+            pending_materializations: HashMap::new(),
+            pending_delete_invalidations: Vec::new(),
+            generations: HashMap::from([(policy.id.clone(), 0)]),
+            policy_stats: BTreeMap::new(),
+        });
+        let reads = FixedSourceReads {
+            budget: crate::QueryBudget::new(QueryBudgetLimits::default()).unwrap(),
+            points: vec![DataPoint::new(0, 1.0), DataPoint::new(1_000, 3.0)],
+        };
+        let failing_series_id = sources[1].series_id;
+        runtime.set_source_read_hook(move |_policy, series_id| {
+            if series_id == failing_series_id {
+                Err(TsinkError::Other(
+                    "injected later-source read failure".to_string(),
+                ))
+            } else {
+                Ok(())
+            }
+        });
+        let registry = RwLock::new(SeriesRegistry::new());
+        let writes = CapturingRollupWrites::default();
+        let semaphore = crate::concurrency::Semaphore::new(1);
+        let write_permit = semaphore.acquire();
+
+        reset_rollup_source_page_state_lookups();
+        let error = run_rollup_policy_sources_once(
+            store,
+            RollupSourceReadContext {
+                registry: RollupRegistryReadContext {
+                    registry: &registry,
+                },
+                ops: &reads,
+            },
+            RollupMaterializedWriteContext {
+                ops: &writes,
+                write_permit: &write_permit,
+                write_batch_limits: crate::WriteBatchLimits::default(),
+            },
+            &policy,
+            2_000,
+            &sources,
+            true,
+        )
+        .expect_err("the later source must fail in isolation");
+        runtime.clear_source_read_hook();
+
+        assert!(matches!(
+            error,
+            PolicySourceRunError::Isolated(TsinkError::Other(message))
+                if message == "injected later-source read failure"
+        ));
+        assert_eq!(rollup_source_page_state_lookups(), 2);
+        assert_eq!(
+            runtime
+                .checkpoints
+                .read()
+                .get(&policy.id)
+                .and_then(|entries| entries.get(&sources[0].source_key))
+                .copied(),
+            Some(2_000)
+        );
+        assert_eq!(
+            runtime
+                .checkpoints
+                .read()
+                .get(&policy.id)
+                .and_then(|entries| entries.get(&sources[1].source_key))
+                .copied(),
+            None
+        );
+        assert!(runtime.pending_materializations.read().is_empty());
+        let coverage = rollup_policy_page_coverage(store, &policy.id, &sources);
+        assert_eq!(coverage.matched_series, 2);
+        assert_eq!(coverage.materialized_series, 1);
+        assert_eq!(coverage.materialized_through, Some(2_000));
+        assert_eq!(writes.rows.lock().len(), 2);
+    }
+
+    #[test]
+    fn fully_checkpointed_page_skips_corrupt_journal_discovery() {
+        let data_dir = TempDir::new().unwrap();
+        let rollup_dir = data_dir.path().join(ROLLUP_DIR_NAME);
+        std::fs::create_dir_all(&rollup_dir).unwrap();
+        let batch = rollup_dir.join("state-journal-batch-0000000000000001.d");
+        std::fs::create_dir(&batch).unwrap();
+        let unknown = batch.join("operator.keep");
+        std::fs::write(&unknown, b"preserved").unwrap();
+
+        let runtime =
+            RollupRuntimeState::new_with_disk_budget(Some(data_dir.path().to_path_buf()), None);
+        let store = RollupStateStoreContext { state: &runtime };
+        let policy = RollupPolicy {
+            id: "no-event-page".to_string(),
+            metric: "cpu_usage".to_string(),
+            match_labels: Vec::new(),
+            interval: 1_000,
+            aggregation: Aggregation::Avg,
+            bucket_origin: 0,
+        };
+        let source = RollupSourceSeries {
+            series_id: 1,
+            source_key: source_series_key(&policy.metric, &[]),
+            labels: Vec::new(),
+        };
+        runtime.generations.write().insert(policy.id.clone(), 0);
+        runtime
+            .checkpoints
+            .write()
+            .entry(policy.id.clone())
+            .or_default()
+            .insert(source.source_key.clone(), 2_000);
+        let reads = FixedSourceReads {
+            budget: crate::QueryBudget::new(QueryBudgetLimits::default()).unwrap(),
+            points: Vec::new(),
+        };
+        let registry = RwLock::new(SeriesRegistry::new());
+        let registry_context = RollupRegistryReadContext {
+            registry: &registry,
+        };
+        let writes = CapturingRollupWrites::default();
+        let semaphore = crate::concurrency::Semaphore::new(1);
+        let write_permit = semaphore.acquire();
+        let report = match run_rollup_policy_sources_once(
+            store,
+            RollupSourceReadContext {
+                registry: registry_context,
+                ops: &reads,
+            },
+            RollupMaterializedWriteContext {
+                ops: &writes,
+                write_permit: &write_permit,
+                write_batch_limits: crate::WriteBatchLimits::default(),
+            },
+            &policy,
+            2_000,
+            std::slice::from_ref(&source),
+            false,
+        ) {
+            Ok(report) => report,
+            Err(error) => panic!(
+                "a no-event page must not discover an unrelated corrupt journal batch: {}",
+                error.error()
+            ),
+        };
+        assert!(!report.checkpoint_changed);
+        assert_eq!(std::fs::read(unknown).unwrap(), b"preserved");
+        assert!(writes.rows.lock().is_empty());
+    }
+
+    #[test]
+    fn multi_source_page_batches_journal_events_without_full_root_reconciliation() {
+        let data_dir = TempDir::new().unwrap();
+        let rollup_dir = data_dir.path().join(ROLLUP_DIR_NAME);
+        std::fs::create_dir_all(&rollup_dir).unwrap();
+        let budget =
+            crate::LocalDiskBudget::open(data_dir.path(), crate::LocalDiskLimits::default())
+                .unwrap();
+        let runtime = RollupRuntimeState::new_with_disk_budget(
+            Some(data_dir.path().to_path_buf()),
+            Some(Arc::clone(&budget)),
+        );
+        let store = RollupStateStoreContext { state: &runtime };
+        let policy = RollupPolicy {
+            id: "batched-page".to_string(),
+            metric: "cpu_usage".to_string(),
+            match_labels: Vec::new(),
+            interval: 1_000,
+            aggregation: Aggregation::Avg,
+            bucket_origin: 0,
+        };
+        runtime.generations.write().insert(policy.id.clone(), 0);
+        let sources = [
+            RollupSourceSeries {
+                series_id: 1,
+                source_key: "cpu_usage{host=\"a\"}".to_string(),
+                labels: vec![Label::new("host", "a")],
+            },
+            RollupSourceSeries {
+                series_id: 2,
+                source_key: "cpu_usage{host=\"b\"}".to_string(),
+                labels: vec![Label::new("host", "b")],
+            },
+        ];
+        let reads = FixedSourceReads {
+            budget: crate::QueryBudget::new(QueryBudgetLimits::default()).unwrap(),
+            points: vec![DataPoint::new(0, 1.0), DataPoint::new(1_000, 3.0)],
+        };
+        let registry = RwLock::new(SeriesRegistry::new());
+        let registry_context = RollupRegistryReadContext {
+            registry: &registry,
+        };
+        let writes = CapturingRollupWrites::default();
+        let semaphore = crate::concurrency::Semaphore::new(1);
+        let write_permit = semaphore.acquire();
+        let before = budget.snapshot();
+
+        let report = match run_rollup_policy_sources_once(
+            store,
+            RollupSourceReadContext {
+                registry: registry_context,
+                ops: &reads,
+            },
+            RollupMaterializedWriteContext {
+                ops: &writes,
+                write_permit: &write_permit,
+                write_batch_limits: crate::WriteBatchLimits::default(),
+            },
+            &policy,
+            2_000,
+            &sources,
+            false,
+        ) {
+            Ok(report) => report,
+            Err(error) => panic!("batched source page failed: {}", error.error()),
+        };
+        assert_eq!(report.materialized_series, 2);
+        let after = budget.snapshot();
+        assert_eq!(after.reconciliations_total, before.reconciliations_total);
+        assert_eq!(after.active_reservations, 0);
+        assert_eq!(after.reserved_bytes, 0);
+        let batches = std::fs::read_dir(&rollup_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("state-journal-batch-"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(std::fs::read_dir(&batches[0]).unwrap().count(), 4);
     }
 
     #[test]

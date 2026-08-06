@@ -626,49 +626,11 @@ fn tombstone_transaction_path(data_path: &Path) -> PathBuf {
 }
 
 fn absolute_path_lexically_normalized(path: &Path) -> Result<PathBuf> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir().map_err(TsinkError::Io)?.join(path)
-    };
-    let mut normalized = PathBuf::new();
-    for component in absolute.components() {
-        match component {
-            std::path::Component::Prefix(_)
-            | std::path::Component::RootDir
-            | std::path::Component::Normal(_) => normalized.push(component.as_os_str()),
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                normalized.pop();
-            }
-        }
-    }
-    Ok(normalized)
+    crate::engine::fs_utils::absolute_path_lexically_normalized(path)
 }
 
 fn resolve_trusted_namespace_root(path: &Path) -> Result<PathBuf> {
-    let absolute = absolute_path_lexically_normalized(path)?;
-    let mut resolved = PathBuf::new();
-    let mut encountered_missing = false;
-    for component in absolute.components() {
-        resolved.push(component.as_os_str());
-        if encountered_missing {
-            continue;
-        }
-        match std::fs::canonicalize(&resolved) {
-            Ok(canonical) => resolved = canonical,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                encountered_missing = true;
-            }
-            Err(source) => {
-                return Err(TsinkError::IoWithPath {
-                    path: resolved,
-                    source,
-                })
-            }
-        }
-    }
-    Ok(resolved)
+    crate::engine::fs_utils::resolve_trusted_namespace_root(path)
 }
 
 pub(crate) fn normalize_tombstone_lanes(lanes: &[TombstoneLane]) -> Result<Vec<TombstoneLane>> {
@@ -705,29 +667,7 @@ fn validate_boundary_directory(
     description: &str,
     allow_root_alias: bool,
 ) -> Result<()> {
-    let metadata = if allow_root_alias {
-        std::fs::metadata(root)
-    } else {
-        std::fs::symlink_metadata(root)
-    };
-    match metadata {
-        Ok(metadata)
-            if metadata.is_dir()
-                && (allow_root_alias
-                    || !crate::engine::fs_utils::is_link_or_reparse_point(&metadata)) =>
-        {
-            Ok(())
-        }
-        Ok(_) => Err(TsinkError::InvalidConfiguration(format!(
-            "{description} must resolve to a directory: {}",
-            root.display()
-        ))),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(TsinkError::IoWithPath {
-            path: root.to_path_buf(),
-            source,
-        }),
-    }
+    crate::engine::fs_utils::validate_boundary_directory(root, description, allow_root_alias)
 }
 
 fn validate_owned_entry_below_alias_boundary(
@@ -735,57 +675,18 @@ fn validate_owned_entry_below_alias_boundary(
     target: &Path,
     final_kind: OwnedTombstoneEntryKind,
 ) -> Result<()> {
-    let relative = target.strip_prefix(root).map_err(|_| {
-        TsinkError::InvalidConfiguration(format!(
-            "owned tombstone path {} escapes configured boundary {}",
-            target.display(),
-            root.display()
-        ))
-    })?;
-    if relative.as_os_str().is_empty() {
-        return Err(TsinkError::InvalidConfiguration(format!(
-            "owned tombstone path may not replace its configured boundary: {}",
-            root.display()
-        )));
-    }
-    let components = relative.components().collect::<Vec<_>>();
-    let mut current = root.to_path_buf();
-    for (index, component) in components.iter().enumerate() {
-        let std::path::Component::Normal(component) = component else {
-            return Err(TsinkError::InvalidConfiguration(format!(
-                "owned tombstone path contains a non-normal component: {}",
-                target.display()
-            )));
-        };
-        current.push(component);
-        let metadata = match std::fs::symlink_metadata(&current) {
-            Ok(metadata) => metadata,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => break,
-            Err(source) => {
-                return Err(TsinkError::IoWithPath {
-                    path: current,
-                    source,
-                })
-            }
-        };
-        let final_component = index + 1 == components.len();
-        let valid = !crate::engine::fs_utils::is_link_or_reparse_point(&metadata)
-            && if final_component {
-                match final_kind {
-                    OwnedTombstoneEntryKind::File => metadata.file_type().is_file(),
-                    OwnedTombstoneEntryKind::Directory => metadata.file_type().is_dir(),
-                }
-            } else {
-                metadata.file_type().is_dir()
-            };
-        if !valid {
-            return Err(TsinkError::DataCorruption(format!(
-                "owned tombstone path contains a link-like or wrong-type entry: {}",
-                current.display()
-            )));
+    let final_kind = match final_kind {
+        OwnedTombstoneEntryKind::File => crate::engine::fs_utils::OwnedBoundaryEntryKind::File,
+        OwnedTombstoneEntryKind::Directory => {
+            crate::engine::fs_utils::OwnedBoundaryEntryKind::Directory
         }
-    }
-    Ok(())
+    };
+    crate::engine::fs_utils::validate_owned_entry_below_alias_boundary(
+        root,
+        target,
+        final_kind,
+        "owned tombstone",
+    )
 }
 
 fn validate_tombstone_lane_namespace(lane: &TombstoneLane) -> Result<()> {
@@ -1050,15 +951,15 @@ fn cleanup_tombstone_atomic_temps_before_recovery(
     }
 
     // Enumeration and every memory check complete before the first deletion. Exact-file removal
-    // preserves the no-follow boundary and reconciles governed quota accounting.
-    for path in owned_paths {
-        remove_owned_regular_file_and_sync_parent_budgeted(
-            &path,
-            budget,
-            crate::DiskCategory::Temporary,
-        )?;
-    }
-    Ok(())
+    // preserves the no-follow boundary. One lazy Recovery reservation covers every governed
+    // temporary and exact accounting is installed by at most one terminal reconciliation.
+    remove_owned_regular_files_and_sync_parents_budgeted(
+        owned_paths.iter().map(PathBuf::as_path),
+        budget,
+        crate::DiskCategory::Temporary,
+        |_| Ok(()),
+    )
+    .map(|_| ())
 }
 
 fn preflight_recovery_namespace_directory(
@@ -2578,81 +2479,133 @@ fn fingerprint_candidate_manifest_shards(
     Ok(records)
 }
 
-/// Removes only an exact, no-follow regular-file target. In particular this never falls back to
-/// recursive directory removal if an owned filename is replaced between discovery and cleanup.
+/// Removes only an exact, no-follow regular-file target and reports whether the directory entry
+/// actually disappeared. In particular this never falls back to recursive directory removal if
+/// an owned filename is replaced between discovery and cleanup.
+fn remove_owned_regular_file_and_sync_parent_observed(path: &Path) -> Result<bool> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => {
+            return Err(TsinkError::IoWithPath {
+                path: path.to_path_buf(),
+                source,
+            })
+        }
+    };
+    if !metadata.file_type().is_file()
+        || crate::engine::fs_utils::is_link_or_reparse_point(&metadata)
+    {
+        return Err(TsinkError::DataCorruption(format!(
+            "owned tombstone cleanup target must be a regular file and may not be link-like: {}",
+            path.display()
+        )));
+    }
+    let removed = remove_file_if_exists(path).map_err(|source| TsinkError::IoWithPath {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if removed {
+        crate::engine::fs_utils::sync_parent_dir(path)?;
+    }
+    Ok(removed)
+}
+
+/// Removes a preflighted sequence of exact tombstone files under one lazy governed reservation.
+///
+/// Cleanup stops at the first per-entry error, preserving caller ordering. A successful no-op
+/// batch avoids a root scan; any governed unlink, ambiguous removal/sync failure, or settlement
+/// failure receives exactly one terminal reconciliation before the result is returned.
+fn remove_owned_regular_files_and_sync_parents_budgeted<'a>(
+    paths: impl IntoIterator<Item = &'a Path>,
+    budget: Option<&Arc<crate::LocalDiskBudget>>,
+    category: crate::DiskCategory,
+    mut validate_before_remove: impl FnMut(&Path) -> Result<()>,
+) -> Result<u64> {
+    let mut reservation = None;
+    let mut governed_mutation_or_ambiguity = false;
+    let mut removed = 0u64;
+    let removal_result = (|| -> Result<()> {
+        for path in paths {
+            validate_before_remove(path)?;
+            let governed = match budget {
+                Some(budget) => budget.governs_entry(path)?,
+                None => false,
+            };
+            if governed && reservation.is_none() {
+                reservation = Some(
+                    budget
+                        .expect("governed tombstone cleanup requires a disk budget")
+                        .reserve(category, 0, crate::DiskReservationKind::Recovery)?,
+                );
+            }
+            match remove_owned_regular_file_and_sync_parent_observed(path) {
+                Ok(was_removed) => {
+                    governed_mutation_or_ambiguity |= governed && was_removed;
+                    if was_removed {
+                        removed = removed.saturating_add(1);
+                    }
+                }
+                Err(err) => {
+                    governed_mutation_or_ambiguity |= governed;
+                    return Err(err);
+                }
+            }
+        }
+        Ok(())
+    })();
+
+    let settlement_result = reservation
+        .map(|reservation| reservation.commit(0, 0))
+        .transpose()
+        .map(|_| ());
+    if settlement_result.is_err() {
+        governed_mutation_or_ambiguity = true;
+    }
+    let reconciliation_result = if governed_mutation_or_ambiguity {
+        budget
+            .expect("governed tombstone cleanup requires a disk budget")
+            .reconcile_when_idle()
+            .map(|_| ())
+    } else {
+        Ok(())
+    };
+
+    let mut errors = Vec::new();
+    if let Err(err) = &removal_result {
+        errors.push(format!("cleanup failed: {err}"));
+    }
+    if let Err(err) = &settlement_result {
+        errors.push(format!("disk settlement failed: {err}"));
+    }
+    if let Err(err) = &reconciliation_result {
+        errors.push(format!("disk reconciliation failed: {err}"));
+    }
+    match errors.len() {
+        0 => Ok(removed),
+        1 => match (removal_result, settlement_result, reconciliation_result) {
+            (Err(err), _, _) | (_, Err(err), _) | (_, _, Err(err)) => Err(err),
+            _ => unreachable!("one recorded tombstone cleanup error must have a failed result"),
+        },
+        _ => Err(TsinkError::Other(format!(
+            "batched budgeted exact-file tombstone cleanup failed: {}",
+            errors.join("; ")
+        ))),
+    }
+}
+
 fn remove_owned_regular_file_and_sync_parent_budgeted(
     path: &Path,
     budget: Option<&Arc<crate::LocalDiskBudget>>,
     category: crate::DiskCategory,
 ) -> Result<bool> {
-    let governed_budget = match budget {
-        Some(budget) if budget.governs_entry(path)? => Some(budget),
-        _ => None,
-    };
-    let reservation = governed_budget
-        .map(|budget| budget.reserve(category, 0, crate::DiskReservationKind::Recovery))
-        .transpose()?;
-
-    let removal_result = (|| -> Result<bool> {
-        let metadata = match std::fs::symlink_metadata(path) {
-            Ok(metadata) => metadata,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(source) => {
-                return Err(TsinkError::IoWithPath {
-                    path: path.to_path_buf(),
-                    source,
-                })
-            }
-        };
-        if !metadata.file_type().is_file()
-            || crate::engine::fs_utils::is_link_or_reparse_point(&metadata)
-        {
-            return Err(TsinkError::DataCorruption(format!(
-                "owned tombstone cleanup target must be a regular file and may not be link-like: {}",
-                path.display()
-            )));
-        }
-        let removed = remove_file_if_exists(path).map_err(|source| TsinkError::IoWithPath {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        if removed {
-            crate::engine::fs_utils::sync_parent_dir(path)?;
-        }
-        Ok(removed)
-    })();
-
-    let settlement_result = reservation
-        .map(|reservation| reservation.commit(0, 0))
-        .transpose();
-    let reconciliation_result = governed_budget
-        .map(|budget| budget.reconcile_when_idle().map(|_| ()))
-        .transpose();
-
-    let removed = removal_result.as_ref().copied().unwrap_or(false);
-    let mut errors = Vec::new();
-    if let Err(err) = removal_result {
-        errors.push(err);
-    }
-    if let Err(err) = settlement_result {
-        errors.push(err);
-    }
-    if let Err(err) = reconciliation_result {
-        errors.push(err);
-    }
-    match errors.len() {
-        0 => Ok(removed),
-        1 => Err(errors.pop().expect("one tombstone cleanup error")),
-        _ => Err(TsinkError::Other(format!(
-            "budgeted exact-file removal of {} failed: {}",
-            path.display(),
-            errors
-                .into_iter()
-                .map(|err| err.to_string())
-                .collect::<Vec<_>>()
-                .join("; ")
-        ))),
-    }
+    remove_owned_regular_files_and_sync_parents_budgeted(
+        std::iter::once(path),
+        budget,
+        category,
+        |_| Ok(()),
+    )
+    .map(|removed| removed != 0)
 }
 
 fn cleanup_replaced_shards(
@@ -5276,62 +5229,315 @@ pub(crate) fn cleanup_unreferenced_tombstone_shards(
     cleanup_unreferenced_tombstone_shards_with_memory_admission(lane, local_disk_budget, |_| Ok(()))
 }
 
+/// One exact startup plan for unreferenced immutable tombstone shard finals.
+///
+/// The plan retains the normalized lane, stable identities for both directories involved in the
+/// cleanup, the manifest fingerprint used to classify references, and only exact owned regular
+/// files. Its raw executor deliberately owns no local-disk lock, reservation, or reconciliation;
+/// aggregate startup cleanup supplies those responsibilities once across every category.
+pub(crate) struct TombstoneFinalOrphanCleanupPlan {
+    lane: TombstoneLane,
+    lane_directory: PathBuf,
+    lane_directory_identity: same_file::Handle,
+    shards_directory: PathBuf,
+    shards_directory_identity: same_file::Handle,
+    manifest_fingerprint: RemoteTombstoneManifestFingerprint,
+    orphan_paths: Vec<PathBuf>,
+}
+
+impl TombstoneFinalOrphanCleanupPlan {
+    pub(crate) fn governed_path(&self) -> &Path {
+        &self.lane.manifest_path
+    }
+
+    pub(crate) fn modeled_heap_bytes(&self) -> Result<usize> {
+        let orphan_vector = self
+            .orphan_paths
+            .capacity()
+            .checked_mul(std::mem::size_of::<PathBuf>())
+            .ok_or_else(|| {
+                TsinkError::Other(
+                    "tombstone final-orphan plan vector capacity overflow".to_string(),
+                )
+            })?;
+        [
+            self.lane.namespace_root.capacity(),
+            self.lane.manifest_path.capacity(),
+            self.lane_directory.capacity(),
+            self.shards_directory.capacity(),
+        ]
+        .into_iter()
+        .chain(self.orphan_paths.iter().map(PathBuf::capacity))
+        .try_fold(orphan_vector, |total, bytes| {
+            total.checked_add(bytes).ok_or_else(|| {
+                TsinkError::Other(
+                    "tombstone final-orphan plan retained-memory overflow".to_string(),
+                )
+            })
+        })
+    }
+
+    pub(crate) fn execution_scratch_bytes(&self) -> Result<usize> {
+        let manifest_bytes =
+            usize::try_from(self.manifest_fingerprint.logical_bytes).map_err(|_| {
+                TsinkError::Other(
+                    "tombstone final-orphan manifest length exceeds the supported range"
+                        .to_string(),
+                )
+            })?;
+        let validation_paths = 4usize
+            .checked_mul(
+                std::mem::size_of::<PathBuf>()
+                    .checked_add(MAX_TOMBSTONE_TRANSACTION_PATH_BYTES)
+                    .ok_or_else(|| {
+                        TsinkError::Other(
+                            "tombstone final-orphan execution memory overflow".to_string(),
+                        )
+                    })?,
+            )
+            .ok_or_else(|| {
+                TsinkError::Other("tombstone final-orphan execution memory overflow".to_string())
+            })?;
+        manifest_bytes
+            .checked_add(validation_paths)
+            .and_then(|bytes| bytes.checked_add(TOMBSTONE_CLEANUP_ALLOCATOR_SLACK))
+            .ok_or_else(|| {
+                TsinkError::Other("tombstone final-orphan execution memory overflow".to_string())
+            })
+    }
+
+    /// Executes exact removals without local-disk accounting or mutation-lock acquisition.
+    pub(crate) fn execute_raw(self) -> Result<u64> {
+        validate_tombstone_lane_namespace(&self.lane)?;
+        for (directory, identity, description) in [
+            (
+                &self.lane_directory,
+                &self.lane_directory_identity,
+                "tombstone lane directory",
+            ),
+            (
+                &self.shards_directory,
+                &self.shards_directory_identity,
+                "tombstone shards directory",
+            ),
+        ] {
+            if !crate::engine::fs_utils::path_matches_plain_directory_identity(directory, identity)?
+            {
+                return Err(TsinkError::DataCorruption(format!(
+                    "{description} identity changed before final-orphan cleanup: {}",
+                    directory.display()
+                )));
+            }
+        }
+
+        let expected_len = self
+            .manifest_fingerprint
+            .exists
+            .then(|| usize::try_from(self.manifest_fingerprint.logical_bytes))
+            .transpose()
+            .map_err(|_| {
+                TsinkError::Other(
+                    "tombstone final-orphan manifest length exceeds the supported range"
+                        .to_string(),
+                )
+            })?;
+        let current_fingerprint = revalidate_remote_tombstone_manifest(&self.lane, expected_len)?;
+        if current_fingerprint != self.manifest_fingerprint {
+            return Err(TsinkError::DataCorruption(format!(
+                "tombstone manifest changed before final-orphan cleanup: {}",
+                self.lane.manifest_path.display()
+            )));
+        }
+
+        let mut removed = 0u64;
+        for path in self.orphan_paths {
+            let file_name = path.file_name().and_then(|name| name.to_str());
+            if !file_name.is_some_and(is_owned_tombstone_shard_name) {
+                return Err(TsinkError::DataCorruption(format!(
+                    "planned tombstone final orphan no longer has an owned shard name: {}",
+                    path.display()
+                )));
+            }
+            if remove_owned_regular_file_and_sync_parent_observed(&path)? {
+                removed = removed.saturating_add(1);
+            }
+        }
+        Ok(removed)
+    }
+}
+
+#[allow(dead_code)] // Retained as the behavior-compatible standalone cleanup adapter.
 pub(crate) fn cleanup_unreferenced_tombstone_shards_with_memory_admission(
     lane: &TombstoneLane,
     local_disk_budget: Option<&Arc<crate::LocalDiskBudget>>,
-    admit_memory: impl FnMut(usize) -> Result<()>,
+    mut admit_memory: impl FnMut(usize) -> Result<()>,
 ) -> Result<u64> {
-    cleanup_unreferenced_tombstone_shards_with_memory_admission_inner(
+    let mut namespace_budget = crate::engine::fs_utils::RecoveryNamespaceBudget::new(
+        crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES,
+    );
+    let Some(plan) = plan_unreferenced_tombstone_shard_cleanup(
         lane,
-        local_disk_budget,
-        true,
-        admit_memory,
+        &mut namespace_budget,
+        0,
+        &mut admit_memory,
+    )?
+    else {
+        return Ok(0);
+    };
+    let governed = local_disk_budget
+        .map(|budget| budget.governs_entry(plan.governed_path()))
+        .transpose()?
+        .unwrap_or(false);
+    let reservation = if governed {
+        Some(
+            local_disk_budget
+                .expect("governed tombstone cleanup requires a disk budget")
+                .reserve(
+                    crate::DiskCategory::Tombstones,
+                    0,
+                    crate::DiskReservationKind::Recovery,
+                )?,
+        )
+    } else {
+        None
+    };
+    let cleanup_result = plan.execute_raw();
+    let removed = cleanup_result.as_ref().copied().unwrap_or(0);
+    let settlement_result = reservation
+        .map(|reservation| reservation.commit(0, 0))
+        .transpose()
+        .map(|_| ());
+    let reconciliation_result =
+        if governed && (removed > 0 || cleanup_result.is_err() || settlement_result.is_err()) {
+            local_disk_budget
+                .expect("governed tombstone cleanup requires a disk budget")
+                .reconcile_when_idle()
+                .map(|_| ())
+        } else {
+            Ok(())
+        };
+    combine_tombstone_final_orphan_cleanup_results(
+        cleanup_result,
+        settlement_result,
+        reconciliation_result,
+        removed,
     )
 }
 
 /// Performs the complete bounded scan and every modeled-memory admission used by orphan cleanup
 /// without deleting a shard. Startup uses this for all configured lanes before executing any
 /// lane cleanup, so a later lane's finite-memory rejection cannot follow an earlier lane mutation.
+#[allow(dead_code)] // Retained as the behavior-compatible standalone preflight adapter.
 pub(crate) fn preflight_unreferenced_tombstone_shard_cleanup_memory(
     lane: &TombstoneLane,
-    admit_memory: impl FnMut(usize) -> Result<()>,
+    mut admit_memory: impl FnMut(usize) -> Result<()>,
 ) -> Result<()> {
-    cleanup_unreferenced_tombstone_shards_with_memory_admission_inner(
-        lane,
-        None,
-        false,
-        admit_memory,
-    )
-    .map(|_| ())
+    let mut namespace_budget = crate::engine::fs_utils::RecoveryNamespaceBudget::new(
+        crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES,
+    );
+    plan_unreferenced_tombstone_shard_cleanup(lane, &mut namespace_budget, 0, &mut admit_memory)
+        .map(drop)
 }
 
-fn cleanup_unreferenced_tombstone_shards_with_memory_admission_inner(
+pub(crate) fn plan_unreferenced_tombstone_shard_cleanup(
     lane: &TombstoneLane,
-    local_disk_budget: Option<&Arc<crate::LocalDiskBudget>>,
-    remove_orphans: bool,
+    namespace_budget: &mut crate::engine::fs_utils::RecoveryNamespaceBudget,
+    base_retained_bytes: usize,
     mut admit_memory: impl FnMut(usize) -> Result<()>,
-) -> Result<u64> {
+) -> Result<Option<TombstoneFinalOrphanCleanupPlan>> {
+    for path in [&lane.namespace_root, &lane.manifest_path] {
+        if path.as_os_str().as_encoded_bytes().len() > MAX_TOMBSTONE_TRANSACTION_PATH_BYTES {
+            return Err(TsinkError::InvalidConfiguration(format!(
+                "tombstone cleanup path exceeds the {}-byte startup bound: {}",
+                MAX_TOMBSTONE_TRANSACTION_PATH_BYTES,
+                path.display()
+            )));
+        }
+    }
+    let normalization_peak = 6usize
+        .checked_mul(
+            std::mem::size_of::<PathBuf>()
+                .checked_add(MAX_TOMBSTONE_TRANSACTION_PATH_BYTES)
+                .ok_or_else(|| {
+                    TsinkError::Other("tombstone cleanup normalization overflow".to_string())
+                })?,
+        )
+        .and_then(|bytes| bytes.checked_add(std::mem::size_of::<TombstoneLane>()))
+        .and_then(|bytes| bytes.checked_add(base_retained_bytes))
+        .ok_or_else(|| TsinkError::Other("tombstone cleanup normalization overflow".to_string()))?;
+    admit_memory(normalization_peak)?;
     let normalized = normalize_tombstone_lanes(std::slice::from_ref(lane))?;
     let lane = normalized
-        .first()
+        .into_iter()
+        .next()
         .expect("normalizing one tombstone lane returns one lane");
-    validate_tombstone_lanes(std::slice::from_ref(lane))?;
+    validate_tombstone_lanes(std::slice::from_ref(&lane))?;
+    for path in [&lane.namespace_root, &lane.manifest_path] {
+        if path.as_os_str().as_encoded_bytes().len() > MAX_TOMBSTONE_TRANSACTION_PATH_BYTES {
+            return Err(TsinkError::InvalidConfiguration(format!(
+                "normalized tombstone cleanup path exceeds the {}-byte startup bound: {}",
+                MAX_TOMBSTONE_TRANSACTION_PATH_BYTES,
+                path.display()
+            )));
+        }
+    }
+    let lane_directory_source = lane.manifest_path.parent().ok_or_else(|| {
+        TsinkError::InvalidConfiguration(format!(
+            "tombstone manifest has no lane directory: {}",
+            lane.manifest_path.display()
+        ))
+    })?;
+    let derived_path_peak = base_retained_bytes
+        .checked_add(std::mem::size_of::<TombstoneFinalOrphanCleanupPlan>())
+        .and_then(|bytes| bytes.checked_add(path_retained_bytes(&lane.namespace_root)))
+        .and_then(|bytes| bytes.checked_add(path_retained_bytes(&lane.manifest_path)))
+        .and_then(|bytes| {
+            bytes.checked_add(2usize.checked_mul(
+                std::mem::size_of::<PathBuf>().checked_add(MAX_TOMBSTONE_TRANSACTION_PATH_BYTES)?,
+            )?)
+        })
+        .ok_or_else(|| TsinkError::Other("tombstone cleanup path memory overflow".to_string()))?;
+    admit_memory(derived_path_peak)?;
+    let lane_directory = lane_directory_source.to_path_buf();
+    let shards_directory = tombstone_shards_dir(&lane.manifest_path);
+    for path in [&lane_directory, &shards_directory] {
+        if path.as_os_str().as_encoded_bytes().len() > MAX_TOMBSTONE_TRANSACTION_PATH_BYTES {
+            return Err(TsinkError::InvalidConfiguration(format!(
+                "derived tombstone cleanup path exceeds the {}-byte startup bound: {}",
+                MAX_TOMBSTONE_TRANSACTION_PATH_BYTES,
+                path.display()
+            )));
+        }
+    }
+    let discovery_path_retained = std::mem::size_of::<TombstoneFinalOrphanCleanupPlan>()
+        .checked_add(lane.namespace_root.capacity())
+        .and_then(|bytes| bytes.checked_add(lane.manifest_path.capacity()))
+        .and_then(|bytes| bytes.checked_add(lane_directory.capacity()))
+        .and_then(|bytes| bytes.checked_add(shards_directory.capacity()))
+        .ok_or_else(|| TsinkError::Other("tombstone cleanup path memory overflow".to_string()))?;
     let path = &lane.manifest_path;
     let maximum_reference_set_staging = TOMBSTONE_STORE_SHARD_COUNT
         .saturating_mul(std::mem::size_of::<String>().saturating_add(80))
         .saturating_add(TOMBSTONE_CLEANUP_ALLOCATOR_SLACK);
-    let referenced = match read_optional_regular_file_bounded_exact_with_admission(
+    let manifest_bytes = read_optional_regular_file_bounded_exact_with_admission(
         path,
         MAX_TOMBSTONE_TRANSACTION_RECORD_BYTES,
         |len| {
-            admit_memory(
-                len.saturating_mul(64)
-                    .saturating_add(maximum_reference_set_staging)
-                    .saturating_add(4096),
-            )
+            let manifest_peak = len
+                .checked_mul(64)
+                .and_then(|bytes| bytes.checked_add(maximum_reference_set_staging))
+                .and_then(|bytes| bytes.checked_add(4096))
+                .and_then(|bytes| bytes.checked_add(discovery_path_retained))
+                .and_then(|bytes| bytes.checked_add(base_retained_bytes))
+                .ok_or_else(|| {
+                    TsinkError::Other("tombstone cleanup manifest memory overflow".to_string())
+                })?;
+            admit_memory(manifest_peak)
         },
-    )? {
-        Some(bytes) => match load_store_manifest_from_bytes(&bytes)? {
+    )?;
+    let manifest_fingerprint = remote_tombstone_manifest_fingerprint(manifest_bytes.as_deref());
+    let referenced = match manifest_bytes.as_deref() {
+        Some(bytes) => match load_store_manifest_from_bytes(bytes)? {
             Some(manifest) => manifest
                 .shards
                 .into_iter()
@@ -5341,73 +5547,89 @@ fn cleanup_unreferenced_tombstone_shards_with_memory_admission_inner(
                 // An existing non-V2 file implies no shard references only when it is a fully
                 // valid legacy V1 snapshot. Unrecognized bytes may be a damaged V2 manifest, so
                 // fail closed and retain every candidate shard for explicit recovery.
-                load_legacy_tombstones_from_bytes(&bytes)?;
+                load_legacy_tombstones_from_bytes(bytes)?;
                 HashSet::new()
             }
         },
         None => HashSet::new(),
     };
+    drop(manifest_bytes);
 
     // Revalidate the complete no-follow namespace immediately before scanning. The per-entry
     // exact-file removal below repeats the final type check and cannot recurse on a type swap.
-    validate_tombstone_lane_namespace(lane)?;
-    let shards_dir = tombstone_shards_dir(path);
-    match std::fs::symlink_metadata(&shards_dir) {
+    validate_tombstone_lane_namespace(&lane)?;
+    match std::fs::symlink_metadata(&shards_directory) {
         Ok(metadata)
             if metadata.file_type().is_dir()
                 && !crate::engine::fs_utils::is_link_or_reparse_point(&metadata) => {}
         Ok(_) => {
             return Err(TsinkError::DataCorruption(format!(
             "tombstone shard cleanup namespace must be a directory and may not be link-like: {}",
-            shards_dir.display()
+            shards_directory.display()
         )))
         }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(source) => {
             return Err(TsinkError::IoWithPath {
-                path: shards_dir,
+                path: shards_directory,
                 source,
             })
         }
     }
+    let lane_directory_identity = crate::engine::fs_utils::capture_plain_directory_identity(
+        &lane_directory,
+        "tombstone final-orphan lane directory",
+    )?;
+    let shards_directory_identity = crate::engine::fs_utils::capture_plain_directory_identity(
+        &shards_directory,
+        "tombstone final-orphan shards directory",
+    )?;
     let reference_set_retained = tombstone_cleanup_reference_set_retained_bytes(&referenced);
-    let entry_transient = tombstone_cleanup_entry_transient_bytes(&shards_dir);
+    let entry_transient = tombstone_cleanup_entry_transient_bytes(&shards_directory);
     let mut orphan_paths = Vec::new();
     let mut orphan_path_payload_bytes = 0usize;
-    let mut entries_seen = 0usize;
     // Keep deletion two-phase without retaining every unrelated directory entry. Before asking
     // the OS for each DirEntry, reserve one maximum-length transient entry plus every retained
     // candidate accumulated so far. The namespace count remains bounded and every failure occurs
     // before the first removal.
-    let mut entries = std::fs::read_dir(&shards_dir).map_err(|source| TsinkError::IoWithPath {
-        path: shards_dir.clone(),
-        source,
-    })?;
+    admit_memory(
+        base_retained_bytes
+            .checked_add(discovery_path_retained)
+            .and_then(|bytes| bytes.checked_add(reference_set_retained))
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<std::fs::ReadDir>()))
+            .ok_or_else(|| {
+                TsinkError::Other("tombstone cleanup scan memory overflow".to_string())
+            })?,
+    )?;
+    let mut entries =
+        std::fs::read_dir(&shards_directory).map_err(|source| TsinkError::IoWithPath {
+            path: shards_directory.clone(),
+            source,
+        })?;
     loop {
         let orphan_retained = tombstone_cleanup_orphan_paths_retained_bytes(
             orphan_paths.capacity(),
             orphan_path_payload_bytes,
         );
         admit_memory(
-            reference_set_retained
-                .saturating_add(orphan_retained)
-                .saturating_add(entry_transient),
+            base_retained_bytes
+                .checked_add(discovery_path_retained)
+                .and_then(|bytes| bytes.checked_add(reference_set_retained))
+                .and_then(|bytes| bytes.checked_add(orphan_retained))
+                .and_then(|bytes| bytes.checked_add(entry_transient))
+                .and_then(|bytes| bytes.checked_add(std::mem::size_of::<std::fs::ReadDir>()))
+                .ok_or_else(|| {
+                    TsinkError::Other("tombstone cleanup entry memory overflow".to_string())
+                })?,
         )?;
         let Some(entry) = entries.next() else {
             break;
         };
+        namespace_budget.observe_entry(&shards_directory, "tombstone final-orphan cleanup")?;
         let entry = entry.map_err(|source| TsinkError::IoWithPath {
-            path: shards_dir.clone(),
+            path: shards_directory.clone(),
             source,
         })?;
-        entries_seen = entries_seen.saturating_add(1);
-        if entries_seen > crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES {
-            return Err(TsinkError::DataCorruption(format!(
-                "tombstone orphan-shard cleanup directory exceeds the {}-entry recovery bound: {}",
-                crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES,
-                shards_dir.display()
-            )));
-        }
         let file_name = entry.file_name();
         let Some(file_name) = file_name.to_str() else {
             continue;
@@ -5437,41 +5659,163 @@ fn cleanup_unreferenced_tombstone_shards_with_memory_admission_inner(
                 entry_path.display()
             )));
         }
-        let next_path_payload_bytes = orphan_path_payload_bytes.saturating_add(entry_path_len);
-        let required_len = orphan_paths.len().saturating_add(1);
+        let next_path_payload_bytes = orphan_path_payload_bytes
+            .checked_add(entry_path_len)
+            .ok_or_else(|| {
+                TsinkError::Other("tombstone cleanup orphan path overflow".to_string())
+            })?;
+        let required_len = orphan_paths.len().checked_add(1).ok_or_else(|| {
+            TsinkError::Other("tombstone cleanup orphan count overflow".to_string())
+        })?;
         let next_vector_capacity = if required_len <= orphan_paths.capacity() {
             orphan_paths.capacity()
         } else {
-            required_len.next_power_of_two().max(4)
+            required_len
         };
         admit_memory(
-            reference_set_retained
-                .saturating_add(tombstone_cleanup_orphan_paths_retained_bytes(
-                    next_vector_capacity,
-                    next_path_payload_bytes,
-                ))
-                .saturating_add(entry_transient),
+            base_retained_bytes
+                .checked_add(discovery_path_retained)
+                .and_then(|bytes| bytes.checked_add(reference_set_retained))
+                .and_then(|bytes| {
+                    bytes.checked_add(tombstone_cleanup_orphan_paths_retained_bytes(
+                        next_vector_capacity,
+                        next_path_payload_bytes,
+                    ))
+                })
+                .and_then(|bytes| bytes.checked_add(entry_transient))
+                .ok_or_else(|| {
+                    TsinkError::Other("tombstone cleanup path-plan memory overflow".to_string())
+                })?,
         )?;
+        if required_len > orphan_paths.capacity() {
+            orphan_paths.try_reserve_exact(1).map_err(|_| {
+                TsinkError::Other(
+                    "unable to allocate bounded tombstone final-orphan plan".to_string(),
+                )
+            })?;
+        }
         orphan_paths.push(entry_path);
         orphan_path_payload_bytes = next_path_payload_bytes;
     }
+    drop(entries);
 
-    if !remove_orphans {
-        return Ok(0);
-    }
-
-    let mut removed = 0u64;
-    for entry_path in orphan_paths {
-        validate_tombstone_lane_namespace(lane)?;
-        if remove_owned_regular_file_and_sync_parent_budgeted(
-            &entry_path,
-            local_disk_budget,
-            crate::DiskCategory::Tombstones,
-        )? {
-            removed = removed.saturating_add(1);
+    for (directory, identity, description) in [
+        (
+            &lane_directory,
+            &lane_directory_identity,
+            "tombstone lane directory",
+        ),
+        (
+            &shards_directory,
+            &shards_directory_identity,
+            "tombstone shards directory",
+        ),
+    ] {
+        if !crate::engine::fs_utils::path_matches_plain_directory_identity(directory, identity)? {
+            return Err(TsinkError::DataCorruption(format!(
+                "{description} identity changed during final-orphan discovery: {}",
+                directory.display()
+            )));
         }
     }
-    Ok(removed)
+    let fingerprint_scratch = usize::try_from(manifest_fingerprint.logical_bytes)
+        .map_err(|_| {
+            TsinkError::Other(
+                "tombstone final-orphan manifest length exceeds the supported range".to_string(),
+            )
+        })?
+        .checked_add(TOMBSTONE_CLEANUP_ALLOCATOR_SLACK)
+        .ok_or_else(|| {
+            TsinkError::Other("tombstone cleanup fingerprint memory overflow".to_string())
+        })?;
+    admit_memory(
+        base_retained_bytes
+            .checked_add(discovery_path_retained)
+            .and_then(|bytes| bytes.checked_add(reference_set_retained))
+            .and_then(|bytes| {
+                bytes.checked_add(tombstone_cleanup_orphan_paths_retained_bytes(
+                    orphan_paths.capacity(),
+                    orphan_path_payload_bytes,
+                ))
+            })
+            .and_then(|bytes| bytes.checked_add(fingerprint_scratch))
+            .ok_or_else(|| {
+                TsinkError::Other("tombstone cleanup fingerprint memory overflow".to_string())
+            })?,
+    )?;
+    let expected_len = manifest_fingerprint
+        .exists
+        .then(|| usize::try_from(manifest_fingerprint.logical_bytes))
+        .transpose()
+        .map_err(|_| {
+            TsinkError::Other(
+                "tombstone final-orphan manifest length exceeds the supported range".to_string(),
+            )
+        })?;
+    if revalidate_remote_tombstone_manifest(&lane, expected_len)? != manifest_fingerprint {
+        return Err(TsinkError::DataCorruption(format!(
+            "tombstone manifest changed during final-orphan discovery: {}",
+            lane.manifest_path.display()
+        )));
+    }
+
+    if orphan_paths.is_empty() {
+        return Ok(None);
+    }
+    drop(referenced);
+    let plan = TombstoneFinalOrphanCleanupPlan {
+        lane,
+        lane_directory,
+        lane_directory_identity,
+        shards_directory,
+        shards_directory_identity,
+        manifest_fingerprint,
+        orphan_paths,
+    };
+    let retained = base_retained_bytes
+        .checked_add(std::mem::size_of::<TombstoneFinalOrphanCleanupPlan>())
+        .and_then(|bytes| plan.modeled_heap_bytes().ok()?.checked_add(bytes))
+        .ok_or_else(|| {
+            TsinkError::Other("tombstone cleanup retained-memory overflow".to_string())
+        })?;
+    admit_memory(
+        retained
+            .checked_add(plan.execution_scratch_bytes()?)
+            .ok_or_else(|| {
+                TsinkError::Other("tombstone cleanup execution memory overflow".to_string())
+            })?,
+    )?;
+    Ok(Some(plan))
+}
+
+#[allow(dead_code)] // Used by the retained standalone cleanup adapter.
+fn combine_tombstone_final_orphan_cleanup_results(
+    cleanup_result: Result<u64>,
+    settlement_result: Result<()>,
+    reconciliation_result: Result<()>,
+    removed: u64,
+) -> Result<u64> {
+    let mut errors = Vec::new();
+    if let Err(err) = &cleanup_result {
+        errors.push(format!("cleanup failed: {err}"));
+    }
+    if let Err(err) = &settlement_result {
+        errors.push(format!("disk settlement failed: {err}"));
+    }
+    if let Err(err) = &reconciliation_result {
+        errors.push(format!("disk reconciliation failed: {err}"));
+    }
+    match errors.len() {
+        0 => Ok(removed),
+        1 => match (cleanup_result, settlement_result, reconciliation_result) {
+            (Err(err), _, _) | (_, Err(err), _) | (_, _, Err(err)) => Err(err),
+            _ => unreachable!("one recorded tombstone cleanup error must have a failed result"),
+        },
+        _ => Err(TsinkError::Other(format!(
+            "batched budgeted exact-file tombstone cleanup failed: {}",
+            errors.join("; ")
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -5865,6 +6209,90 @@ mod tests {
         assert!(matches!(err, TsinkError::MemoryBudgetExceeded { .. }));
         assert!(peak >= tombstone_cleanup_entry_transient_bytes(&coordinator_dir));
         assert_eq!(std::fs::read(temporary).unwrap(), b"preserve-pending-temp");
+    }
+
+    #[test]
+    fn recovery_atomic_temp_cleanup_batches_managed_removals_into_one_reconciliation() {
+        let temp_dir = TempDir::new().unwrap();
+        let lane_root = temp_dir.path().join("lane_numeric");
+        let manifest_path = lane_root.join(TOMBSTONES_FILE_NAME);
+        let shards_dir = tombstone_shards_dir(&manifest_path);
+        let coordinator_dir = tombstone_transaction_dir(temp_dir.path());
+        std::fs::create_dir_all(&shards_dir).unwrap();
+        std::fs::create_dir_all(&coordinator_dir).unwrap();
+        let pid = std::process::id();
+        let temporaries = [
+            coordinator_dir.join(format!(
+                ".{TOMBSTONE_TRANSACTION_FILE_NAME}.tmp-{pid}-0000000000000001"
+            )),
+            lane_root.join(format!(
+                ".{TOMBSTONES_FILE_NAME}.tmp-{pid}-0000000000000002"
+            )),
+            shards_dir.join(format!(
+                ".shard-007-0000000000000003.bin.tmp-{pid}-0000000000000004"
+            )),
+        ];
+        for temporary in &temporaries {
+            std::fs::write(temporary, b"stale").unwrap();
+        }
+        let unknown = lane_root.join(format!(".{TOMBSTONES_FILE_NAME}.tmp-{pid}-NOT-LOWER-HEX"));
+        std::fs::write(&unknown, b"preserve-unknown").unwrap();
+        let budget =
+            crate::LocalDiskBudget::open(temp_dir.path(), crate::LocalDiskLimits::default())
+                .unwrap();
+        let before = budget.snapshot();
+        let lanes = [TombstoneLane {
+            role: TombstoneLaneRole::LocalNumeric,
+            namespace_root: lane_root,
+            manifest_path,
+        }];
+
+        assert_eq!(
+            recover_tombstone_transaction(temp_dir.path(), &lanes, Some(&budget)).unwrap(),
+            TombstoneRecoveryOutcome::NoTransaction
+        );
+
+        assert!(temporaries.iter().all(|path| !path.exists()));
+        assert_eq!(std::fs::read(unknown).unwrap(), b"preserve-unknown");
+        let after = budget.snapshot();
+        assert_eq!(
+            after.reconciliations_total,
+            before.reconciliations_total + 1
+        );
+        assert_eq!(
+            after.accounted_bytes,
+            crate::disk_budget::measured_path_bytes(temp_dir.path()).unwrap()
+        );
+        assert_eq!(after.reserved_bytes, 0);
+        assert_eq!(after.active_reservations, 0);
+    }
+
+    #[test]
+    fn tombstone_cleanup_definite_noop_skips_reconciliation() {
+        let temp_dir = TempDir::new().unwrap();
+        let budget =
+            crate::LocalDiskBudget::open(temp_dir.path(), crate::LocalDiskLimits::default())
+                .unwrap();
+        let before = budget.snapshot();
+        let missing = [
+            temp_dir.path().join("lane_numeric/missing-first.bin"),
+            temp_dir.path().join("lane_numeric/missing-second.bin"),
+        ];
+
+        let removed = remove_owned_regular_files_and_sync_parents_budgeted(
+            missing.iter().map(PathBuf::as_path),
+            Some(&budget),
+            crate::DiskCategory::Tombstones,
+            |_| Ok(()),
+        )
+        .unwrap();
+
+        assert_eq!(removed, 0);
+        let after = budget.snapshot();
+        assert_eq!(after.reconciliations_total, before.reconciliations_total);
+        assert_eq!(after.accounted_bytes, before.accounted_bytes);
+        assert_eq!(after.reserved_bytes, 0);
+        assert_eq!(after.active_reservations, 0);
     }
 
     #[test]
@@ -6294,6 +6722,97 @@ mod tests {
         assert!(requested >= tombstone_cleanup_entry_transient_bytes(&shards_dir));
         assert_eq!(std::fs::read(first).unwrap(), b"preserve-first");
         assert_eq!(std::fs::read(second).unwrap(), b"preserve-second");
+    }
+
+    #[test]
+    fn orphan_cleanup_batches_managed_removals_into_one_reconciliation() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir
+            .path()
+            .join("lane_numeric")
+            .join(TOMBSTONES_FILE_NAME);
+        let shards_dir = tombstone_shards_dir(&path);
+        std::fs::create_dir_all(&shards_dir).unwrap();
+        let orphans = [
+            shards_dir.join("shard-007-0000000000000001.bin"),
+            shards_dir.join("shard-008-0000000000000002.bin"),
+            shards_dir.join("shard-009-0000000000000003.bin"),
+        ];
+        for orphan in &orphans {
+            std::fs::write(orphan, b"orphan").unwrap();
+        }
+        let unknown = shards_dir.join("shard-999-0000000000000004.bin");
+        std::fs::write(&unknown, b"preserve-unknown").unwrap();
+        let budget =
+            crate::LocalDiskBudget::open(temp_dir.path(), crate::LocalDiskLimits::default())
+                .unwrap();
+        let before = budget.snapshot();
+
+        assert_eq!(
+            cleanup_unreferenced_tombstone_shards(&cleanup_lane(&path), Some(&budget)).unwrap(),
+            3
+        );
+
+        assert!(orphans.iter().all(|orphan| !orphan.exists()));
+        assert_eq!(std::fs::read(unknown).unwrap(), b"preserve-unknown");
+        let after = budget.snapshot();
+        assert_eq!(
+            after.reconciliations_total,
+            before.reconciliations_total + 1
+        );
+        assert_eq!(
+            after.accounted_bytes,
+            crate::disk_budget::measured_path_bytes(temp_dir.path()).unwrap()
+        );
+        assert_eq!(after.reserved_bytes, 0);
+        assert_eq!(after.active_reservations, 0);
+    }
+
+    #[test]
+    fn orphan_cleanup_reconciles_once_after_post_unlink_sync_failure() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir
+            .path()
+            .join("lane_numeric")
+            .join(TOMBSTONES_FILE_NAME);
+        let shards_dir = tombstone_shards_dir(&path);
+        std::fs::create_dir_all(&shards_dir).unwrap();
+        let orphans = [
+            shards_dir.join("shard-007-0000000000000001.bin"),
+            shards_dir.join("shard-008-0000000000000002.bin"),
+        ];
+        for orphan in &orphans {
+            std::fs::write(orphan, b"orphan").unwrap();
+        }
+        let budget =
+            crate::LocalDiskBudget::open(temp_dir.path(), crate::LocalDiskLimits::default())
+                .unwrap();
+        let before = budget.snapshot();
+        let _sync_failure = crate::engine::fs_utils::fail_directory_sync_once(
+            std::fs::canonicalize(&shards_dir).unwrap(),
+            "injected tombstone orphan cleanup sync failure",
+        );
+
+        let err = cleanup_unreferenced_tombstone_shards(&cleanup_lane(&path), Some(&budget))
+            .expect_err("a committed orphan unlink must retain its synchronization error");
+
+        assert!(matches!(
+            err,
+            TsinkError::Other(ref message)
+                if message == "injected tombstone orphan cleanup sync failure"
+        ));
+        assert_eq!(orphans.iter().filter(|orphan| orphan.exists()).count(), 1);
+        let after = budget.snapshot();
+        assert_eq!(
+            after.reconciliations_total,
+            before.reconciliations_total + 1
+        );
+        assert_eq!(
+            after.accounted_bytes,
+            crate::disk_budget::measured_path_bytes(temp_dir.path()).unwrap()
+        );
+        assert_eq!(after.reserved_bytes, 0);
+        assert_eq!(after.active_reservations, 0);
     }
 
     #[test]

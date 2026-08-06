@@ -72,7 +72,11 @@ impl StorageStateAssembly {
                 options.compaction_interval,
                 options.background_fail_fast,
             ),
-            rollups: Self::build_rollup_state(series_index_path, local_disk_budget),
+            rollups: Self::build_rollup_state(
+                series_index_path,
+                local_disk_budget,
+                usize::try_from(options.memory_budget_bytes).unwrap_or(usize::MAX),
+            ),
             query_budget: QueryBudget::new(query_budget_limits)
                 .map_err(crate::QueryBudgetError::from)?,
             observability,
@@ -272,13 +276,15 @@ impl StorageStateAssembly {
     fn build_rollup_state(
         series_index_path: Option<PathBuf>,
         local_disk_budget: Option<Arc<crate::LocalDiskBudget>>,
+        journal_memory_limit_bytes: usize,
     ) -> RollupState {
         RollupState {
-            runtime: rollups::RollupRuntimeState::new_with_disk_budget(
+            runtime: rollups::RollupRuntimeState::new_with_disk_budget_and_memory_limit(
                 series_index_path
                     .as_ref()
                     .and_then(|path| path.parent().map(|parent| parent.to_path_buf())),
                 local_disk_budget,
+                journal_memory_limit_bytes,
             ),
             run_lock: Mutex::new(()),
             traversal_cursor: Mutex::new(rollups::BackgroundRollupCursor::default()),

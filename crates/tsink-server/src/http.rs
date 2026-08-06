@@ -16,9 +16,12 @@ pub struct HttpRequest {
 
 impl HttpRequest {
     pub fn header(&self, name: &str) -> Option<&str> {
-        self.headers
-            .get(&name.to_ascii_lowercase())
-            .map(String::as_str)
+        let value = if name.as_bytes().iter().any(u8::is_ascii_uppercase) {
+            self.headers.get(&name.to_ascii_lowercase())
+        } else {
+            self.headers.get(name)
+        };
+        value.map(String::as_str)
     }
 
     pub fn path_without_query(&self) -> &str {

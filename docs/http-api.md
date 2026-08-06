@@ -60,6 +60,29 @@ x-tsink-tenant: <tenant-id>
 
 If omitted, the request is attributed to the `default` tenant. Tenant IDs must be non-empty strings that do not start with `__`. See [Multi-tenancy](multi-tenancy.md) for quota and isolation details.
 
+When a tenant policy file is enabled, its optional top-level `maxRuntimeTenants` field caps the
+process-lifetime tenant runtime map and defaults to 4,096. Slots are reserved for every configured
+tenant and for `default`; a policy file whose limit cannot cover those reservations is rejected at
+startup. Unconfigured tenants share only the remaining capacity. Runtimes are not evicted, so an
+existing tenant remains usable at the limit without resetting its permits, counters, or recent
+decisions. Public tenant authentication runs before cache insertion, so rejected credentials do
+not consume a slot. A new unconfigured tenant with no available unreserved slot receives
+`503 text/plain` with
+`X-Tsink-Tenant-Error-Code: tenant_runtime_cache_limit_exceeded` and no `Retry-After` header.
+
+`GET /api/v1/status/tsdb` exposes configured-registry cache state at
+`data.admission.tenant.runtimeCache` with `initializedRuntimes`,
+`initializedReservedRuntimes`, `initializedDynamicRuntimes`, `maxRuntimes`, `reservedRuntimes`,
+and `limitRejectionsTotal`. The value is `null` when no tenant registry is configured. `/metrics`
+always emits seven unlabeled series: `tsink_tenant_runtime_cache_configured`,
+`tsink_tenant_runtime_cache_initialized_runtimes`,
+`tsink_tenant_runtime_cache_initialized_reserved_runtimes`,
+`tsink_tenant_runtime_cache_initialized_dynamic_runtimes`,
+`tsink_tenant_runtime_cache_max_runtimes`, `tsink_tenant_runtime_cache_reserved_runtimes`, and
+`tsink_tenant_runtime_cache_limit_rejections_total`. Without a registry, `configured` is `0` and
+the other six values are zero; with a registry, `configured` is `1` and the remaining series report
+the scalar snapshot above.
+
 ---
 
 ## Common response envelope
@@ -434,10 +457,16 @@ its dynamic clone before materialization and retains the reservation with the sn
 The direct handler now consumes that projection under the same root execution as complete metric
 enumeration. Its allocation-bearing write/fanout, outbox, consensus/handoff, digest,
 hotspot/rebalance, tenant, audit, security/RBAC, usage, managed-control-plane, and edge-sync
-producers likewise reserve before materialization and retain their guards through response-tree
-materialization; the fixed planner projection is allocation-free. The remaining adapter boundary
-is the `serde_json::Value` tree itself: the handler measures and retains it once complete, but
-still constructs it before that tree reservation is established.
+producers likewise reserve before materialization and retain their guards through response
+encoding; the fixed planner projection is allocation-free. The handler does not assemble a final
+`serde_json::Value` tree or mapped `Vec<Value>` arrays. Instead, it runs a cancellation-aware
+counting pass directly over borrowed projections, rejects encoded output above the exact 1 MiB
+ceiling, charges the applicable returned-byte limit, and reserves the measured body plus a
+conservative header model before allocating the response buffer. A second controlled pass writes
+the same fixed schema into that admitted capacity. Exact-ceiling, one-byte-over, memory/returned
+boundary, schema, and second-pass cancellation regressions cover this adapter; the broader clean
+workspace matrix has not yet been rerun for this slice. JSON object-member ordering is not part of
+the endpoint contract; clients must compare parsed fields rather than raw object key order.
 
 **Authentication:** public scope, read permission.
 
@@ -1020,12 +1049,23 @@ Download a bounded JSON diagnostic snapshot for a tenant. Includes status, usage
 `tsink-support-bundle-<tenant>-<timestamp>.json`.
 
 The adapter caps simultaneously retained child responses and the final encoded bundle at 16 MiB.
-It admits one query execution before collecting children. TSDB status and rebalance reuse that
-execution, and every completed child response acquires an exact same-execution retained-memory
-guard inside its support-specific child API before returning to the bundle orchestrator. All child
-guards remain live through final composition; the parent base reservation excludes those already
-guarded bytes, and only the final bundle charges HTTP response-body bytes. Child source operations
-still charge canonical logical returned work such as metric identities.
+After bounded tenant validation and persistent-runtime initialization, it admits one query
+execution before collecting children. TSDB status and rebalance reuse that execution. Every
+dynamic child source reserves before materialization, every serializer measures before allocating,
+and every completed child response carries an exact same-execution retained-memory guard back to
+the orchestrator. All eleven guards remain live through final composition; the parent base
+reservation excludes those already guarded bytes, and only the final bundle charges HTTP
+response-body bytes. Child source operations still charge canonical logical returned work such as
+metric identities. Fixed TSDB/rebalance compatibility errors are built under the admitted root
+scratch and transferred to exact guards before retention.
+
+Support prewarm uses the same finite tenant runtime map. Because prewarm intentionally precedes
+root query admission, a new unconfigured tenant that reaches the runtime limit returns the
+tenant-runtime `503` above without attempting root admission; configured/default reserved tenants
+and already initialized tenants remain available. Its TSDB-status child carries the
+`runtimeCache` object described above when a registry is configured and `null` otherwise; the
+unlabeled Prometheus series expose the same process-local capacity state independently.
+
 It returns the standard structured read-error body with
 `X-Tsink-Read-Error-Code` for composition failures:
 
@@ -1041,13 +1081,24 @@ failure does not by itself change a successfully encoded bundle's outer `200`.
 
 The 16 MiB child aggregate is both a fixed size ceiling and a cumulatively guarded retained
 response envelope. This closes the completed child-to-parent response handoff, including
-cluster-enabled finite profiles with `max_concurrent_queries = 1`. It does not retrospectively
-account legacy operational snapshot and serialization work performed before a child has built its
-completed response; those producer transients remain in progress. Tenant/actor parsing and the
-synthetic child-request/header copies are also prepared before the parent setup reservation and
-remain an explicit adapter boundary. Tenant override decoding is capped at the 16 KiB tenant
-label-value ceiling and does not clone the HTTP request body. Socket, runtime, allocator, kernel,
-and TLS allocations after `HttpResponse` construction remain outside the portable model.
+cluster-enabled finite profiles with `max_concurrent_queries = 1`. The `securityState` and
+`rollups` sections also close their earlier producer boundaries: each captures an execution-aware,
+reserve-before-clone generation, keeps that guard live through two-pass serialization from
+borrowed fields, and reserves the measured child body/header before allocation. Configured
+security, RBAC-only, disabled security, and nonempty nested rollup-policy responses preserve their
+established schemas. A backend without accounted storage-status observability fails the rollup
+child closed instead of calling the legacy snapshot. Other legacy operational snapshot and
+serialization work performed before a child has built its completed response remains in progress.
+After allocation-free validation, the adapter admits the root execution before owned tenant
+decoding, actor construction, or child-request allocation and reserves a conservative setup
+envelope from borrowed request lengths. It then
+reuses one controlled request containing only the verified-auth and selected-tenant headers. It
+does not copy authorization, cookies, tracing headers, other arbitrary headers, or the HTTP request
+body into child requests. An allocation-free validation pass preserves every malformed-tenant
+`400` before query admission, including header conflicts, empty/control-character values, decoded
+control characters, and lossy UTF-8 expansion beyond the 16 KiB tenant label-value ceiling.
+Socket, runtime, allocator, kernel, and TLS allocations after `HttpResponse` construction remain
+outside the portable model.
 
 ---
 

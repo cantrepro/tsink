@@ -378,10 +378,11 @@ remains Phase 2 work, as permitted by the Phase 1 charter's â€œonce implementedâ
   vectors, downsample output/value payload, numeric scratch, and every cloned row identity before
   allocation, and releases all charges through RAII. A finite transform/row rejection occurs
   before pending state, output, or checkpoint publication, while an exact-boundary retry commits
-  completely; `ExpertUnlimited` remains explicitly unbounded. Per-source
-  checkpoint/pending state is now a checksummed replacement journal with 1,024-record/4 MiB active
-  generations, bounded adjacent-generation compaction, a 1,024-generation namespace ceiling, and
-  restart-safe epoch rebasing into full policy/delete snapshots. Those full snapshots reject more
+  completely; `ExpertUnlimited` remains explicitly unbounded. Per-source checkpoint/pending state
+  is now a checksummed create-only replacement journal with 1,024-event/4 MiB batch directories,
+  equal same-generation packing shadows, bounded adjacent-generation compaction, a 1,024-generation
+  and 16,384-observed-entry recovery ceiling, replay-inert detached cleanup, and restart-safe epoch
+  rebasing into full policy/delete snapshots. Those full snapshots reject more
   than 65,536 logical items or 64 MiB of conservative modeled JSON before live-map cloning; the
   corresponding structured ceiling is still a Server-cardinality strand point rather than hidden
   unbounded work. Ordinary registry-catalog root changes now use a per-segment store with one
@@ -1197,9 +1198,13 @@ assigned to later roadmap phases.
   application/publication, retained cursors, and staged root maps are admitted separately and
   exposed as `remote_catalog_staging_bytes`.
 - Exact disk cleanup that removes an owned entry performs a full-tree reconciliation and relies on
-  an internal no-nested-reservation invariant; a no-op orphan pass skips that rescan. This is
-  correctness-first but can make repeated effective cleanup expensive, so batching or safe deferred
-  reconciliation is still needed before claiming high cleanup throughput.
+  an internal no-nested-reservation invariant; a proven absent no-op skips that rescan. Strict
+  barriers whose requests predate the same terminal scan now coalesce only while the checked disk
+  reservation generation remains unchanged. Post-flush staged cleanup batches all governed roots
+  under one Recovery reservation and one scan while retaining best-effort cleanup after a malformed
+  path. These changes remove avoidable and multiplied scans, but an effective batch still performs
+  complete-root work, so broader batching or a separately specified audit/debt protocol remains
+  necessary before claiming high cleanup throughput.
 - Usage metering does not change the response classification of already-completed primary work,
   but handlers await its bounded blocking append and can therefore add ledger-I/O latency. Usage
   status, reporting, support-bundle, and export reads now use bounded incremental summaries or
@@ -1269,7 +1274,8 @@ debt and additional WAL and query-accounting boundaries:
   as explicit-series scans. Metric-postings count and identity materialization are admitted while
   the postings read guard prevents concurrent growth. Both async row-scan commands carry the
   detailed guard through the worker reply and reject an unaccounted finite backend before
-  invocation. Tenant and distributed metric-name adapters remain explicitly `Unaccounted`.
+  invocation. The later continuation below closes the non-default tenant metric-name adapter;
+  default-tenant and distributed metric-name adapters remain explicitly `Unaccounted`.
 - Async `list_metrics` and `select_series` now carry their operation-specific detailed metadata
   guards through the worker reply instead of consuming them in the worker. Finite calls require
   `Complete` accounting and reject missing or undersized false-`Complete` guards; unlimited calls
@@ -1283,7 +1289,7 @@ debt and additional WAL and query-accounting boundaries:
   compressed chunks include declared output, a decoded-window allowance, and a 1 MiB zstd
   workspace; decoder timestamp/value/point vectors and nested value-capacity growth are included.
   Pagination now reports continuation only after observing a real later row. Focused verification
-  currently passes 49/49 core query-budget tests, 9/9 query-read tests, 42/42 async tests, the
+  currently passes 56/56 core query-budget tests, 9/9 query-read tests, 43/43 async tests, the
   metric-postings concurrency regression, 3/3 server series-row accounting tests, and 2/2
   tenant/distributed detailed-list guard tests.
 - Public Prometheus metadata and finite-limit internal metadata already retain their source,
@@ -1368,8 +1374,10 @@ The 2026-07-29 continuation re-audited those remaining gates and closed another 
 - A proposed compound tenant/default-tenant row-accounting shortcut was reviewed and removed before
   publication. It materialized and charged offset-skipped/off-page points as returned work, could
   double-charge metadata plus point composition, and moved budget admission ahead of compatibility
-  validation. Those adapters remain honestly `Unaccounted` until a lower-level scoped-versus-legacy
-  paged contract or counter-transfer mechanism can preserve final-logical-result semantics.
+  validation. The rejected shortcut remains absent. The matcher-aware primitive described below
+  later closes the non-default tenant metric-name case; default-tenant and distributed row adapters
+  remain honestly `Unaccounted` until a scoped-versus-legacy or per-peer paged contract can preserve
+  final-logical-result semantics.
 - Before the support-bundle slice, the settled 12-file working diff passed formatting and diff
   checks, warning-denied all-feature workspace Clippy, warning-denied no-default all-target
   checking, the Rust 1.89 all-target check, warning-denied all-feature rustdoc, and the final exact
@@ -1537,7 +1545,8 @@ direct TSDB-status adapter or Phase 2:
   `cargo fmt --all -- --check`, `git diff --check`, both locked all-target check feature matrices,
   warning-denied all-feature workspace rustdoc, package content listing, and full core package
   verification (326 files, 8.4 MiB unpacked, 1.5 MiB compressed). Incremental integration for
-  finite background flush and catalog refresh remains a later staged output-lifetime slice.
+  finite background flush and catalog refresh was deferred at that checkpoint; the later
+  continuation below closes it without retaining staged output between wakes.
 - `HUMAN GATE`: the retained hotspot policy cannot be completed truthfully without a maintainer
   compatibility decision. The current process-global tracker never removes shard or normalized
   tenant identities, publishes saturating process-lifetime totals, and resets only on restart.
@@ -1563,6 +1572,208 @@ direct TSDB-status adapter or Phase 2:
   recorded before later
   row-admission/write outcome, which must also remain documented or be changed as part of the
   selected contract.
+- Direct `/api/v1/status/tsdb` response composition now streams its exact public schema twice from
+  borrowed/accounted snapshots: a cancellation-aware counting pass enforces the fixed 1 MiB
+  encoded ceiling, then the body and conservative response-header model are reserved before the
+  body allocator runs. The adapter no longer builds a retained `serde_json::Value` tree, mapped
+  `Vec<Value>` arrays, or per-pass string clones; optional object-or-null sections and dynamic
+  arrays serialize directly while their producer reservations remain live. Focused regressions pin
+  the exact 1 MiB acceptance and one-byte rejection boundaries, exact returned- and retained-byte
+  admission, second-pass cancellation cleanup, the absence of legacy tree producers in the
+  handler, the broad status schema, and a nonempty `final_sync` rebalance job with its complete
+  fixed field set. This closes the direct-status serialization subtask, not Phase 2.
+  Focused verification passes `cargo test -p tsink-server status_tsdb` (19 tests), the borrowed
+  local-disk schema regression, and `cargo test -p tsink-server support_bundle` (19 tests), plus
+  `cargo fmt --all -- --check`, `cargo check -p tsink-server --all-targets --all-features`, and
+  warning-denied all-target/all-feature server Clippy. The full clean workspace matrix has not yet
+  been rerun for this continuation.
+- Support-bundle setup now admits the root query before tenant decoding, actor construction, or
+  synthetic-request allocation. A borrowed-input preflight reserves their conservative peak, then
+  reconciles to the retained root strings and one reusable request containing only verified-auth
+  and tenant headers. The previous three full header-map copies are gone, so authorization,
+  cookies, tracing headers, and the potentially 64 MiB body never enter child requests. Exact
+  N/N-1, cancellation/release, admission-precedence, schema, and sensitive-header/body regressions
+  pass in the 19-test `support_bundle` slice. This closes setup accounting, while legacy
+  operational child snapshot/serialization transients before their completed-response guards
+  remain open.
+
+The 2026-08-05 continuation closes that remaining support-bundle producer gate without completing
+Phase 2:
+
+- All eleven support sections now have reserve-before-materialization source producers and
+  measured, reserve-before-allocation serializers under the one forwarded execution. Usage, RBAC
+  state/audit, security state, cluster audit/handoff/repair, rules, and rollups no longer call their
+  legacy owned response/tree producers. TSDB status and cluster rebalance retain their already
+  accounted success paths. Static source guards forbid the legacy snapshot/handler, `json!`,
+  `serde_json::Value`, collection, and post-hoc response-accounting paths at each focused boundary.
+- Rules status was the last large dynamic child. Its private accounted projection reserves the
+  complete four-or-more-rule tree, maps, diagnostics, and alert instances before cloning. Separate
+  legacy-limit and query-memory models preserve the established rules-store limit semantics while
+  charging conservative B-tree nodes. The support serializer preserves declaration/key order,
+  optional-field behavior, `status`-before-`data`, and the legacy eight-attempt self-observing peak
+  fixed point across counting, exact body allocation, and final-capacity enforcement. Typed
+  allocation/measurement/serialization failures retain the direct endpoint's exact text response.
+  Producer and adapter regressions cover rich raw-byte parity, exact N/N-1 source and combined
+  source/body peaks, cancellation, poisoned-lock release, unavailable/limit errors, and legacy
+  source exclusion.
+- The two remaining fixed compatibility-error paths no longer install a generic response guard
+  after leaving their wrappers. In the support path, TSDB status and rebalance return the untouched
+  raw error to the root. Before either call, an input-derived contract partitions the already
+  admitted 256 KiB scratch between the capped 16 KiB tenant/raw response and its fixed budget-error
+  mapper. The root then transfers the completed response to an exact same-execution guard before
+  retention. Transfer failure preserves the distinct TSDB versus rebalance status/header/body
+  mapping. Direct-versus-transferred regressions pin a TSDB early accounting error and both
+  rebalance-unavailable shapes; worst-tenant/every-fixed-rebalance-shape tests reconcile below the
+  preflight. This closes only the support shared-execution adapters; equivalent direct endpoint
+  error construction after internal admission remains separate work.
+- Persistent tenant runtime initialization is intentionally moved ahead of support root admission
+  after the allocation-free malformed-tenant pass. It performs no authorization or permit
+  acquisition, so the synthetic verified child still has its historical token behavior. When a
+  runtime already exists or an unreserved slot is available, root concurrency retains precedence.
+  Ordinary admission decisions now enter a preallocated compact ring without retaining new
+  strings; exact legacy reason strings are reconstructed only inside the query-accounted
+  tenant-status projection. Tests pin invalid-cache noncreation, idempotent warmup,
+  configured-token/no-bearer behavior, blocked-root raw parity, all compact reason variants, stable
+  ring heap/capacity, and status projection parity. This removes support-induced post-admission
+  resident allocation.
+- The registry's process-lifetime tenant runtime map is now capped by the optional top-level
+  `maxRuntimeTenants` policy field, with a finite default of 4,096. Configured tenants and `default`
+  own reserved slots, an undersized policy fails startup, unconfigured tenants use only the
+  remainder, and one mutex makes concurrent check/construction/insertion atomic. The map never
+  evicts: existing plans keep one semaphore generation and admission counters/decision history are
+  not silently reset. Public template and managed-policy authorization runs before insertion, so
+  established `401`/`403` results do not consume capacity. A full unconfigured pool returns stable
+  `503`/`tenant_runtime_cache_limit_exceeded` without `Retry-After`; support prewarm returns that
+  result before root admission. Four focused tests pin default/config validation, reserved-slot and
+  exact wire behavior, authorization-before-insertion with duplicate token-scope parity, and a
+  32-thread exact boundary. TSDB status now emits that scalar snapshot under
+  `data.admission.tenant.runtimeCache` and emits `null` without a registry. `/metrics` always emits
+  seven fixed unlabeled configured/count/limit/reservation/rejection series; an absent registry
+  produces `configured = 0` and zeros for the other six. Focused unit and end-to-end regressions pin
+  configured and absent behavior on both surfaces. This closes the former tenant-runtime cache
+  policy-and-observability next-work item.
+- Direct TSDB status and admin rebalance now reserve their compatibility-error construction
+  envelopes immediately after their own query admission. TSDB status and rebalance status use a
+  fixed 96 KiB fallback; pause/resume/run add a worst-case node-ID allowance derived from the
+  admitted operation input. The guard remains live while legacy errors are built, partial success
+  responses are dropped before mapping, and the success serializer reuses the same reservation so
+  peak memory is `max(fallback, response)`. A rejected initial reservation drops the execution
+  before its budget error is constructed. Raw status/header/body compatibility is unchanged.
+  `direct_tsdb_error_scratch_enforces_exact_boundary_and_reuses_response_guard` and
+  `direct_admin_rebalance_scratch_is_input_derived_exact_and_reused`, plus the 19-test
+  `status_tsdb_`, seven-test `admin_cluster_rebalance`, and three-test `admin_rebalance_` slices in
+  both feature modes, pin exact N/N-1, hostile input, post-effect, reuse, and cleanup behavior.
+  This closes the former direct compatibility-error next-work item.
+- Core storage now exposes an additive matcher-aware metric-name row primitive. It validates the
+  request, matcher shape, and any output projection before cancellation or memory admission;
+  resolves the exact metric-plus-matcher candidate set once; charges that selected set once; and
+  applies an optional projection before row materialization and logical returned-byte charging.
+  Projection is accepted only for a non-`__name__` label bound by a non-empty exact-equality
+  matcher, preserving one-to-one visible identities. The non-default `TenantScopedStorage` path
+  uses this primitive with an exact tenant matcher, requires inner `Complete` accounting, verifies
+  the hidden label and result guard, and transfers/resizes that guard without a second page clone.
+  Default-tenant fallback remains `Unaccounted` because it can merge scoped and legacy-unlabeled
+  rows; distributed metric-name scans remain `Unaccounted` because the RPC has no canonical
+  per-peer row cursor. Async result validation now also destroys a falsely guarded payload before
+  releasing its detached reservation. Focused locked all-feature and no-default verification passes
+  56/56 core query-budget tests, 48/48 tenant tests, 43/43 async-storage tests, ten synchronous and
+  two async tenant metric-row contract tests, seven core matcher-aware contract tests, and the
+  distributed fail-closed capability regression.
+- Finite background flush and open-state catalog refresh now share the generation-stable,
+  shared-memory-accounted post-flush clean-fence cursor previously used only by compaction. One raw
+  marker-namespace entry consumes a wake; a stable terminal probe must complete under the
+  compaction gate before flush stages a discoverable root or catalog refresh constructs inventory
+  or publication state. Marker publication invalidates the cursor before writing its marker, so a
+  marker inserted between wakes restarts the proof. Allocation-free minimum-work preflights retain
+  the existing sealed-chunk and unknown-catalog error precedence. Foreground/lifecycle operations,
+  manual compaction, and both-limits-unlimited background calls retain exhaustive behavior; flush
+  now completes that strict proof before staging too, so a pending-marker or namespace error cannot
+  strand newly published roots. Registry-catalog source failures after staging now also enter the
+  existing root-rollback path. Catalog refresh reloads lifecycle under the compaction gate, so a
+  refresh that waited behind close cannot recreate a retained cursor after the close-side reset.
+  The 29-test `fence` slice and complete 96-test
+  persistence-background module pass in both locked feature modes.
+- Strict local-disk reconciliation now assigns scan-start request tickets and checked reservation
+  generations. Concurrent idle barriers and reconciled-operation finishers can share one exact
+  terminal scan, while a request registered during traversal or any later admitted reservation
+  forces a follow-up scan. Reuse also requires the waiting caller's finite memory limit to admit the
+  completed scan's recorded modeled peak; an overlapping unlimited scan cannot waive a smaller
+  caller's bound. Ticket saturation disables reuse without wrapping; generation overflow rejects
+  admission before changing reservation state. Governed removal skips a scan only for a
+  definite absent target plus successful zero-byte settlement. Best-effort post-flush failure
+  cleanup lazily admits one aggregate Recovery reservation, removes every classifiable path, and
+  performs at most one strict scan for the governed batch; governance or reservation errors no
+  longer prevent later external/valid cleanup. Tombstone recovery now batches every preflighted
+  owned atomic temporary under one lazy Recovery reservation and one terminal scan, while each
+  lane's already-preflighted orphan-shard sweep does the same for all recognized candidates.
+  Unknown names remain untouched, definite missing targets avoid a scan, and a post-unlink
+  parent-sync failure reconciles exact accounting before returning its native error. Obsolete
+  immutable segment-catalog generations now
+  retain the current and nearest predecessor while batching every governed deletion under one
+  Recovery reservation and one memory-limited strict scan. Pending registry-catalog root deltas
+  similarly batch every governed removed-entry unlink under one Recovery reservation and one
+  terminal scan while retaining first per-entry cleanup-error ordering; an unlink or parent-sync
+  ambiguity reconciles exact accounting before returning its native cleanup error. Incremental
+  series-registry checkpoint cleanup preserves its bounded all-entry preflight and unknown/link
+  retention while batching recognized governed generations under one lazy Recovery reservation and
+  one terminal scan; it stops at the first per-entry cleanup error and reconciles post-unlink
+  ambiguity before returning the native error. Full-snapshot rollup state-journal cleanup likewise
+  removes every recognized sealed/active generation under one Recovery reservation and one terminal
+  scan. Canonical v3 pointer/generation files also reconcile into Registry rather than Unknown;
+  strict filename/layout lookalikes remain Unknown.
+- `IN PROGRESS` The next reconciliation/pressure batch has focused two-mode evidence but awaits its
+  complete integrated matrix. Preparing-compaction rollback and rollback of newly published flush
+  segment roots now retain one aggregate Recovery reservation through all exact removals and one
+  terminal scan, including post-unlink parent-sync failure. Read-write startup preflights every
+  post-flush marker temporary and rewrite/copy staging tree before mutation under one shared
+  16,384-entry, depth, and modeled-startup-memory envelope, then uses one zero-byte Recovery
+  reservation and one bounded scan for all governed roots; empty, lookalike-only, and external-only
+  plans do not scan. Reconciliation-waiter saturation releases the consumed reservation and keeps
+  the full admitted peak as conservative accounting. Native registry-catalog deltas admit the
+  checked sum of intent, added entries, and final manifest under one strict aggregate. Incremental
+  series journals derive restart nonces from their own directory without advancing the global
+  empty-namespace seed. Memory/WAL pressure now retries one positively delayed, serialized bounded
+  relief pass on every still-blocked poll, allowing multiple old heads to be reclaimed while the
+  current head remains intact.
+- `DONE` Close the bounded rollup source-state journal and JSON-startup slice. Create-only batches
+  now use exact namespace slots, require equality with a same-generation packing shadow before
+  cleanup/replay, detach live batches before child deletion, serialize governed mutations once at
+  their outer boundary, and distinguish definite pre-publication rejection from the canonical
+  rename fence. Policies, checkpoints, pending state, invalidations, generations, and journal
+  replacements share one retained envelope. Policy/state JSON loading now performs a
+  schema-equivalent streaming physical-record pass, admits raw predecessor/successor buffers,
+  trace growth, typed DTOs, and destination maps, preserves format/magic error precedence, and
+  moves decoded state into the runtime without full install clones. A bounded materialization page
+  reads only each selected source's checkpoint/pending entry rather than cloning the policy's
+  complete maps, then computes coverage from installed results.
+- `DONE` Aggregate core startup's remaining exact owned-orphan classes. Fixed atomic targets,
+  registry deltas, the tombstone coordinator, per-lane manifest/shard temporaries and unreferenced
+  final shards, compaction markers, and segment staging trees now share one mutation lock, global
+  namespace counter, retained-memory plan, lazy Recovery reservation, and terminal reconciliation.
+  Directory identities and tombstone-manifest fingerprints are rechecked before exact deletion;
+  execution preserves source order and first-error stopping. The terminal scan retains a bounded
+  native-error allowance, including a dynamically larger post-discovery namespace, while empty and
+  external-only plans avoid local reservation/reconciliation work.
+- Focused verification passes 74/74 `support_bundle_` tests in both locked all-feature and
+  no-default-feature modes, 48/48 tenant tests, 23/23 tombstone tests, 9/9 registry-catalog tests,
+  3/3 incremental-registry checkpoint-cleanup tests, 51/51 rollup state-journal tests, four rich
+  rules producer tests in both feature modes, and six rules child tests in both modes. Both
+  warning-denied workspace all-target Clippy matrices pass, as do formatting, warning-denied
+  workspace checks, the warning-denied all-feature workspace documentation build, and diff checks.
+  The complete locked server package matrices
+  also pass with loopback access and `RUSTFLAGS='-D warnings'`: each feature mode passes 48/48
+  active auxiliary tests and 1,103/1,103 active server tests, with the two established fixture
+  ignores. The complete locked all-feature and no-default-feature workspace matrices also pass
+  with loopback access and warning denial: each passes 1,297/1,297 core tests, 43/43 async-storage
+  tests, and every remaining workspace binary, including those same server counts and established
+  ignores.
+
+The 2026-08-06 wrap boundary additionally passes, in both all-feature and no-default-feature modes,
+11/11 rollup JSON-preflight tests, 9/9 rollup transformation/page-state tests, 13/13 aggregate
+startup orphan-cleanup tests, the active/reused policy-id startup boundary, and the 51/51 journal
+slice. Warning-denied core library checks and library-test Clippy pass in both modes, as do scoped
+formatting and diff checks. The complete workspace/package counts immediately above predate this
+latest boundary and were not rerun before the requested stop.
 
 The next required Phase 2 work is:
 
@@ -1571,22 +1782,18 @@ The next required Phase 2 work is:
    tenant capacity/window/removal behavior, overflow/rejection observability, and explicit
    rebalance semantics. Until then, continue only the non-semantic characterization and
    observability work listed above.
-2. Replace direct `/api/v1/status/tsdb`'s allocate-then-measure JSON-tree construction with a
-   reserve-before-allocation or direct-streaming envelope while preserving its schema and exact
-   1 MiB response boundary, then account the support bundle's pre-reservation tenant/actor/request
-   setup and remaining legacy operational child producers before their completed-response guards
-   are established.
-3. Close default-tenant/distributed series-row and tenant/distributed metric-row adapter gaps only
-   after exact paged-work reconciliation can preserve canonical logical result charging.
-4. Finish the remaining background pass-budget integrations: the exhaustive post-flush fence
-   still reached by finite background flush and catalog refresh; full-root disk reconciliation
-   after governed mutations; registry/rollup journal discovery and merge work; aggregate rollup
-   source/state work; and complete pressure-path reclamation/flush fallbacks.
-5. Implement the cluster activation membership-certificate/joint-configuration convergence proof;
+2. Close the default-tenant series-row and metric-name row gaps, plus the distributed series-row
+   and metric-name row gaps, only after exact paged-work reconciliation can preserve canonical
+   logical result charging.
+3. Finish the remaining background pass-budget integrations: full-root disk reconciliation after
+   ordinary governed mutations; registry-journal discovery/merge peaks; one shared residual
+   allowance across every rollup source selected in a wake; whole-policy state-snapshot encoding;
+   and complete pressure-path reclamation/flush fallbacks.
+4. Implement the cluster activation membership-certificate/joint-configuration convergence proof;
    characterization now pins the gap, but it has not been reclassified as an accepted exclusion.
-6. Calibrate the shared query envelope under constrained direct, async, PromQL, HTTP, and
+5. Calibrate the shared query envelope under constrained direct, async, PromQL, HTTP, and
    distributed workloads, keeping logical-versus-physical byte evidence separate from
    process-memory measurements.
-7. Run the complete clean constrained Test, Embedded, Edge, and Server workload matrix; qualify or
+6. Run the complete clean constrained Test, Embedded, Edge, and Server workload matrix; qualify or
    revise the shipped provisional constants and record the final evidence. Preserve the explicit
    expert-only unlimited migration path and deterministic base-plus-override contract.

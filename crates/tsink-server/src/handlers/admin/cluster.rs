@@ -630,12 +630,9 @@ pub(crate) async fn handle_admin_cluster_rebalance_status_with_execution(
             response,
             reservation,
         }),
-        None => account_completed_http_response(response, execution).map_err(|error| {
-            admin_rebalance_response_error_response(
-                AdminRebalanceResponseError::Budget(error),
-                None,
-            )
-        }),
+        // The only caller is the support-bundle adapter. Its admitted root scratch covers these
+        // bounded compatibility errors until it transfers them to an exact response guard.
+        None => Err(response),
     }
 }
 
@@ -684,8 +681,9 @@ async fn execute_admin_cluster_rebalance_impl(
             "admin rebalance status requires complete metric-enumeration accounting",
         );
     }
-    let (execution, cancellation_guard) = match shared_execution {
-        Some(execution) => (execution.clone(), None),
+    let node_id = cluster_context.runtime.membership.local_node_id.as_str();
+    let (execution, cancellation_guard, mut direct_error_scratch) = match shared_execution {
+        Some(execution) => (execution.clone(), None, None),
         None => {
             let cancellation = tsink::QueryCancellationToken::new();
             let cancellation_guard = TsdbStatusCancellationGuard {
@@ -716,7 +714,20 @@ async fn execute_admin_cluster_rebalance_impl(
                     )
                 }
             };
-            (execution, Some(cancellation_guard))
+            let error_scratch = match reserve_direct_admin_rebalance_error_scratch(
+                &execution, operation, node_id,
+            ) {
+                Ok(reservation) => reservation,
+                Err(error) => {
+                    drop(execution);
+                    drop(cancellation_guard);
+                    return admin_rebalance_response_error_response(
+                        AdminRebalanceResponseError::Budget(error),
+                        None,
+                    );
+                }
+            };
+            (execution, Some(cancellation_guard), Some(error_scratch))
         }
     };
     let worker_storage = Arc::clone(storage);
@@ -767,20 +778,6 @@ async fn execute_admin_cluster_rebalance_impl(
         );
     }
 
-    let node_id = cluster_context.runtime.membership.local_node_id.as_str();
-    let mut fallback_reservation = if operation == AdminRebalanceOperation::Status {
-        None
-    } else {
-        match reserve_admin_rebalance_effect_fallback(&execution, node_id) {
-            Ok(reservation) => Some(reservation),
-            Err(error) => {
-                return admin_rebalance_response_error_response(
-                    AdminRebalanceResponseError::Budget(error),
-                    None,
-                )
-            }
-        }
-    };
     let effect = match operation {
         AdminRebalanceOperation::Pause => {
             let control = digest_runtime.pause_rebalance();
@@ -874,13 +871,18 @@ async fn execute_admin_cluster_rebalance_impl(
         message,
         &execution,
         charge_http_returned_bytes,
+        direct_error_scratch.take(),
     );
     let (response, response_reservation) = match accounted_response {
         Ok(AccountedHttpResponse {
             response,
             reservation,
         }) => (response, Some(reservation)),
-        Err(error) => (admin_rebalance_response_error_response(error, effect), None),
+        Err(AdminRebalanceResponseFailure { error, reservation }) => {
+            let response = admin_rebalance_response_error_response(error, effect);
+            drop(reservation);
+            (response, None)
+        }
     };
     drop(snapshot);
     drop(hotspot_snapshot);
@@ -891,7 +893,6 @@ async fn execute_admin_cluster_rebalance_impl(
     } = guarded_metrics;
     drop(series);
     drop(reservation);
-    drop(fallback_reservation.take());
     if let Some(response_reservation) = response_reservation {
         if let Some(retained_response_reservation) = retained_response_reservation {
             *retained_response_reservation = Some(response_reservation);

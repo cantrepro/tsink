@@ -381,6 +381,39 @@ impl ChunkStorage {
     }
 
     #[cfg(test)]
+    pub(in crate::engine::storage_engine) fn set_catalog_refresh_pre_compaction_gate_hook<F>(
+        &self,
+        hook: F,
+    ) where
+        F: Fn() + Send + Sync + 'static,
+    {
+        *self
+            .persist_test_hooks
+            .catalog_refresh_pre_compaction_gate_hook
+            .write() = Some(Arc::new(hook));
+    }
+
+    #[cfg(test)]
+    pub(in crate::engine::storage_engine) fn clear_catalog_refresh_pre_compaction_gate_hook(&self) {
+        self.persist_test_hooks
+            .catalog_refresh_pre_compaction_gate_hook
+            .write()
+            .take();
+    }
+
+    #[cfg(test)]
+    pub(super) fn invoke_catalog_refresh_pre_compaction_gate_hook(&self) {
+        let hook = self
+            .persist_test_hooks
+            .catalog_refresh_pre_compaction_gate_hook
+            .read()
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
     pub(in crate::engine::storage_engine) fn set_persisted_catalog_inventory_entry_hook<F>(
         &self,
         hook: F,

@@ -1156,12 +1156,17 @@ fn apply_validated_compaction_replacement_with_disk_budget(
     if !budget.governs_entry(marker_path)? {
         return apply_validated_compaction_replacement_marker(data_path, marker_path, marker, None);
     }
-    if marker.phase != CompactionReplacementPhase::Ready {
-        return apply_validated_compaction_replacement_marker(
-            data_path,
-            marker_path,
-            marker,
-            local_disk_budget,
+    if marker.phase == CompactionReplacementPhase::Preparing {
+        // Preparing recovery only removes the already-validated planned outputs and marker. Keep
+        // one zero-byte Recovery reservation live across that complete rollback so every
+        // governed unlink is installed by one terminal exact scan instead of one scan per output
+        // plus another for the marker. The unbudgeted inner path is safe only because this outer
+        // reservation remains live until reconciliation finishes.
+        return budget.with_strict_reconciled_reservation(
+            crate::DiskCategory::Temporary,
+            0,
+            crate::DiskReservationKind::Recovery,
+            || apply_validated_compaction_replacement_marker(data_path, marker_path, marker, None),
         );
     }
 

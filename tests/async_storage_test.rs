@@ -139,17 +139,24 @@ impl MetadataReplyTestStorage {
 
     fn maybe_omit_detailed_metadata_reservation(
         &self,
-        detailed: SelectSeriesExecutionResult,
-        execution: &QueryExecution,
+        mut detailed: SelectSeriesExecutionResult,
     ) -> Result<SelectSeriesExecutionResult> {
         if self.omit_detailed_metadata_reservation {
             Ok(SelectSeriesExecutionResult::unaccounted(
                 detailed.into_series(),
             ))
         } else if self.undersize_detailed_metadata_reservation {
-            let series = detailed.into_series();
-            let reservation = execution.reserve_memory(1)?;
-            Ok(SelectSeriesExecutionResult::accounted(series, reservation))
+            let mut reservation = detailed
+                .take_memory_reservation()
+                .expect("built-in detailed metadata should retain a reservation");
+            assert!(reservation.bytes() > 0);
+            reservation
+                .resize(reservation.bytes() - 1)
+                .expect("shrinking the metadata test guard should succeed");
+            Ok(SelectSeriesExecutionResult::accounted(
+                detailed.into_series(),
+                reservation,
+            ))
         } else {
             Ok(detailed)
         }
@@ -235,7 +242,7 @@ impl Storage for MetadataReplyTestStorage {
         self.wait_for_detailed_metadata_release();
         self.inner
             .list_metrics_with_execution_result(execution)
-            .and_then(|detailed| self.maybe_omit_detailed_metadata_reservation(detailed, execution))
+            .and_then(|detailed| self.maybe_omit_detailed_metadata_reservation(detailed))
     }
 
     fn list_metrics_execution_accounting(&self) -> QueryExecutionAccounting {
@@ -257,7 +264,7 @@ impl Storage for MetadataReplyTestStorage {
         self.wait_for_detailed_metadata_release();
         self.inner
             .select_series_with_execution_result(selection, execution)
-            .and_then(|detailed| self.maybe_omit_detailed_metadata_reservation(detailed, execution))
+            .and_then(|detailed| self.maybe_omit_detailed_metadata_reservation(detailed))
     }
 
     fn select_series_execution_accounting(&self) -> QueryExecutionAccounting {
@@ -315,6 +322,7 @@ struct RowScanTestStorage {
     accounting: QueryExecutionAccounting,
     block_detailed_scan: bool,
     omit_detailed_scan_reservation: bool,
+    undersize_detailed_scan_reservation: bool,
     compatibility_scan_calls: AtomicUsize,
     detailed_scan_calls: AtomicUsize,
     detailed_scan_started: Notify,
@@ -335,6 +343,7 @@ impl RowScanTestStorage {
             accounting,
             block_detailed_scan,
             omit_detailed_scan_reservation: false,
+            undersize_detailed_scan_reservation: false,
             compatibility_scan_calls: AtomicUsize::new(0),
             detailed_scan_calls: AtomicUsize::new(0),
             detailed_scan_started: Notify::new(),
@@ -351,6 +360,35 @@ impl RowScanTestStorage {
     fn with_missing_detailed_scan_reservation(mut self) -> Self {
         self.omit_detailed_scan_reservation = true;
         self
+    }
+
+    fn with_undersized_detailed_scan_reservation(mut self) -> Self {
+        self.undersize_detailed_scan_reservation = true;
+        self
+    }
+
+    fn maybe_fault_detailed_scan_result(
+        &self,
+        mut detailed: QueryRowsExecutionResult,
+    ) -> Result<QueryRowsExecutionResult> {
+        if self.omit_detailed_scan_reservation {
+            return Ok(QueryRowsExecutionResult::unaccounted(detailed.into_page()));
+        }
+        if self.undersize_detailed_scan_reservation {
+            let required = tsink::modeled_query_rows_retained_bytes(&detailed.page.rows);
+            assert!(required > 0);
+            let mut reservation = detailed
+                .take_memory_reservation()
+                .expect("built-in detailed row scan should retain a reservation");
+            reservation
+                .resize(required - 1)
+                .expect("shrinking the row-scan test guard should succeed");
+            return Ok(QueryRowsExecutionResult::accounted(
+                detailed.into_page(),
+                reservation,
+            ));
+        }
+        Ok(detailed)
     }
 }
 
@@ -452,11 +490,7 @@ impl Storage for RowScanTestStorage {
             let detailed = self
                 .inner
                 .scan_series_rows_with_execution_result(series, start, end, options, execution)?;
-            if self.omit_detailed_scan_reservation {
-                Ok(QueryRowsExecutionResult::unaccounted(detailed.into_page()))
-            } else {
-                Ok(detailed)
-            }
+            self.maybe_fault_detailed_scan_result(detailed)
         } else {
             self.scan_series_rows(series, start, end, options)
                 .map(QueryRowsExecutionResult::unaccounted)
@@ -500,11 +534,7 @@ impl Storage for RowScanTestStorage {
             let detailed = self
                 .inner
                 .scan_metric_rows_with_execution_result(metric, start, end, options, execution)?;
-            if self.omit_detailed_scan_reservation {
-                Ok(QueryRowsExecutionResult::unaccounted(detailed.into_page()))
-            } else {
-                Ok(detailed)
-            }
+            self.maybe_fault_detailed_scan_result(detailed)
         } else {
             self.scan_metric_rows(metric, start, end, options)
                 .map(QueryRowsExecutionResult::unaccounted)
@@ -1290,6 +1320,46 @@ async fn budgeted_async_scan_metric_rows_rejects_a_missing_result_reservation() 
     assert_eq!(snapshot.queries_completed_total, 1);
     assert_eq!(snapshot.active_queries, 0);
     assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+
+    async_storage.close().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn budgeted_async_scan_metric_rows_rejects_an_undersized_result_reservation() -> Result<()> {
+    let inner = build_row_scan_storage(guarded_row_scan_limits())?;
+    let storage = Arc::new(
+        RowScanTestStorage::new(
+            Arc::clone(&inner),
+            true,
+            QueryExecutionAccounting::Complete,
+            false,
+        )
+        .with_undersized_detailed_scan_reservation(),
+    );
+    let async_storage = AsyncStorage::from_storage(storage.clone() as Arc<dyn Storage>)?;
+
+    let error = async_storage
+        .scan_metric_rows("async_rows", 0, 2, row_scan_options())
+        .await
+        .expect_err("a falsely complete metric backend with an undersized guard must fail closed");
+    assert!(matches!(
+        error,
+        TsinkError::UnsupportedOperation {
+            operation: "async_scan_metric_rows",
+            reason,
+        } if reason == "bounded async row scans require complete execution accounting"
+    ));
+    assert_eq!(storage.detailed_scan_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(storage.compatibility_scan_calls.load(Ordering::SeqCst), 0);
+
+    wait_for_query_resources_to_release(&inner).await;
+    let snapshot = inner.query_budget_snapshot();
+    assert_eq!(snapshot.queries_started_total, 1);
+    assert_eq!(snapshot.queries_completed_total, 1);
+    assert_eq!(snapshot.active_queries, 0);
+    assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+    assert_eq!(snapshot.accounting_invariant_violations_total, 0);
 
     async_storage.close().await?;
     Ok(())

@@ -1,8 +1,10 @@
-use super::policy::{encode_rollup_policies, load_rollup_policies};
+use super::json_decode::{preflight_rollup_state, read_json_to_end_budgeted, RollupJsonLimits};
+use super::policy::{encode_rollup_policies, load_rollup_policies_budgeted};
 use super::*;
 use crate::engine::series::SeriesKey;
 
 const ROLLUP_METRICS_COLLECTION_ALLOCATION_ALLOWANCE_BYTES: usize = 64;
+const ROLLUP_ACTIVE_POLICY_ID_NODE_BYTES: usize = 96;
 
 fn rollup_metrics_capacity_upper(required: usize) -> Result<usize> {
     if required == 0 {
@@ -33,10 +35,53 @@ fn modeled_rollup_metrics_retained_bytes(policy_count: usize, label_bytes: usize
     Ok(u64::try_from(bytes).unwrap_or(u64::MAX))
 }
 
+fn modeled_active_policy_ids_bytes(policies: &[RollupPolicy]) -> Result<usize> {
+    policies.iter().try_fold(64usize, |total, policy| {
+        total
+            .checked_add(ROLLUP_ACTIVE_POLICY_ID_NODE_BYTES)
+            // One exact cloned string plus conservative capacity slack.
+            .and_then(|bytes| {
+                policy
+                    .id
+                    .len()
+                    .checked_mul(2)
+                    .and_then(|id| bytes.checked_add(id))
+            })
+            .ok_or_else(|| {
+                TsinkError::Other(
+                    "rollup active-policy id startup memory model overflow".to_string(),
+                )
+            })
+    })
+}
+
+fn admit_rollup_runtime_startup_memory(
+    memory_limit_bytes: usize,
+    retained_usage: RollupStateEnvelopeUsage,
+    auxiliary_bytes: usize,
+) -> Result<()> {
+    let required = retained_usage
+        .modeled_bytes
+        .checked_add(auxiliary_bytes)
+        .ok_or_else(|| {
+            TsinkError::Other("rollup runtime startup memory model overflow".to_string())
+        })?;
+    crate::disk_budget::admit_startup_memory(memory_limit_bytes, required)
+}
+
 impl RollupRuntimeState {
+    #[cfg(test)]
     pub(in crate::engine) fn new_with_disk_budget(
         data_path: Option<PathBuf>,
         local_disk_budget: Option<Arc<crate::LocalDiskBudget>>,
+    ) -> Self {
+        Self::new_with_disk_budget_and_memory_limit(data_path, local_disk_budget, usize::MAX)
+    }
+
+    pub(in crate::engine) fn new_with_disk_budget_and_memory_limit(
+        data_path: Option<PathBuf>,
+        local_disk_budget: Option<Arc<crate::LocalDiskBudget>>,
+        journal_memory_limit_bytes: usize,
     ) -> Self {
         let dir_path = data_path.map(|path| path.join(ROLLUP_DIR_NAME));
         let policies_path = dir_path
@@ -50,6 +95,7 @@ impl RollupRuntimeState {
             policies_path,
             state_path,
             local_disk_budget,
+            journal_memory_limit_bytes,
             snapshot_publication_fenced: AtomicBool::new(false),
             snapshot_visibility: RwLock::new(()),
             policies: RwLock::new(Vec::new()),
@@ -57,6 +103,7 @@ impl RollupRuntimeState {
             pending_materializations: RwLock::new(HashMap::new()),
             pending_delete_invalidations: RwLock::new(Vec::new()),
             generations: RwLock::new(HashMap::new()),
+            state_envelope_usage: Mutex::new(RollupStateEnvelopeUsage::empty()),
             journal_epoch: AtomicU64::new(0),
             policy_stats: RwLock::new(BTreeMap::new()),
             #[cfg(test)]
@@ -168,9 +215,20 @@ impl RollupRuntimeState {
     }
 }
 
+#[cfg(test)]
 pub(super) fn load_rollup_state(path: Option<&Path>) -> Result<LoadedRollupState> {
+    load_rollup_state_budgeted(path, None, RollupStateEnvelopeUsage::empty(), usize::MAX)
+        .map(|(state, _)| state)
+}
+
+fn load_rollup_state_budgeted(
+    path: Option<&Path>,
+    local_disk_budget: Option<&Arc<crate::LocalDiskBudget>>,
+    initial_usage: RollupStateEnvelopeUsage,
+    journal_memory_limit_bytes: usize,
+) -> Result<(LoadedRollupState, RollupStateEnvelopeUsage)> {
     let Some(path) = path else {
-        return Ok(LoadedRollupState::default());
+        return Ok((LoadedRollupState::default(), initial_usage));
     };
     let bytes = match fs::symlink_metadata(path) {
         Ok(metadata) => {
@@ -189,13 +247,15 @@ pub(super) fn load_rollup_state(path: Option<&Path>) -> Result<LoadedRollupState
                 )));
             }
             let mut file = fs::File::open(path)?;
-            Some(crate::engine::binio::read_to_end_bounded(
+            Some(read_json_to_end_budgeted(
                 &mut file,
                 ROLLUP_STATE_SNAPSHOT_MAX_MODELED_BYTES,
                 usize::try_from(metadata.len())
                     .unwrap_or(ROLLUP_STATE_SNAPSHOT_MAX_MODELED_BYTES)
                     .min(ROLLUP_STATE_SNAPSHOT_MAX_MODELED_BYTES),
                 "rollup state snapshot",
+                journal_memory_limit_bytes,
+                initial_usage.modeled_bytes,
             )?)
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
@@ -207,51 +267,99 @@ pub(super) fn load_rollup_state(path: Option<&Path>) -> Result<LoadedRollupState
         }
     };
 
-    let file = if let Some(bytes) = bytes {
+    let (
+        journal_epoch,
+        persisted_checkpoints,
+        persisted_generations,
+        persisted_pending_materializations,
+        persisted_pending_delete_invalidations,
+    ) = if let Some(bytes) = bytes {
+        let (_, _, journal_epoch, decode_plan) = preflight_rollup_state(
+            &bytes,
+            path,
+            initial_usage,
+            journal_memory_limit_bytes,
+            RollupJsonLimits::default(),
+        )?;
+        debug_assert!(decode_plan.usage.items >= initial_usage.items);
+        decode_plan.admit_typed_decode(
+            bytes.capacity(),
+            bytes.len(),
+            initial_usage.modeled_bytes,
+            journal_memory_limit_bytes,
+            true,
+        )?;
+        super::json_decode::note_typed_json_materialization();
         let file: PersistedRollupStateFile = serde_json::from_slice(&bytes)?;
-        if file.magic != ROLLUP_STATE_MAGIC || file.version != ROLLUP_SCHEMA_VERSION {
-            return Err(TsinkError::DataCorruption(format!(
-                "unsupported rollup state file {}",
-                path.display()
-            )));
-        }
-        Some(file)
+        debug_assert_eq!(file.magic, ROLLUP_STATE_MAGIC);
+        debug_assert_eq!(file.version, ROLLUP_SCHEMA_VERSION);
+        let PersistedRollupStateFile {
+            magic: _,
+            version: _,
+            journal_epoch: typed_journal_epoch,
+            checkpoints,
+            pending_materializations,
+            pending_delete_invalidations,
+            generations,
+        } = file;
+        debug_assert_eq!(journal_epoch, typed_journal_epoch);
+        drop(bytes);
+        (
+            journal_epoch,
+            checkpoints,
+            generations,
+            pending_materializations,
+            pending_delete_invalidations,
+        )
     } else {
-        None
+        (0, Vec::new(), Vec::new(), Vec::new(), Vec::new())
     };
 
-    let journal_epoch = file.as_ref().map_or(0, |file| file.journal_epoch);
-
+    let mut decoded_usage = initial_usage;
     let mut checkpoints = HashMap::<String, BTreeMap<String, i64>>::new();
-    for checkpoint in file
-        .as_ref()
-        .map(|file| file.checkpoints.as_slice())
-        .unwrap_or_default()
-        .iter()
-        .cloned()
-    {
+    for checkpoint in persisted_checkpoints {
+        let is_new = !checkpoints
+            .get(&checkpoint.policy_id)
+            .is_some_and(|entries| entries.contains_key(&checkpoint.source_key));
+        if is_new {
+            decoded_usage = decoded_usage.add_item(
+                checkpoint
+                    .policy_id
+                    .len()
+                    .saturating_add(checkpoint.source_key.len())
+                    .saturating_mul(6)
+                    .saturating_add(128),
+            )?;
+        }
         checkpoints
             .entry(checkpoint.policy_id)
             .or_default()
             .insert(checkpoint.source_key, checkpoint.materialized_through);
     }
-    let generations = file
-        .as_ref()
-        .map(|file| file.generations.as_slice())
-        .unwrap_or_default()
-        .iter()
-        .cloned()
-        .map(|entry| (entry.policy_id, entry.generation))
-        .collect::<HashMap<_, _>>();
+    let mut generations = HashMap::new();
+    for entry in persisted_generations {
+        if !generations.contains_key(&entry.policy_id) {
+            decoded_usage = decoded_usage
+                .add_item(entry.policy_id.len().saturating_mul(6).saturating_add(96))?;
+        }
+        generations.insert(entry.policy_id, entry.generation);
+    }
     let mut pending_materializations =
         HashMap::<String, BTreeMap<String, PendingRollupMaterialization>>::new();
-    for pending in file
-        .as_ref()
-        .map(|file| file.pending_materializations.as_slice())
-        .unwrap_or_default()
-        .iter()
-        .cloned()
-    {
+    for pending in persisted_pending_materializations {
+        let is_new = !pending_materializations
+            .get(&pending.policy_id)
+            .is_some_and(|entries| entries.contains_key(&pending.source_key));
+        if is_new {
+            decoded_usage = decoded_usage.add_item(
+                pending
+                    .policy_id
+                    .len()
+                    .saturating_add(pending.source_key.len())
+                    .saturating_mul(6)
+                    .saturating_add(192),
+            )?;
+        }
         pending_materializations
             .entry(pending.policy_id)
             .or_default()
@@ -264,19 +372,30 @@ pub(super) fn load_rollup_state(path: Option<&Path>) -> Result<LoadedRollupState
                 },
             );
     }
-    let mut pending_delete_invalidations = file
-        .as_ref()
-        .map(|file| file.pending_delete_invalidations.as_slice())
-        .unwrap_or_default()
-        .iter()
-        .cloned()
-        .map(|pending| PendingRollupDeleteInvalidation {
+    let mut pending_delete_invalidations = Vec::new();
+    for pending in persisted_pending_delete_invalidations {
+        decoded_usage = decoded_usage.add_item(192)?;
+        for _ in &pending.series_ids {
+            decoded_usage = decoded_usage.add_item(32)?;
+        }
+        for policy_id in &pending.affected_policy_ids {
+            decoded_usage =
+                decoded_usage.add_item(policy_id.len().saturating_mul(6).saturating_add(32))?;
+        }
+        pending_delete_invalidations.push(PendingRollupDeleteInvalidation {
             tombstone: pending.tombstone,
             series_ids: pending.series_ids,
             affected_policy_ids: pending.affected_policy_ids,
-        })
-        .collect::<Vec<_>>();
+        });
+    }
     normalize_pending_delete_invalidations(&mut pending_delete_invalidations);
+    decoded_usage = rollup_state_components_envelope_usage(
+        initial_usage,
+        &checkpoints,
+        &generations,
+        &pending_materializations,
+        &pending_delete_invalidations,
+    )?;
 
     let mut state = LoadedRollupState {
         journal_epoch,
@@ -285,8 +404,15 @@ pub(super) fn load_rollup_state(path: Option<&Path>) -> Result<LoadedRollupState
         pending_delete_invalidations,
         generations,
     };
-    super::state_journal::load_rollup_state_journal(path.parent(), journal_epoch, &mut state)?;
-    Ok(state)
+    decoded_usage = super::state_journal::load_rollup_state_journal(
+        path.parent(),
+        journal_epoch,
+        &mut state,
+        decoded_usage,
+        local_disk_budget,
+        journal_memory_limit_bytes,
+    )?;
+    Ok((state, decoded_usage))
 }
 
 #[cfg(test)]
@@ -360,25 +486,56 @@ fn persist_rollup_state_budgeted(
     )
 }
 
-fn charge_rollup_snapshot_item(
-    selected_items: &mut usize,
-    selected_bytes: &mut usize,
-    modeled_bytes: usize,
-) -> Result<()> {
-    *selected_items = selected_items.saturating_add(1);
-    *selected_bytes = selected_bytes.saturating_add(modeled_bytes);
-    if *selected_items > ROLLUP_STATE_SNAPSHOT_MAX_ITEMS
-        || *selected_bytes > ROLLUP_STATE_SNAPSHOT_MAX_MODELED_BYTES
-    {
-        return Err(TsinkError::MaintenanceDependencyWindowExceeded {
-            operation: "rollup state snapshot encoding",
-            item_limit: ROLLUP_STATE_SNAPSHOT_MAX_ITEMS,
-            byte_limit: ROLLUP_STATE_SNAPSHOT_MAX_MODELED_BYTES as u64,
-            selected_items: *selected_items,
-            selected_bytes: u64::try_from(*selected_bytes).unwrap_or(u64::MAX),
-        });
+impl RollupStateEnvelopeUsage {
+    pub(super) const fn empty() -> Self {
+        Self {
+            items: 0,
+            modeled_bytes: 512,
+        }
     }
-    Ok(())
+
+    pub(super) fn transition(
+        self,
+        removed_items: usize,
+        removed_bytes: usize,
+        added_items: usize,
+        added_bytes: usize,
+        operation: &'static str,
+    ) -> Result<Self> {
+        let items = self
+            .items
+            .checked_sub(removed_items)
+            .and_then(|items| items.checked_add(added_items))
+            .ok_or_else(|| {
+                TsinkError::Other("rollup state envelope item accounting overflow".to_string())
+            })?;
+        let modeled_bytes = self
+            .modeled_bytes
+            .checked_sub(removed_bytes)
+            .and_then(|bytes| bytes.checked_add(added_bytes))
+            .ok_or_else(|| {
+                TsinkError::Other("rollup state envelope byte accounting overflow".to_string())
+            })?;
+        if items > ROLLUP_STATE_SNAPSHOT_MAX_ITEMS
+            || modeled_bytes > ROLLUP_STATE_SNAPSHOT_MAX_MODELED_BYTES
+        {
+            return Err(TsinkError::MaintenanceDependencyWindowExceeded {
+                operation,
+                item_limit: ROLLUP_STATE_SNAPSHOT_MAX_ITEMS,
+                byte_limit: ROLLUP_STATE_SNAPSHOT_MAX_MODELED_BYTES as u64,
+                selected_items: items,
+                selected_bytes: u64::try_from(modeled_bytes).unwrap_or(u64::MAX),
+            });
+        }
+        Ok(Self {
+            items,
+            modeled_bytes,
+        })
+    }
+
+    fn add_item(self, modeled_bytes: usize) -> Result<Self> {
+        self.transition(0, 0, 1, modeled_bytes, "rollup state snapshot encoding")
+    }
 }
 
 fn ensure_rollup_snapshot_within_limits(
@@ -388,12 +545,42 @@ fn ensure_rollup_snapshot_within_limits(
     pending_materializations: &HashMap<String, BTreeMap<String, PendingRollupMaterialization>>,
     pending_delete_invalidations: &[PendingRollupDeleteInvalidation],
 ) -> Result<()> {
-    let mut selected_items = 0usize;
-    let mut selected_bytes = 512usize;
+    rollup_state_envelope_usage(
+        policies,
+        checkpoints,
+        generations,
+        pending_materializations,
+        pending_delete_invalidations,
+    )
+    .map(|_| ())
+}
+
+pub(super) fn rollup_state_envelope_usage(
+    policies: &[RollupPolicy],
+    checkpoints: &HashMap<String, BTreeMap<String, i64>>,
+    generations: &HashMap<String, u64>,
+    pending_materializations: &HashMap<String, BTreeMap<String, PendingRollupMaterialization>>,
+    pending_delete_invalidations: &[PendingRollupDeleteInvalidation],
+) -> Result<RollupStateEnvelopeUsage> {
+    let policy_usage = rollup_policy_envelope_usage(policies)?;
+    rollup_state_components_envelope_usage(
+        policy_usage,
+        checkpoints,
+        generations,
+        pending_materializations,
+        pending_delete_invalidations,
+    )
+}
+
+pub(super) fn rollup_policy_envelope_usage(
+    policies: &[RollupPolicy],
+) -> Result<RollupStateEnvelopeUsage> {
+    let mut usage = RollupStateEnvelopeUsage::empty();
     for policy in policies {
-        charge_rollup_snapshot_item(
-            &mut selected_items,
-            &mut selected_bytes,
+        // The 6x decoded-string term intentionally covers both the policy's owned strings and
+        // the persistent `policy_stats` key clone. Startup's additional active-id tree is charged
+        // separately because it is a third, temporary policy-id owner.
+        usage = usage.add_item(
             policy
                 .id
                 .len()
@@ -402,9 +589,7 @@ fn ensure_rollup_snapshot_within_limits(
                 .saturating_add(192),
         )?;
         for label in &policy.match_labels {
-            charge_rollup_snapshot_item(
-                &mut selected_items,
-                &mut selected_bytes,
+            usage = usage.add_item(
                 label
                     .name
                     .len()
@@ -414,11 +599,19 @@ fn ensure_rollup_snapshot_within_limits(
             )?;
         }
     }
+    Ok(usage)
+}
+
+fn rollup_state_components_envelope_usage(
+    mut usage: RollupStateEnvelopeUsage,
+    checkpoints: &HashMap<String, BTreeMap<String, i64>>,
+    generations: &HashMap<String, u64>,
+    pending_materializations: &HashMap<String, BTreeMap<String, PendingRollupMaterialization>>,
+    pending_delete_invalidations: &[PendingRollupDeleteInvalidation],
+) -> Result<RollupStateEnvelopeUsage> {
     for (policy_id, entries) in checkpoints {
         for source_key in entries.keys() {
-            charge_rollup_snapshot_item(
-                &mut selected_items,
-                &mut selected_bytes,
+            usage = usage.add_item(
                 policy_id
                     .len()
                     .saturating_add(source_key.len())
@@ -428,17 +621,11 @@ fn ensure_rollup_snapshot_within_limits(
         }
     }
     for policy_id in generations.keys() {
-        charge_rollup_snapshot_item(
-            &mut selected_items,
-            &mut selected_bytes,
-            policy_id.len().saturating_mul(6).saturating_add(96),
-        )?;
+        usage = usage.add_item(policy_id.len().saturating_mul(6).saturating_add(96))?;
     }
     for (policy_id, entries) in pending_materializations {
         for source_key in entries.keys() {
-            charge_rollup_snapshot_item(
-                &mut selected_items,
-                &mut selected_bytes,
+            usage = usage.add_item(
                 policy_id
                     .len()
                     .saturating_add(source_key.len())
@@ -448,19 +635,15 @@ fn ensure_rollup_snapshot_within_limits(
         }
     }
     for pending in pending_delete_invalidations {
-        charge_rollup_snapshot_item(&mut selected_items, &mut selected_bytes, 192)?;
+        usage = usage.add_item(192)?;
         for _ in &pending.series_ids {
-            charge_rollup_snapshot_item(&mut selected_items, &mut selected_bytes, 32)?;
+            usage = usage.add_item(32)?;
         }
         for policy_id in &pending.affected_policy_ids {
-            charge_rollup_snapshot_item(
-                &mut selected_items,
-                &mut selected_bytes,
-                policy_id.len().saturating_mul(6).saturating_add(32),
-            )?;
+            usage = usage.add_item(policy_id.len().saturating_mul(6).saturating_add(32))?;
         }
     }
-    Ok(())
+    Ok(usage)
 }
 
 pub(super) fn ensure_rollup_policies_within_limits(policies: &[RollupPolicy]) -> Result<()> {
@@ -608,7 +791,7 @@ pub(super) fn normalize_pending_delete_invalidations(
     for pending in pending_delete_invalidations.iter_mut() {
         pending.series_ids.sort_unstable();
         pending.series_ids.dedup();
-        pending.affected_policy_ids.sort();
+        pending.affected_policy_ids.sort_unstable();
         pending.affected_policy_ids.dedup();
     }
     pending_delete_invalidations.retain(|pending| {
@@ -919,12 +1102,23 @@ impl<'a> RollupStateStoreContext<'a> {
             .store(0, Ordering::Relaxed);
     }
 
-    fn load_policies(self) -> Result<Vec<RollupPolicy>> {
-        load_rollup_policies(self.state.policies_path())
+    fn load_policies(self) -> Result<(Vec<RollupPolicy>, RollupStateEnvelopeUsage)> {
+        load_rollup_policies_budgeted(
+            self.state.policies_path(),
+            self.state.journal_memory_limit_bytes,
+        )
     }
 
-    fn load_state(self) -> Result<LoadedRollupState> {
-        load_rollup_state(self.state.state_path())
+    fn load_state(
+        self,
+        policy_usage: RollupStateEnvelopeUsage,
+    ) -> Result<(LoadedRollupState, RollupStateEnvelopeUsage)> {
+        load_rollup_state_budgeted(
+            self.state.state_path(),
+            self.state.local_disk_budget.as_ref(),
+            policy_usage,
+            self.state.journal_memory_limit_bytes,
+        )
     }
 
     #[cfg(test)]
@@ -964,6 +1158,7 @@ impl<'a> RollupStateStoreContext<'a> {
         generations: &HashMap<String, u64>,
         pending_materializations: &HashMap<String, BTreeMap<String, PendingRollupMaterialization>>,
         pending_delete_invalidations: &[PendingRollupDeleteInvalidation],
+        retained_memory_bytes: usize,
     ) -> Result<()> {
         self.ensure_snapshot_mutations_unfenced()?;
         let journal_epoch = self.state.journal_epoch.load(Ordering::Acquire);
@@ -978,24 +1173,79 @@ impl<'a> RollupStateStoreContext<'a> {
             journal_epoch,
             self.state.local_disk_budget.as_ref(),
         )?;
-        super::state_journal::cleanup_rollup_state_journal(
+        super::state_journal::cleanup_rollup_state_journal_with_memory_limit(
             self.state.dir_path(),
             self.state.local_disk_budget.as_ref(),
+            self.state.journal_memory_limit_bytes,
+            retained_memory_bytes,
+        )
+    }
+
+    pub(super) fn begin_source_state_journal_writer(
+        self,
+    ) -> Result<super::state_journal::RollupStateJournalWriter> {
+        self.ensure_snapshot_mutations_unfenced()?;
+        let retained_memory_bytes = self.state.state_envelope_usage.lock().modeled_bytes;
+        super::state_journal::begin_rollup_state_journal_writer_with_memory_limit(
+            self.state.dir_path(),
+            self.state.local_disk_budget.as_ref(),
+            self.state.journal_memory_limit_bytes,
+            retained_memory_bytes,
         )
     }
 
     pub(super) fn persist_source_state_event(
         self,
+        writer: &mut super::state_journal::RollupStateJournalWriter,
         event: super::state_journal::RollupSourceStateEvent,
     ) -> Result<()> {
         self.ensure_snapshot_mutations_unfenced()?;
+        let _visibility = self.state.snapshot_visibility.read();
+        let mut retained_usage = self.state.state_envelope_usage.lock();
+        let epoch = self.state.journal_epoch.load(Ordering::Acquire);
+        let checkpoints = self.state.checkpoints.read();
+        let pending_materializations = self.state.pending_materializations.read();
+        let generations = self.state.generations.read();
+        let event_applies = super::state_journal::event_applies(&event, epoch, &generations);
+        let next_usage = super::state_journal::preflight_event_envelope_usage(
+            *retained_usage,
+            &checkpoints,
+            &pending_materializations,
+            &generations,
+            &event,
+            epoch,
+            "rollup source state journal publication",
+        )?;
+        drop(generations);
+        drop(pending_materializations);
+        drop(checkpoints);
         #[cfg(test)]
         self.state.invoke_state_persist_hook()?;
-        super::state_journal::persist_rollup_source_state_event(
-            self.state.dir_path(),
-            event,
-            self.state.local_disk_budget.as_ref(),
-        )
+        let operation_retained_memory_bytes =
+            retained_usage.modeled_bytes.max(next_usage.modeled_bytes);
+        if let Err(error) = writer.persist_with_retained_memory(
+            event.clone(),
+            operation_retained_memory_bytes,
+            next_usage.modeled_bytes,
+        ) {
+            if writer.event_publication_may_be_ambiguous() {
+                self.state
+                    .snapshot_publication_fenced
+                    .store(true, Ordering::Release);
+            }
+            return Err(error);
+        }
+        if event_applies {
+            let mut checkpoints = self.state.checkpoints.write();
+            let mut pending_materializations = self.state.pending_materializations.write();
+            super::state_journal::apply_event_to_maps(
+                &mut checkpoints,
+                &mut pending_materializations,
+                event,
+            );
+        }
+        *retained_usage = next_usage;
+        Ok(())
     }
 
     pub(super) fn capture_snapshot(self) -> Result<RollupRuntimeSnapshot> {
@@ -1133,9 +1383,14 @@ impl<'a> RollupStateStoreContext<'a> {
 
         match persist_result {
             Ok(()) => {
-                let cleanup_result = super::state_journal::cleanup_rollup_state_journal(
+                let retained_memory_bytes =
+                    self.state.state_envelope_usage.lock().modeled_bytes;
+                let cleanup_result =
+                    super::state_journal::cleanup_rollup_state_journal_with_memory_limit(
                     self.state.dir_path(),
                     self.state.local_disk_budget.as_ref(),
+                    self.state.journal_memory_limit_bytes,
+                    retained_memory_bytes,
                 );
                 self.state
                     .snapshot_publication_fenced
@@ -1172,16 +1427,26 @@ impl<'a> RollupStateStoreContext<'a> {
     }
 
     pub(super) fn install_snapshot(self, snapshot: RollupRuntimeSnapshot) {
+        let envelope_usage = rollup_state_envelope_usage(
+            &snapshot.policies,
+            &snapshot.checkpoints,
+            &snapshot.generations,
+            &snapshot.pending_materializations,
+            &snapshot.pending_delete_invalidations,
+        )
+        .expect("validated rollup snapshot has bounded envelope usage");
         // Query selection holds the matching read guard while it reads the component locks. Keep
         // the whole in-memory replacement invisible until every component is installed, and put
         // policies last so even non-query readers see the conservative invalidating state first.
         let _visibility = self.state.snapshot_visibility.write();
+        let mut retained_usage = self.state.state_envelope_usage.lock();
         *self.state.checkpoints.write() = snapshot.checkpoints;
         *self.state.pending_materializations.write() = snapshot.pending_materializations;
         *self.state.pending_delete_invalidations.write() = snapshot.pending_delete_invalidations;
         *self.state.generations.write() = snapshot.generations;
         *self.state.policy_stats.write() = snapshot.policy_stats;
         *self.state.policies.write() = snapshot.policies;
+        *retained_usage = envelope_usage;
     }
 
     pub(super) fn next_snapshot_for_policies(
@@ -1289,11 +1554,34 @@ impl<'a> RollupRegistryReadContext<'a> {
     }
 }
 
+fn add_missing_rollup_generations_within_envelope(
+    policies: &[RollupPolicy],
+    generations: &mut HashMap<String, u64>,
+    mut usage: RollupStateEnvelopeUsage,
+    active_policy_ids_bytes: usize,
+    memory_limit_bytes: usize,
+) -> Result<RollupStateEnvelopeUsage> {
+    for policy in policies {
+        if generations.contains_key(&policy.id) {
+            continue;
+        }
+        let next_usage = usage.add_item(policy.id.len().saturating_mul(6).saturating_add(96))?;
+        admit_rollup_runtime_startup_memory(
+            memory_limit_bytes,
+            next_usage,
+            active_policy_ids_bytes,
+        )?;
+        generations.insert(policy.id.clone(), 0);
+        usage = next_usage;
+    }
+    Ok(usage)
+}
+
 impl<'a> RollupDeleteRepairContext<'a> {
     fn repair_pending_delete_invalidations_on_load(
         self,
         state: &mut LoadedRollupState,
-        active_policy_ids: &BTreeSet<String>,
+        active_policy_ids: &mut BTreeSet<String>,
     ) -> bool {
         for pending in state.pending_delete_invalidations.iter_mut() {
             pending
@@ -1306,33 +1594,41 @@ impl<'a> RollupDeleteRepairContext<'a> {
             return false;
         }
 
+        // The full active-id tree has completed its filtering role. Reuse that allocation role
+        // for the committed repair subset instead of retaining two cloned-id trees at once.
+        active_policy_ids.clear();
         let tombstones = self.tombstones.read();
-        let mut repaired_policy_ids = BTreeSet::new();
         for pending in &state.pending_delete_invalidations {
             if pending_delete_is_committed(&tombstones, pending) {
-                repaired_policy_ids.extend(pending.affected_policy_ids.iter().cloned());
+                active_policy_ids.extend(pending.affected_policy_ids.iter().cloned());
             }
         }
         drop(tombstones);
 
         let had_pending_delete_invalidations = !state.pending_delete_invalidations.is_empty();
         state.pending_delete_invalidations.clear();
-        if !repaired_policy_ids.is_empty() {
+        if !active_policy_ids.is_empty() {
             invalidate_rollup_state_for_policy_ids(
                 &mut state.checkpoints,
                 &mut state.generations,
                 &mut state.pending_materializations,
                 None,
-                &repaired_policy_ids,
+                active_policy_ids,
             );
         }
         had_pending_delete_invalidations
     }
 
     fn load_runtime_state(self) -> Result<()> {
-        let policies = self.store.load_policies()?;
-        let mut state = self.store.load_state()?;
-        let active_ids = policies
+        let (policies, policy_usage) = self.store.load_policies()?;
+        let (mut state, loaded_usage) = self.store.load_state(policy_usage)?;
+        let active_policy_ids_bytes = modeled_active_policy_ids_bytes(&policies)?;
+        admit_rollup_runtime_startup_memory(
+            self.store.state.journal_memory_limit_bytes,
+            loaded_usage,
+            active_policy_ids_bytes,
+        )?;
+        let mut active_ids = policies
             .iter()
             .map(|policy| policy.id.clone())
             .collect::<BTreeSet<_>>();
@@ -1345,9 +1641,20 @@ impl<'a> RollupDeleteRepairContext<'a> {
         state
             .pending_materializations
             .retain(|policy_id, _| active_ids.contains(policy_id));
-        for policy in &policies {
-            state.generations.entry(policy.id.clone()).or_insert(0);
-        }
+        let retained_usage = rollup_state_envelope_usage(
+            &policies,
+            &state.checkpoints,
+            &state.generations,
+            &state.pending_materializations,
+            &state.pending_delete_invalidations,
+        )?;
+        let _retained_usage = add_missing_rollup_generations_within_envelope(
+            &policies,
+            &mut state.generations,
+            retained_usage,
+            active_policy_ids_bytes,
+            self.store.state.journal_memory_limit_bytes,
+        )?;
         state.pending_materializations.retain(|policy_id, entries| {
             let current_generation = state.generations.get(policy_id).copied().unwrap_or(0);
             entries.retain(|_, pending| {
@@ -1357,17 +1664,45 @@ impl<'a> RollupDeleteRepairContext<'a> {
             !entries.is_empty()
         });
         let repaired_pending_delete_invalidations =
-            self.repair_pending_delete_invalidations_on_load(&mut state, &active_ids);
+            self.repair_pending_delete_invalidations_on_load(&mut state, &mut active_ids);
+        // The active-id tree has no uses after pending-delete repair. Release it before any
+        // repair persistence buffers or final runtime installation are allocated.
+        drop(active_ids);
         if repaired_pending_delete_invalidations {
             // The repaired state is installed in memory below even if persisting the cleanup
             // fails here; leaving the on-disk marker in place keeps the recovery retry-safe.
+            let repair_retained_usage = rollup_state_envelope_usage(
+                &policies,
+                &state.checkpoints,
+                &state.generations,
+                &state.pending_materializations,
+                &state.pending_delete_invalidations,
+            )?;
             let _ = self.store.persist_state_snapshot(
                 &state.checkpoints,
                 &state.generations,
                 &state.pending_materializations,
                 &state.pending_delete_invalidations,
+                repair_retained_usage.modeled_bytes,
             );
         }
+
+        let envelope_usage = rollup_state_envelope_usage(
+            &policies,
+            &state.checkpoints,
+            &state.generations,
+            &state.pending_materializations,
+            &state.pending_delete_invalidations,
+        )?;
+        crate::disk_budget::admit_startup_memory(
+            self.store.state.journal_memory_limit_bytes,
+            envelope_usage.modeled_bytes,
+        )?;
+
+        let policy_stats = policies
+            .iter()
+            .map(|policy| (policy.id.clone(), PolicyRunState::default()))
+            .collect::<BTreeMap<_, _>>();
 
         let LoadedRollupState {
             journal_epoch,
@@ -1377,20 +1712,19 @@ impl<'a> RollupDeleteRepairContext<'a> {
             generations,
         } = state;
 
+        let _visibility = self.store.state.snapshot_visibility.write();
+        let mut retained_usage = self.store.state.state_envelope_usage.lock();
         self.store
             .state
             .journal_epoch
             .store(journal_epoch, Ordering::Release);
-        *self.store.state.policies.write() = policies.clone();
+        *self.store.state.policies.write() = policies;
         *self.store.state.checkpoints.write() = checkpoints;
         *self.store.state.pending_materializations.write() = pending_materializations;
         *self.store.state.pending_delete_invalidations.write() = pending_delete_invalidations;
         *self.store.state.generations.write() = generations;
-        let mut policy_stats = self.store.state.policy_stats.write();
-        policy_stats.clear();
-        for policy in policies {
-            policy_stats.insert(policy.id, PolicyRunState::default());
-        }
+        *self.store.state.policy_stats.write() = policy_stats;
+        *retained_usage = envelope_usage;
         Ok(())
     }
 }
@@ -1584,5 +1918,33 @@ impl ChunkStorage {
     ) -> Result<bool> {
         self.rollup_invalidation_context()
             .invalidate_rollup_policy_ids(affected_policy_ids)
+    }
+}
+
+#[cfg(test)]
+mod startup_memory_tests {
+    use super::*;
+
+    #[test]
+    fn active_and_reused_repair_id_tree_peak_has_exact_memory_boundary() {
+        let policies = vec![RollupPolicy {
+            id: "policy-a".to_string(),
+            metric: "cpu".to_string(),
+            match_labels: Vec::new(),
+            interval: 1,
+            aggregation: Aggregation::Avg,
+            bucket_origin: 0,
+        }];
+        let usage = rollup_policy_envelope_usage(&policies).unwrap();
+        let active_ids = modeled_active_policy_ids_bytes(&policies).unwrap();
+        let exact = usage.modeled_bytes.checked_add(active_ids).unwrap();
+
+        admit_rollup_runtime_startup_memory(exact, usage, active_ids).unwrap();
+        let error = admit_rollup_runtime_startup_memory(exact - 1, usage, active_ids).unwrap_err();
+        assert!(matches!(
+            error,
+            TsinkError::MemoryBudgetExceeded { budget, required }
+                if budget == exact - 1 && required == exact
+        ));
     }
 }

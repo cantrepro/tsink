@@ -1,5 +1,7 @@
+use super::json_decode::{preflight_rollup_policies, read_json_to_end_budgeted, RollupJsonLimits};
 use super::runtime::{
     ensure_rollup_policies_within_limits, pending_delete_blocks_rollup_candidate,
+    rollup_policy_envelope_usage,
 };
 use super::*;
 
@@ -28,15 +30,24 @@ pub(super) fn normalize_policy(mut policy: RollupPolicy) -> Result<RollupPolicy>
         )));
     }
     validate_metric(&policy.metric)?;
-    policy.match_labels.sort();
+    policy.match_labels.sort_unstable();
     policy.match_labels.dedup();
     validate_labels(&policy.match_labels)?;
     Ok(policy)
 }
 
+#[cfg(test)]
 pub(super) fn load_rollup_policies(path: Option<&Path>) -> Result<Vec<RollupPolicy>> {
+    load_rollup_policies_budgeted(path, usize::MAX).map(|(policies, _)| policies)
+}
+
+pub(super) fn load_rollup_policies_budgeted(
+    path: Option<&Path>,
+    memory_limit_bytes: usize,
+) -> Result<(Vec<RollupPolicy>, RollupStateEnvelopeUsage)> {
+    let initial_usage = RollupStateEnvelopeUsage::empty();
     let Some(path) = path else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), initial_usage));
     };
     let bytes = match fs::symlink_metadata(path) {
         Ok(metadata) => {
@@ -55,16 +66,20 @@ pub(super) fn load_rollup_policies(path: Option<&Path>) -> Result<Vec<RollupPoli
                 )));
             }
             let mut file = fs::File::open(path)?;
-            crate::engine::binio::read_to_end_bounded(
+            read_json_to_end_budgeted(
                 &mut file,
                 ROLLUP_STATE_SNAPSHOT_MAX_MODELED_BYTES,
                 usize::try_from(metadata.len())
                     .unwrap_or(ROLLUP_STATE_SNAPSHOT_MAX_MODELED_BYTES)
                     .min(ROLLUP_STATE_SNAPSHOT_MAX_MODELED_BYTES),
                 "rollup policies snapshot",
+                memory_limit_bytes,
+                initial_usage.modeled_bytes,
             )?
         }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((Vec::new(), initial_usage));
+        }
         Err(err) => {
             return Err(TsinkError::IoWithPath {
                 path: path.to_path_buf(),
@@ -73,19 +88,32 @@ pub(super) fn load_rollup_policies(path: Option<&Path>) -> Result<Vec<RollupPoli
         }
     };
 
-    let file: PersistedRollupPoliciesFile = serde_json::from_slice(&bytes)?;
-    if file.magic != ROLLUP_POLICIES_MAGIC || file.version != ROLLUP_SCHEMA_VERSION {
-        return Err(TsinkError::DataCorruption(format!(
-            "unsupported rollup policies file {}",
-            path.display()
-        )));
+    let (_, _, decode_plan) = preflight_rollup_policies(
+        &bytes,
+        path,
+        initial_usage,
+        memory_limit_bytes,
+        RollupJsonLimits::default(),
+    )?;
+    debug_assert!(decode_plan.usage.items >= initial_usage.items);
+    decode_plan.admit_typed_decode(
+        bytes.capacity(),
+        bytes.len(),
+        initial_usage.modeled_bytes,
+        memory_limit_bytes,
+        false,
+    )?;
+    super::json_decode::note_typed_json_materialization();
+    let mut file: PersistedRollupPoliciesFile = serde_json::from_slice(&bytes)?;
+    debug_assert_eq!(file.magic, ROLLUP_POLICIES_MAGIC);
+    debug_assert_eq!(file.version, ROLLUP_SCHEMA_VERSION);
+    drop(bytes);
+    for policy in &mut file.policies {
+        *policy = normalize_policy(std::mem::take(policy))?;
     }
-    ensure_rollup_policies_within_limits(&file.policies)?;
-
-    file.policies
-        .into_iter()
-        .map(normalize_policy)
-        .collect::<Result<Vec<_>>>()
+    let usage = rollup_policy_envelope_usage(&file.policies)?;
+    crate::disk_budget::admit_startup_memory(memory_limit_bytes, usage.modeled_bytes)?;
+    Ok((file.policies, usage))
 }
 
 pub(super) fn encode_rollup_policies(policies: &[RollupPolicy]) -> Result<Vec<u8>> {

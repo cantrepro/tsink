@@ -622,6 +622,12 @@ impl Storage for ChunkStorage {
         crate::QueryExecutionAccounting::Complete
     }
 
+    fn scan_metric_rows_with_matchers_execution_accounting(
+        &self,
+    ) -> crate::QueryExecutionAccounting {
+        crate::QueryExecutionAccounting::Complete
+    }
+
     fn query_budget(&self) -> Option<QueryBudget> {
         Some(self.query_budget.clone())
     }
@@ -1186,6 +1192,27 @@ impl Storage for ChunkStorage {
     ) -> Result<QueryRowsExecutionResult> {
         execution.checkpoint()?;
         self.scan_metric_rows_result_api(metric, start, end, options, execution)
+    }
+
+    fn scan_metric_rows_with_matchers_with_execution_result(
+        &self,
+        metric: &str,
+        matchers: &[crate::SeriesMatcher],
+        excluded_output_label: Option<&str>,
+        start: i64,
+        end: i64,
+        options: crate::storage::QueryRowsScanOptions,
+        execution: &QueryExecution,
+    ) -> Result<QueryRowsExecutionResult> {
+        self.scan_metric_rows_with_matchers_result_api(
+            metric,
+            matchers,
+            excluded_output_label,
+            start,
+            end,
+            options,
+            execution,
+        )
     }
 
     fn delete_series(&self, selection: &SeriesSelection) -> Result<DeleteSeriesResult> {

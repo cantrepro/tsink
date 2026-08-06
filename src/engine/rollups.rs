@@ -19,6 +19,8 @@ use crate::storage::{
 use crate::validation::{validate_labels, validate_metric};
 use crate::Aggregation;
 
+#[path = "rollups/json_decode.rs"]
+mod json_decode;
 #[path = "rollups/materialization.rs"]
 mod materialization;
 #[path = "rollups/policy.rs"]
@@ -86,6 +88,7 @@ pub(super) struct RollupRuntimeState {
     policies_path: Option<PathBuf>,
     state_path: Option<PathBuf>,
     local_disk_budget: Option<Arc<crate::LocalDiskBudget>>,
+    journal_memory_limit_bytes: usize,
     snapshot_publication_fenced: AtomicBool,
     snapshot_visibility: RwLock<()>,
     policies: RwLock<Vec<RollupPolicy>>,
@@ -94,6 +97,7 @@ pub(super) struct RollupRuntimeState {
         RwLock<HashMap<String, BTreeMap<String, PendingRollupMaterialization>>>,
     pending_delete_invalidations: RwLock<Vec<PendingRollupDeleteInvalidation>>,
     generations: RwLock<HashMap<String, u64>>,
+    state_envelope_usage: Mutex<RollupStateEnvelopeUsage>,
     journal_epoch: AtomicU64,
     policy_stats: RwLock<BTreeMap<String, PolicyRunState>>,
     #[cfg(test)]
@@ -184,6 +188,12 @@ struct LoadedRollupState {
     pending_materializations: HashMap<String, BTreeMap<String, PendingRollupMaterialization>>,
     pending_delete_invalidations: Vec<PendingRollupDeleteInvalidation>,
     generations: HashMap<String, u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RollupStateEnvelopeUsage {
+    items: usize,
+    modeled_bytes: usize,
 }
 
 #[derive(Debug, Clone)]

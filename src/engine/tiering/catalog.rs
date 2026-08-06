@@ -20,7 +20,7 @@ use crate::engine::binio::{
 };
 use crate::engine::fs_utils::{
     create_dir_all_and_sync_parents, is_link_or_reparse_point,
-    remove_path_if_exists_and_sync_parent_budgeted_with_reconciliation_memory_limit,
+    remove_path_if_exists_and_sync_parent_observed,
     write_owned_file_atomically_and_sync_parent_budgeted_with_reconciliation_memory_limit,
     MAX_RECOVERY_NAMESPACE_ENTRIES,
 };
@@ -1575,35 +1575,97 @@ pub(in crate::engine::storage_engine) fn cleanup_old_segment_catalog_generations
         path: directory.to_path_buf(),
         source,
     })?;
-    for entry in reader {
-        let entry = entry.map_err(|source| TsinkError::IoWithPath {
-            path: directory.to_path_buf(),
-            source,
-        })?;
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        let Some(generation) = parse_segment_catalog_generation_file_name(&name) else {
-            continue;
-        };
-        if Some(generation) == current_generation || Some(generation) == predecessor_generation {
-            continue;
+    let mut reservation = None;
+    let mut governed_deletion_or_ambiguous_error = false;
+    let operation_result = (|| -> Result<()> {
+        for entry in reader {
+            let entry = entry.map_err(|source| TsinkError::IoWithPath {
+                path: directory.to_path_buf(),
+                source,
+            })?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Some(generation) = parse_segment_catalog_generation_file_name(&name) else {
+                continue;
+            };
+            if Some(generation) == current_generation || Some(generation) == predecessor_generation
+            {
+                continue;
+            }
+            let path = entry.path();
+            let file_type = entry.file_type().map_err(|source| TsinkError::IoWithPath {
+                path: path.clone(),
+                source,
+            })?;
+            if file_type.is_symlink() || !file_type.is_file() {
+                continue;
+            }
+            let governed = match local_disk_budget {
+                Some(budget) => budget.governs_entry(&path)?,
+                None => false,
+            };
+            if governed && reservation.is_none() {
+                reservation = Some(
+                    local_disk_budget
+                        .expect("governed segment catalog cleanup requires a disk budget")
+                        .reserve(
+                            crate::DiskCategory::Registry,
+                            0,
+                            crate::DiskReservationKind::Recovery,
+                        )?,
+                );
+            }
+            match remove_path_if_exists_and_sync_parent_observed(&path) {
+                Ok(removed) => {
+                    governed_deletion_or_ambiguous_error |= governed && removed;
+                }
+                Err(err) => {
+                    governed_deletion_or_ambiguous_error |= governed;
+                    return Err(err);
+                }
+            }
         }
-        let file_type = entry.file_type().map_err(|source| TsinkError::IoWithPath {
-            path: entry.path(),
-            source,
-        })?;
-        if file_type.is_symlink() || !file_type.is_file() {
-            continue;
-        }
-        remove_path_if_exists_and_sync_parent_budgeted_with_reconciliation_memory_limit(
-            &entry.path(),
-            local_disk_budget,
-            crate::DiskCategory::Registry,
-            reconciliation_memory_limit,
-        )?;
+        Ok(())
+    })();
+
+    let settlement_result = reservation.map_or(Ok(()), |reservation| reservation.commit(0, 0));
+    if settlement_result.is_err() {
+        governed_deletion_or_ambiguous_error = true;
     }
-    Ok(())
+    let reconciliation_result = if governed_deletion_or_ambiguous_error {
+        local_disk_budget
+            .expect("governed segment catalog cleanup requires a disk budget")
+            .reconcile_when_idle_with_memory_limit(reconciliation_memory_limit)
+            .map(|_| ())
+    } else {
+        Ok(())
+    };
+
+    let mut errors = Vec::new();
+    if let Err(err) = &operation_result {
+        errors.push(format!("cleanup failed: {err}"));
+    }
+    if let Err(err) = &settlement_result {
+        errors.push(format!("disk settlement failed: {err}"));
+    }
+    if let Err(err) = &reconciliation_result {
+        errors.push(format!("disk reconciliation failed: {err}"));
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else if errors.len() == 1 {
+        match (operation_result, settlement_result, reconciliation_result) {
+            (Err(err), _, _) | (_, Err(err), _) | (_, _, Err(err)) => Err(err),
+            _ => unreachable!("one recorded cleanup error must have a matching failed result"),
+        }
+    } else {
+        Err(TsinkError::Other(format!(
+            "segment catalog generation cleanup in {} failed: {}",
+            directory.display(),
+            errors.join("; ")
+        )))
+    }
 }
 
 /// Chooses one collision-free generation after a caller has already enumerated the complete
@@ -2553,6 +2615,125 @@ mod tests {
         assert_eq!(snapshot.reserved_bytes, 0);
         assert_eq!(snapshot.maintenance_reserved_bytes, 0);
         assert!(snapshot.reconciliations_total > 1);
+    }
+
+    #[test]
+    fn governed_generation_cleanup_batches_obsolete_files_into_one_reconciliation() {
+        let temp = TempDir::new().unwrap();
+        let directory = temp.path().join(SEGMENT_CATALOG_GENERATION_DIRECTORY_NAME);
+        std::fs::create_dir_all(&directory).unwrap();
+        let generations: [(u64, &[u8]); 4] = [
+            (1, b"obsolete-one"),
+            (2, b"obsolete-generation-two"),
+            (3, b"retained-predecessor"),
+            (4, b"retained-current-generation"),
+        ];
+        for (generation, bytes) in generations {
+            std::fs::write(
+                directory.join(segment_catalog_generation_file_name(generation)),
+                bytes,
+            )
+            .unwrap();
+        }
+        let unknown = directory.join("keep.me");
+        std::fs::write(&unknown, b"unknown").unwrap();
+        let budget =
+            crate::LocalDiskBudget::open(temp.path(), crate::LocalDiskLimits::default()).unwrap();
+        let before = budget.snapshot();
+        assert_eq!(before.reconciliations_total, 1);
+
+        cleanup_old_segment_catalog_generations(&directory, Some(4), Some(&budget), usize::MAX)
+            .unwrap();
+
+        assert!(!directory
+            .join(segment_catalog_generation_file_name(1))
+            .exists());
+        assert!(!directory
+            .join(segment_catalog_generation_file_name(2))
+            .exists());
+        assert!(directory
+            .join(segment_catalog_generation_file_name(3))
+            .is_file());
+        assert!(directory
+            .join(segment_catalog_generation_file_name(4))
+            .is_file());
+        assert!(unknown.is_file());
+        let retained_registry_bytes =
+            u64::try_from(b"retained-predecessor".len() + b"retained-current-generation".len())
+                .unwrap();
+        let retained_unknown_bytes = u64::try_from(b"unknown".len()).unwrap();
+        let snapshot = budget.snapshot();
+        assert_eq!(
+            snapshot.reconciliations_total,
+            before.reconciliations_total + 1
+        );
+        assert_eq!(
+            snapshot.accounted_bytes,
+            retained_registry_bytes + retained_unknown_bytes
+        );
+        assert_eq!(snapshot.active_reservations, 0);
+        assert_eq!(snapshot.reserved_bytes, 0);
+        assert_eq!(snapshot.maintenance_reserved_bytes, 0);
+        let category_bytes = |category| {
+            snapshot
+                .categories
+                .iter()
+                .find(|usage| usage.category == category)
+                .map_or(0, |usage| usage.bytes)
+        };
+        assert_eq!(
+            category_bytes(crate::DiskCategory::Registry),
+            retained_registry_bytes
+        );
+        assert_eq!(
+            category_bytes(crate::DiskCategory::Unknown),
+            retained_unknown_bytes
+        );
+    }
+
+    #[test]
+    fn governed_generation_cleanup_reconciles_after_post_unlink_sync_failure() {
+        let temp = TempDir::new().unwrap();
+        let directory = temp.path().join(SEGMENT_CATALOG_GENERATION_DIRECTORY_NAME);
+        std::fs::create_dir_all(&directory).unwrap();
+        let obsolete = directory.join(segment_catalog_generation_file_name(1));
+        let predecessor = directory.join(segment_catalog_generation_file_name(2));
+        let current = directory.join(segment_catalog_generation_file_name(3));
+        std::fs::write(&obsolete, b"obsolete").unwrap();
+        std::fs::write(&predecessor, b"predecessor").unwrap();
+        std::fs::write(&current, b"current").unwrap();
+        let budget =
+            crate::LocalDiskBudget::open(temp.path(), crate::LocalDiskLimits::default()).unwrap();
+        let before = budget.snapshot();
+        let _sync_failure = crate::engine::fs_utils::fail_directory_sync_once(
+            directory.clone(),
+            "injected catalog generation cleanup sync failure",
+        );
+
+        let err =
+            cleanup_old_segment_catalog_generations(&directory, Some(3), Some(&budget), usize::MAX)
+                .expect_err("the committed unlink must retain its synchronization error");
+
+        assert!(matches!(
+            err,
+            TsinkError::Other(ref message)
+                if message == "injected catalog generation cleanup sync failure"
+        ));
+        assert!(!obsolete.exists());
+        assert!(predecessor.is_file());
+        assert!(current.is_file());
+        let snapshot = budget.snapshot();
+        assert_eq!(
+            snapshot.accounted_bytes,
+            u64::try_from(b"predecessor".len() + b"current".len()).unwrap()
+        );
+        assert_eq!(
+            snapshot.reconciliations_total,
+            before.reconciliations_total + 1
+        );
+        assert_eq!(snapshot.active_reservations, 0);
+        assert_eq!(snapshot.reserved_bytes, 0);
+        assert_eq!(snapshot.maintenance_reserved_bytes, 0);
     }
 
     #[test]

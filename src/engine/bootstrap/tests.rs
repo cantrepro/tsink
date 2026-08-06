@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Barrier, Mutex};
 
 use tempfile::TempDir;
 
@@ -22,6 +22,49 @@ fn startup_builder(data_path: &Path) -> StorageBuilder {
         .with_data_path(data_path)
         .with_timestamp_precision(TimestampPrecision::Seconds)
         .with_chunk_points(2)
+}
+
+fn local_orphan_cleanup_lanes(data_path: &Path) -> Vec<crate::engine::tombstone::TombstoneLane> {
+    [
+        (
+            crate::engine::tombstone::TombstoneLaneRole::LocalNumeric,
+            NUMERIC_LANE_ROOT,
+        ),
+        (
+            crate::engine::tombstone::TombstoneLaneRole::LocalBlob,
+            BLOB_LANE_ROOT,
+        ),
+    ]
+    .into_iter()
+    .map(
+        |(role, lane_root)| crate::engine::tombstone::TombstoneLane {
+            role,
+            namespace_root: data_path.to_path_buf(),
+            manifest_path: data_path
+                .join(lane_root)
+                .join(crate::engine::tombstone::TOMBSTONES_FILE_NAME),
+        },
+    )
+    .collect()
+}
+
+fn external_orphan_cleanup_lane(root: &Path) -> crate::engine::tombstone::TombstoneLane {
+    crate::engine::tombstone::TombstoneLane {
+        role: crate::engine::tombstone::TombstoneLaneRole::WarmNumeric,
+        namespace_root: root.to_path_buf(),
+        manifest_path: root
+            .join("warm/numeric")
+            .join(crate::engine::tombstone::TOMBSTONES_FILE_NAME),
+    }
+}
+
+fn tombstone_shards_directory(manifest_path: &Path) -> PathBuf {
+    manifest_path
+        .with_file_name(format!(
+            "{}.store",
+            crate::engine::tombstone::TOMBSTONES_FILE_NAME
+        ))
+        .join("shards")
 }
 
 fn create_valid_restore_snapshot(path: &Path) {
@@ -1660,6 +1703,890 @@ fn planning_without_orphans_keeps_the_initial_single_reconciliation() {
 }
 
 #[test]
+fn post_flush_recovery_blockers_share_one_exact_reconciliation() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    let marker_dir = data_path.join(super::super::maintenance::POST_FLUSH_REPLACEMENT_DIR_NAME);
+    let marker_name = "transaction-0000000000000001-0000000000000002.json";
+    let atomic_temp = marker_dir.join(format!(".{marker_name}.tmp-123-0000000000000003"));
+    std::fs::create_dir_all(&marker_dir).unwrap();
+    std::fs::write(&atomic_temp, b"atomic-crash-debris").unwrap();
+
+    let copy_stage = data_path
+        .join(NUMERIC_LANE_ROOT)
+        .join("segments/L0")
+        .join(".tmp-tsink-post-flush-stage-copy-seg-0000000000000004-0000000000000005");
+    std::fs::create_dir_all(&copy_stage).unwrap();
+    std::fs::write(copy_stage.join("payload"), b"copy-crash-debris").unwrap();
+    let rewrite_stage =
+        data_path.join(".tmp-tsink-post-flush-retention-rewrite-lane_numeric-0000000000000006");
+    std::fs::create_dir_all(&rewrite_stage).unwrap();
+    std::fs::write(rewrite_stage.join("payload"), b"rewrite-crash-debris").unwrap();
+    let unknown = data_path.join("operator-note");
+    std::fs::write(&unknown, b"keep-operator-data").unwrap();
+
+    let builder = startup_builder(&data_path);
+    let manifest_bytes = data_directory_manifest::install_current_manifest_for_test(&builder)
+        .expect("fixture manifest should be installed");
+    let plan = StartupPlanningPhase::prepare(&builder)
+        .expect("all exact blockers should be reclaimed under one aggregate reservation");
+    assert!(!atomic_temp.exists());
+    assert!(!copy_stage.exists());
+    assert!(!rewrite_stage.exists());
+    assert_eq!(std::fs::read(&unknown).unwrap(), b"keep-operator-data");
+
+    let snapshot = plan.local_disk_budget().unwrap().snapshot();
+    assert_eq!(snapshot.reconciliations_total, 2);
+    assert_eq!(
+        snapshot.accounted_bytes,
+        manifest_bytes + std::fs::metadata(&unknown).unwrap().len()
+    );
+    assert_eq!(snapshot.active_reservations, 0);
+    assert_eq!(snapshot.reserved_bytes, 0);
+}
+
+#[test]
+fn post_flush_recovery_blocker_lookalikes_do_not_trigger_reconciliation() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    let marker_dir = data_path.join(super::super::maintenance::POST_FLUSH_REPLACEMENT_DIR_NAME);
+    let marker_name = "transaction-0000000000000001-0000000000000002.json";
+    let atomic_lookalike = marker_dir.join(format!(".{marker_name}.tmp-123-000000000000000A"));
+    std::fs::create_dir_all(&marker_dir).unwrap();
+    std::fs::write(&atomic_lookalike, b"keep-atomic-lookalike").unwrap();
+    let copy_lookalike = data_path
+        .join(NUMERIC_LANE_ROOT)
+        .join("segments/L0")
+        .join(".tmp-tsink-post-flush-stage-copy-seg-0000000000000003-000000000000000A");
+    std::fs::create_dir_all(&copy_lookalike).unwrap();
+    std::fs::write(copy_lookalike.join("payload"), b"keep-copy-lookalike").unwrap();
+
+    let builder = startup_builder(&data_path);
+    data_directory_manifest::install_current_manifest_for_test(&builder).unwrap();
+    let plan = StartupPlanningPhase::prepare(&builder)
+        .expect("a definite no-op cleanup should not reconcile after the initial scan");
+    assert_eq!(
+        std::fs::read(&atomic_lookalike).unwrap(),
+        b"keep-atomic-lookalike"
+    );
+    assert_eq!(
+        std::fs::read(copy_lookalike.join("payload")).unwrap(),
+        b"keep-copy-lookalike"
+    );
+    let after = plan.local_disk_budget().unwrap().snapshot();
+    assert_eq!(after.reconciliations_total, 1);
+}
+
+#[test]
+fn post_flush_recovery_blocker_external_only_remains_unbudgeted() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    let object_store = temp_dir.path().join("object-store");
+    std::fs::create_dir_all(&data_path).unwrap();
+    let external_stage = object_store
+        .join("warm")
+        .join(NUMERIC_LANE_ROOT)
+        .join("segments/L0")
+        .join(".tmp-tsink-post-flush-stage-copy-seg-0000000000000001-0000000000000002");
+    std::fs::create_dir_all(&external_stage).unwrap();
+    std::fs::write(external_stage.join("payload"), b"external-crash-debris").unwrap();
+    let builder = startup_builder(&data_path).with_object_store_path(&object_store);
+    let budget =
+        crate::LocalDiskBudget::open(&data_path, crate::LocalDiskLimits::default()).unwrap();
+    let before = budget.snapshot();
+
+    super::planning::cleanup_post_flush_recovery_blockers_with_limits_for_test(
+        &builder,
+        &budget,
+        usize::MAX,
+        crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES,
+    )
+    .expect("an external-only exact plan should execute without local accounting");
+    assert!(!external_stage.exists());
+    assert_eq!(
+        budget.snapshot().reconciliations_total,
+        before.reconciliations_total
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn post_flush_recovery_blocker_rejects_an_external_intermediate_symlink_before_reading_it() {
+    use std::os::unix::fs::symlink;
+
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    let object_store = temp_dir.path().join("object-store");
+    let outside = temp_dir.path().join("outside");
+    std::fs::create_dir_all(&data_path).unwrap();
+    std::fs::create_dir_all(&object_store).unwrap();
+    let external_stage = outside
+        .join(NUMERIC_LANE_ROOT)
+        .join("segments/L0")
+        .join(".tmp-tsink-post-flush-stage-copy-seg-0000000000000001-0000000000000002");
+    std::fs::create_dir_all(&external_stage).unwrap();
+    let sentinel = external_stage.join("outside-sentinel");
+    std::fs::write(&sentinel, b"must-not-be-read-or-removed").unwrap();
+    symlink(&outside, object_store.join("warm")).unwrap();
+
+    let builder = startup_builder(&data_path).with_object_store_path(&object_store);
+    let budget =
+        crate::LocalDiskBudget::open(&data_path, crate::LocalDiskLimits::default()).unwrap();
+    let before = budget.snapshot();
+    let error = super::planning::cleanup_post_flush_recovery_blockers_with_limits_for_test(
+        &builder,
+        &budget,
+        usize::MAX,
+        crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES,
+    )
+    .expect_err("an external intermediate symlink must fail before namespace traversal");
+
+    assert!(matches!(error, TsinkError::DataCorruption(message)
+        if message.contains("owned post-flush staging path contains a link-like or wrong-type entry")));
+    assert_eq!(
+        std::fs::read(&sentinel).unwrap(),
+        b"must-not-be-read-or-removed"
+    );
+    assert!(external_stage.is_dir());
+    assert_eq!(
+        budget.snapshot().reconciliations_total,
+        before.reconciliations_total
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn post_flush_recovery_blocker_rejects_an_external_intermediate_reparse_point() {
+    use std::os::windows::fs::symlink_dir;
+
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    let object_store = temp_dir.path().join("object-store");
+    let outside = temp_dir.path().join("outside");
+    std::fs::create_dir_all(&data_path).unwrap();
+    std::fs::create_dir_all(&object_store).unwrap();
+    let external_stage = outside
+        .join(NUMERIC_LANE_ROOT)
+        .join("segments/L0")
+        .join(".tmp-tsink-post-flush-stage-copy-seg-0000000000000001-0000000000000002");
+    std::fs::create_dir_all(&external_stage).unwrap();
+    let sentinel = external_stage.join("outside-sentinel");
+    std::fs::write(&sentinel, b"must-not-be-read-or-removed").unwrap();
+    if let Err(err) = symlink_dir(&outside, object_store.join("warm")) {
+        if err.kind() == std::io::ErrorKind::PermissionDenied {
+            return;
+        }
+        panic!("unexpected directory-symlink fixture error: {err}");
+    }
+
+    let builder = startup_builder(&data_path).with_object_store_path(&object_store);
+    let budget =
+        crate::LocalDiskBudget::open(&data_path, crate::LocalDiskLimits::default()).unwrap();
+    let error = super::planning::cleanup_post_flush_recovery_blockers_with_limits_for_test(
+        &builder,
+        &budget,
+        usize::MAX,
+        crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES,
+    )
+    .expect_err("an external reparse point must fail before namespace traversal");
+
+    assert!(matches!(error, TsinkError::DataCorruption(message)
+        if message.contains("owned post-flush staging path contains a link-like or wrong-type entry")));
+    assert_eq!(
+        std::fs::read(&sentinel).unwrap(),
+        b"must-not-be-read-or-removed"
+    );
+    assert!(external_stage.is_dir());
+}
+
+#[cfg(unix)]
+#[test]
+fn post_flush_recovery_blocker_rejects_a_parent_identity_swap_before_removal() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    let parent = data_path.join(NUMERIC_LANE_ROOT).join("segments/L0");
+    let stage_name = ".tmp-tsink-post-flush-stage-copy-seg-0000000000000001-0000000000000002";
+    let planned_stage = parent.join(stage_name);
+    std::fs::create_dir_all(&planned_stage).unwrap();
+    std::fs::write(planned_stage.join("planned-payload"), b"planned").unwrap();
+
+    let displaced_parent = parent.parent().unwrap().join("L0-displaced");
+    let displaced_stage = displaced_parent.join(stage_name);
+    let replacement_stage = parent.join(stage_name);
+    let replacement_sentinel = replacement_stage.join("replacement-sentinel");
+    let builder = startup_builder(&data_path);
+    let budget =
+        crate::LocalDiskBudget::open(&data_path, crate::LocalDiskLimits::default()).unwrap();
+    let before = budget.snapshot();
+    let swapped_parent = parent.clone();
+    let swapped_displaced_parent = displaced_parent.clone();
+    let swapped_replacement_stage = replacement_stage.clone();
+    let error = super::planning::cleanup_post_flush_recovery_blockers_with_before_execute_for_test(
+        &builder,
+        &budget,
+        usize::MAX,
+        crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES,
+        move || {
+            std::fs::rename(&swapped_parent, &swapped_displaced_parent).unwrap();
+            std::fs::create_dir_all(&swapped_replacement_stage).unwrap();
+            std::fs::write(
+                swapped_replacement_stage.join("replacement-sentinel"),
+                b"replacement",
+            )
+            .unwrap();
+        },
+    )
+    .expect_err("the retained parent handle must reject a same-path replacement");
+
+    assert!(error
+        .to_string()
+        .contains("post-flush cleanup parent identity changed before removal"));
+    assert_eq!(
+        std::fs::read(displaced_stage.join("planned-payload")).unwrap(),
+        b"planned"
+    );
+    assert_eq!(
+        std::fs::read(&replacement_sentinel).unwrap(),
+        b"replacement"
+    );
+    assert_eq!(
+        budget.snapshot().reconciliations_total,
+        before.reconciliations_total + 1
+    );
+}
+
+#[test]
+fn post_flush_recovery_blocker_serializes_a_retained_shared_budget_file_replacement() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    let marker_dir = data_path.join(super::super::maintenance::POST_FLUSH_REPLACEMENT_DIR_NAME);
+    let marker_name = "transaction-0000000000000001-0000000000000002.json";
+    let atomic_temp = marker_dir.join(format!(".{marker_name}.tmp-123-0000000000000003"));
+    std::fs::create_dir_all(&marker_dir).unwrap();
+    std::fs::write(&atomic_temp, b"planned-crash-debris").unwrap();
+
+    let builder = startup_builder(&data_path);
+    let budget =
+        crate::LocalDiskBudget::open(&data_path, crate::LocalDiskLimits::default()).unwrap();
+    let start = Arc::new(Barrier::new(2));
+    let mut writer = None;
+    let writer_start = Arc::clone(&start);
+    let writer_budget = Arc::clone(&budget);
+    let writer_target = atomic_temp.clone();
+
+    super::planning::cleanup_post_flush_recovery_blockers_with_before_execute_for_test(
+        &builder,
+        &budget,
+        usize::MAX,
+        crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES,
+        || {
+            let attempts = budget.managed_file_mutation_lock_attempts_for_test();
+            writer = Some(std::thread::spawn(move || {
+                writer_start.wait();
+                writer_budget.write_file_atomically_and_sync_parent(
+                    &writer_target,
+                    b"same-path-replacement",
+                    crate::DiskCategory::Temporary,
+                )
+            }));
+            start.wait();
+            while budget.managed_file_mutation_lock_attempts_for_test() == attempts {
+                std::thread::yield_now();
+            }
+            assert!(!writer.as_ref().unwrap().is_finished());
+            assert_eq!(
+                std::fs::read(&atomic_temp).unwrap(),
+                b"planned-crash-debris"
+            );
+        },
+    )
+    .expect("the aggregate cleanup should finish before the serialized replacement");
+
+    writer
+        .take()
+        .unwrap()
+        .join()
+        .unwrap()
+        .expect("the retained shared coordinator replacement should complete");
+    assert_eq!(
+        std::fs::read(&atomic_temp).unwrap(),
+        b"same-path-replacement"
+    );
+}
+
+#[test]
+fn post_flush_recovery_blocker_serializes_public_managed_directory_creation() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    let stage = data_path
+        .join(NUMERIC_LANE_ROOT)
+        .join("segments/L0")
+        .join(".tmp-tsink-post-flush-stage-copy-seg-0000000000000001-0000000000000002");
+    let planned_payload = stage.join("planned-payload");
+    let late_directory = stage.join("late-adapter-directory");
+    std::fs::create_dir_all(&stage).unwrap();
+    std::fs::write(&planned_payload, b"planned").unwrap();
+
+    let builder = startup_builder(&data_path);
+    let budget =
+        crate::LocalDiskBudget::open(&data_path, crate::LocalDiskLimits::default()).unwrap();
+    let start = Arc::new(Barrier::new(2));
+    let mut creator = None;
+    let creator_start = Arc::clone(&start);
+    let creator_budget = Arc::clone(&budget);
+    let creator_directory = late_directory.clone();
+
+    super::planning::cleanup_post_flush_recovery_blockers_with_before_execute_for_test(
+        &builder,
+        &budget,
+        usize::MAX,
+        crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES,
+        || {
+            let attempts = budget.managed_file_mutation_lock_attempts_for_test();
+            creator = Some(std::thread::spawn(move || {
+                creator_start.wait();
+                creator_budget.create_dir_all_and_sync_parents(&creator_directory)
+            }));
+            start.wait();
+            while budget.managed_file_mutation_lock_attempts_for_test() == attempts {
+                std::thread::yield_now();
+            }
+            assert!(!creator.as_ref().unwrap().is_finished());
+            assert!(!late_directory.exists());
+            assert_eq!(std::fs::read(&planned_payload).unwrap(), b"planned");
+        },
+    )
+    .expect("the exact stage should be removed before managed directory creation resumes");
+
+    creator
+        .take()
+        .unwrap()
+        .join()
+        .unwrap()
+        .expect("the serialized managed directory creation should complete");
+    assert!(late_directory.is_dir());
+    assert!(!planned_payload.exists());
+}
+
+#[test]
+fn post_flush_recovery_blocker_sync_failure_reconciles_once_and_stops_in_source_order() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    let marker_dir = data_path.join(super::super::maintenance::POST_FLUSH_REPLACEMENT_DIR_NAME);
+    let marker_name = "transaction-0000000000000001-0000000000000002.json";
+    let atomic_temp = marker_dir.join(format!(".{marker_name}.tmp-123-0000000000000003"));
+    std::fs::create_dir_all(&marker_dir).unwrap();
+    std::fs::write(&atomic_temp, b"atomic-crash-debris").unwrap();
+    let copy_stage = data_path
+        .join(NUMERIC_LANE_ROOT)
+        .join("segments/L0")
+        .join(".tmp-tsink-post-flush-stage-copy-seg-0000000000000004-0000000000000005");
+    std::fs::create_dir_all(&copy_stage).unwrap();
+    std::fs::write(copy_stage.join("payload"), b"copy-crash-debris").unwrap();
+
+    let builder = startup_builder(&data_path);
+    data_directory_manifest::install_current_manifest_for_test(&builder).unwrap();
+    let budget =
+        crate::LocalDiskBudget::open(&data_path, crate::LocalDiskLimits::default()).unwrap();
+    let before = budget.snapshot();
+    let synchronized_marker_dir = marker_dir.clone();
+    let _sync_guard = crate::engine::fs_utils::fail_directory_sync_matching_once(
+        move |path| path == synchronized_marker_dir,
+        "injected aggregate blocker sync failure",
+    );
+
+    let error = planning_error(&builder.with_shared_local_disk_budget(Arc::clone(&budget)));
+    assert!(error
+        .to_string()
+        .contains("injected aggregate blocker sync failure"));
+    assert!(
+        !atomic_temp.exists(),
+        "the committed marker-temp deletion must remain"
+    );
+    assert!(
+        copy_stage.is_dir(),
+        "a marker-parent error must stop before the later staging operation"
+    );
+    let after = budget.snapshot();
+    assert_eq!(
+        after.reconciliations_total,
+        before.reconciliations_total + 2
+    );
+    assert_eq!(after.active_reservations, 0);
+    assert_eq!(after.reserved_bytes, 0);
+}
+
+#[test]
+fn post_flush_recovery_blocker_preflight_rejects_ambiguity_before_any_deletion() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    let marker_dir = data_path.join(super::super::maintenance::POST_FLUSH_REPLACEMENT_DIR_NAME);
+    let marker_name = "transaction-0000000000000001-0000000000000002.json";
+    let atomic_temp = marker_dir.join(format!(".{marker_name}.tmp-123-0000000000000003"));
+    std::fs::create_dir_all(&marker_dir).unwrap();
+    std::fs::write(&atomic_temp, b"must-survive-failed-preflight").unwrap();
+    let ambiguous_stage = data_path
+        .join(NUMERIC_LANE_ROOT)
+        .join("segments/L0")
+        .join(".tmp-tsink-post-flush-stage-copy-seg-0000000000000004-0000000000000005");
+    std::fs::create_dir_all(ambiguous_stage.parent().unwrap()).unwrap();
+    std::fs::write(&ambiguous_stage, b"not-a-directory").unwrap();
+
+    let builder = startup_builder(&data_path);
+    data_directory_manifest::install_current_manifest_for_test(&builder).unwrap();
+    let budget =
+        crate::LocalDiskBudget::open(&data_path, crate::LocalDiskLimits::default()).unwrap();
+    let before = budget.snapshot();
+
+    let error = super::planning::preflight_post_flush_recovery_blockers_with_limits_for_test(
+        &builder,
+        &budget,
+        usize::MAX,
+        crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES,
+    )
+    .expect_err("ambiguous staging must fail aggregate preflight");
+    assert!(matches!(error, TsinkError::DataCorruption(message)
+        if message.contains("owned post-flush staging entry is link-like or not a directory")));
+    assert_eq!(
+        std::fs::read(&atomic_temp).unwrap(),
+        b"must-survive-failed-preflight"
+    );
+    assert_eq!(std::fs::read(&ambiguous_stage).unwrap(), b"not-a-directory");
+    let after = budget.snapshot();
+    assert_eq!(after.reconciliations_total, before.reconciliations_total);
+}
+
+#[cfg(unix)]
+#[test]
+fn post_flush_recovery_blocker_marker_ambiguity_precedes_external_lane_resolution() {
+    use std::os::unix::fs::symlink;
+
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    let object_store = temp_dir.path().join("object-store");
+    let outside = temp_dir.path().join("outside");
+    let marker_dir = data_path.join(super::super::maintenance::POST_FLUSH_REPLACEMENT_DIR_NAME);
+    let marker_name = "transaction-0000000000000001-0000000000000002.json";
+    let ambiguous_marker = marker_dir.join(format!(".{marker_name}.tmp-123-0000000000000003"));
+    std::fs::create_dir_all(&ambiguous_marker).unwrap();
+    std::fs::write(ambiguous_marker.join("sentinel"), b"ambiguous-marker").unwrap();
+    std::fs::create_dir_all(&object_store).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    symlink(&outside, object_store.join("warm")).unwrap();
+
+    let builder = startup_builder(&data_path).with_object_store_path(&object_store);
+    let budget =
+        crate::LocalDiskBudget::open(&data_path, crate::LocalDiskLimits::default()).unwrap();
+    let before = budget.snapshot();
+    let error = super::planning::preflight_post_flush_recovery_blockers_with_limits_for_test(
+        &builder,
+        &budget,
+        usize::MAX,
+        crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES,
+    )
+    .expect_err("marker ambiguity must stop preflight before resolving tier lanes");
+
+    assert!(matches!(error, TsinkError::InvalidConfiguration(message)
+        if message.contains("refusing to remove ambiguous owned temporary entry")
+            && message.contains(&ambiguous_marker.display().to_string())));
+    assert_eq!(
+        std::fs::read(ambiguous_marker.join("sentinel")).unwrap(),
+        b"ambiguous-marker"
+    );
+    assert_eq!(
+        budget.snapshot().reconciliations_total,
+        before.reconciliations_total
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn post_flush_recovery_blocker_rejects_a_link_like_windows_marker_root() {
+    use std::os::windows::fs::symlink_dir;
+
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    let marker_dir = data_path.join(super::super::maintenance::POST_FLUSH_REPLACEMENT_DIR_NAME);
+    let outside = temp_dir.path().join("outside-marker");
+    let sentinel = outside.join("sentinel");
+    std::fs::create_dir_all(&marker_dir).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(&sentinel, b"outside-marker").unwrap();
+    let marker_name = "transaction-0000000000000001-0000000000000002.json";
+    let marker_link = marker_dir.join(format!(".{marker_name}.tmp-123-0000000000000003"));
+    if let Err(err) = symlink_dir(&outside, &marker_link) {
+        if err.kind() == std::io::ErrorKind::PermissionDenied {
+            return;
+        }
+        panic!("unexpected marker directory-symlink fixture error: {err}");
+    }
+
+    let builder = startup_builder(&data_path);
+    let budget =
+        crate::LocalDiskBudget::open(&data_path, crate::LocalDiskLimits::default()).unwrap();
+    let error = super::planning::preflight_post_flush_recovery_blockers_with_limits_for_test(
+        &builder,
+        &budget,
+        usize::MAX,
+        crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES,
+    )
+    .expect_err("Windows marker reparse roots must be rejected");
+
+    assert!(matches!(error, TsinkError::InvalidConfiguration(message)
+        if message.contains("refusing to remove ambiguous owned temporary entry")));
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"outside-marker");
+    assert!(marker_link.exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn post_flush_recovery_blocker_rejects_a_windows_reparse_descendant_before_any_deletion() {
+    use std::os::windows::fs::symlink_dir;
+
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    let outside = temp_dir.path().join("outside-stage-descendant");
+    let outside_sentinel = outside.join("sentinel");
+    let stage = data_path
+        .join(NUMERIC_LANE_ROOT)
+        .join("segments/L0")
+        .join(".tmp-tsink-post-flush-stage-copy-seg-0000000000000001-0000000000000002");
+    // Reverse-path deletion would remove this sibling before reaching `aa-reparse`; the complete
+    // preflight must reject the junction while this earlier planned deletion is still untouched.
+    let earlier_sibling = stage.join("zz-earlier-sibling");
+    let reparse = stage.join("aa-reparse");
+    std::fs::create_dir_all(&stage).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(&outside_sentinel, b"outside").unwrap();
+    std::fs::write(&earlier_sibling, b"must-survive-preflight").unwrap();
+    if let Err(err) = symlink_dir(&outside, &reparse) {
+        if err.kind() == std::io::ErrorKind::PermissionDenied {
+            return;
+        }
+        panic!("unexpected stage-descendant directory-symlink fixture error: {err}");
+    }
+
+    let builder = startup_builder(&data_path);
+    let budget =
+        crate::LocalDiskBudget::open(&data_path, crate::LocalDiskLimits::default()).unwrap();
+    let before = budget.snapshot();
+    let error = super::planning::cleanup_post_flush_recovery_blockers_with_limits_for_test(
+        &builder,
+        &budget,
+        usize::MAX,
+        crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES,
+    )
+    .expect_err("a Windows directory reparse descendant must reject the complete plan");
+
+    assert!(matches!(error, TsinkError::DataCorruption(message)
+        if message.contains("unsupported link-like Windows entry")));
+    assert_eq!(
+        std::fs::read(&earlier_sibling).unwrap(),
+        b"must-survive-preflight"
+    );
+    assert_eq!(std::fs::read(&outside_sentinel).unwrap(), b"outside");
+    assert!(std::fs::symlink_metadata(&reparse).is_ok());
+    assert_eq!(
+        budget.snapshot().reconciliations_total,
+        before.reconciliations_total
+    );
+}
+
+#[test]
+fn post_flush_recovery_blocker_preflight_shares_one_cross_parent_namespace_cap() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    let marker_dir = data_path.join(super::super::maintenance::POST_FLUSH_REPLACEMENT_DIR_NAME);
+    let marker_name = "transaction-0000000000000001-0000000000000002.json";
+    let atomic_temp = marker_dir.join(format!(".{marker_name}.tmp-123-0000000000000003"));
+    std::fs::create_dir_all(&marker_dir).unwrap();
+    std::fs::write(&atomic_temp, b"marker-parent-entry").unwrap();
+    let copy_stage = data_path
+        .join(NUMERIC_LANE_ROOT)
+        .join("segments/L0")
+        .join(".tmp-tsink-post-flush-stage-copy-seg-0000000000000004-0000000000000005");
+    std::fs::create_dir_all(&copy_stage).unwrap();
+    std::fs::write(copy_stage.join("payload"), b"recursive-entry").unwrap();
+
+    let builder = startup_builder(&data_path);
+    let budget =
+        crate::LocalDiskBudget::open(&data_path, crate::LocalDiskLimits::default()).unwrap();
+    let before = budget.snapshot();
+
+    // The marker directory contributes one raw entry and the data root contributes its marker
+    // and numeric-lane entries. The first L0 entry must therefore exceed this single shared cap;
+    // resetting the counter per parent would incorrectly accept the fixture.
+    let error = super::planning::preflight_post_flush_recovery_blockers_with_limits_for_test(
+        &builder,
+        &budget,
+        usize::MAX,
+        3,
+    )
+    .expect_err("the fourth raw entry across parents must exceed the global cap");
+    assert!(error.to_string().contains("3-entry global work bound"));
+    assert_eq!(std::fs::read(&atomic_temp).unwrap(), b"marker-parent-entry");
+    assert_eq!(
+        std::fs::read(copy_stage.join("payload")).unwrap(),
+        b"recursive-entry"
+    );
+    assert_eq!(
+        budget.snapshot().reconciliations_total,
+        before.reconciliations_total
+    );
+}
+
+#[test]
+fn post_flush_external_lane_resolution_has_an_exact_preadmission_threshold() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    let object_store = temp_dir.path().join("object-store");
+    std::fs::create_dir_all(&data_path).unwrap();
+    std::fs::create_dir_all(&object_store).unwrap();
+    let builder = startup_builder(&data_path).with_object_store_path(&object_store);
+    let budget =
+        crate::LocalDiskBudget::open(&data_path, crate::LocalDiskLimits::default()).unwrap();
+    let before = budget.snapshot();
+
+    let mut exact_limit = 0usize;
+    loop {
+        match super::planning::preflight_post_flush_recovery_blockers_with_limits_for_test(
+            &builder,
+            &budget,
+            exact_limit,
+            crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES,
+        ) {
+            Ok(()) => break,
+            Err(TsinkError::MemoryBudgetExceeded { budget, required }) => {
+                assert_eq!(budget, exact_limit);
+                assert!(required > exact_limit);
+                exact_limit = required;
+            }
+            Err(err) => panic!("unexpected external-lane preflight error: {err}"),
+        }
+    }
+    assert!(
+        exact_limit > 2 * 1024 * 1024,
+        "the threshold must include the fixed-cardinality canonicalization peak"
+    );
+
+    let below = super::planning::preflight_post_flush_recovery_blockers_with_limits_for_test(
+        &builder,
+        &budget,
+        exact_limit - 1,
+        crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES,
+    )
+    .expect_err("one byte below the external path-resolution threshold must reject");
+    assert!(matches!(
+        below,
+        TsinkError::MemoryBudgetExceeded { budget, required }
+            if budget == exact_limit - 1 && required == exact_limit
+    ));
+    assert_eq!(
+        budget.snapshot().reconciliations_total,
+        before.reconciliations_total
+    );
+}
+
+#[test]
+fn post_flush_recovery_blocker_plan_has_an_exact_memory_threshold() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    let marker_dir = data_path.join(super::super::maintenance::POST_FLUSH_REPLACEMENT_DIR_NAME);
+    let marker_name = "transaction-0000000000000001-0000000000000002.json";
+    let atomic_temp = marker_dir.join(format!(".{marker_name}.tmp-123-0000000000000003"));
+    std::fs::create_dir_all(&marker_dir).unwrap();
+    std::fs::write(&atomic_temp, b"atomic-crash-debris").unwrap();
+    let copy_stage = data_path
+        .join(NUMERIC_LANE_ROOT)
+        .join("segments/L0")
+        .join(".tmp-tsink-post-flush-stage-copy-seg-0000000000000004-0000000000000005");
+    std::fs::create_dir_all(&copy_stage).unwrap();
+    std::fs::write(copy_stage.join("payload"), b"copy-crash-debris").unwrap();
+
+    let builder = startup_builder(&data_path);
+    let budget =
+        crate::LocalDiskBudget::open(&data_path, crate::LocalDiskLimits::default()).unwrap();
+    let before = budget.snapshot();
+    let mut exact_limit = 0usize;
+    loop {
+        match super::planning::preflight_post_flush_recovery_blockers_with_limits_for_test(
+            &builder,
+            &budget,
+            exact_limit,
+            crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES,
+        ) {
+            Ok(()) => break,
+            Err(TsinkError::MemoryBudgetExceeded { budget, required }) => {
+                assert_eq!(budget, exact_limit);
+                assert!(required > exact_limit);
+                exact_limit = required;
+            }
+            Err(err) => panic!("unexpected bounded blocker preflight error: {err}"),
+        }
+    }
+    assert!(exact_limit > 0);
+    let below = super::planning::preflight_post_flush_recovery_blockers_with_limits_for_test(
+        &builder,
+        &budget,
+        exact_limit - 1,
+        crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES,
+    )
+    .expect_err("one byte below the observed plan threshold must reject");
+    assert!(matches!(
+        below,
+        TsinkError::MemoryBudgetExceeded {
+            budget,
+            required
+        } if budget == exact_limit - 1 && required == exact_limit
+    ));
+    assert!(atomic_temp.is_file());
+    assert!(copy_stage.is_dir());
+    assert_eq!(
+        budget.snapshot().reconciliations_total,
+        before.reconciliations_total
+    );
+
+    // The aggregate also has a separately bounded terminal tree scan. Calibrate that exact
+    // threshold without mutating the fixture, prove its N-1 rejection, then verify the cleanup
+    // itself performs exactly one additional successful reconciliation at N.
+    let mut cleanup_limit = exact_limit;
+    loop {
+        match budget.reconcile_with_memory_limit(cleanup_limit) {
+            Ok(_) => break,
+            Err(TsinkError::MemoryBudgetExceeded { budget, required }) => {
+                assert_eq!(budget, cleanup_limit);
+                assert!(required > cleanup_limit);
+                cleanup_limit = required;
+            }
+            Err(err) => panic!("unexpected bounded reconciliation error: {err}"),
+        }
+    }
+    let below_scan = budget
+        .reconcile_with_memory_limit(cleanup_limit - 1)
+        .expect_err("one byte below the exact terminal-scan threshold must reject");
+    assert!(matches!(
+        below_scan,
+        TsinkError::MemoryBudgetExceeded {
+            budget,
+            required
+        } if budget == cleanup_limit - 1 && required == cleanup_limit
+    ));
+    let before_cleanup = budget.snapshot();
+
+    super::planning::cleanup_post_flush_recovery_blockers_with_limits_for_test(
+        &builder,
+        &budget,
+        cleanup_limit,
+        crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES,
+    )
+    .expect("the exact plan-and-scan threshold should admit aggregate cleanup");
+    assert!(!atomic_temp.exists());
+    assert!(!copy_stage.exists());
+    assert_eq!(
+        budget.snapshot().reconciliations_total,
+        before_cleanup.reconciliations_total + 1
+    );
+}
+
+#[test]
+fn post_flush_recovery_blocker_preserves_a_sole_terminal_scan_limit_error() {
+    let error = super::planning::combine_post_flush_recovery_blocker_reconciliation_for_test(Err(
+        TsinkError::MemoryBudgetExceeded {
+            budget: 4095,
+            required: 4096,
+        },
+    ))
+    .expect_err("a sole terminal reconciliation failure must remain structured");
+
+    assert!(matches!(
+        error,
+        TsinkError::MemoryBudgetExceeded {
+            budget: 4095,
+            required: 4096
+        }
+    ));
+}
+
+#[test]
+fn shared_budget_proves_the_finite_startup_scan_before_post_flush_blocker_cleanup() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    let marker_dir = data_path.join(super::super::maintenance::POST_FLUSH_REPLACEMENT_DIR_NAME);
+    let marker_name = "transaction-0000000000000001-0000000000000002.json";
+    let atomic_temp = marker_dir.join(format!(".{marker_name}.tmp-123-0000000000000003"));
+    std::fs::create_dir_all(&marker_dir).unwrap();
+    std::fs::write(&atomic_temp, b"must-survive-the-rejected-scan").unwrap();
+
+    // Streaming reconciliation retains one frame and one owned path per active depth. This
+    // unknown tree makes that proof materially larger than the shallow blocker plan, so the
+    // exact scan threshold can exercise the shared-coordinator gate in isolation.
+    let unknown_root = data_path.join("operator-deep-tree");
+    let mut deepest = unknown_root.clone();
+    for depth in 0..96u32 {
+        deepest.push(format!("d{depth:03}"));
+    }
+    std::fs::create_dir_all(&deepest).unwrap();
+    let outside_owned_namespace = deepest.join("sentinel");
+    std::fs::write(&outside_owned_namespace, b"operator-data").unwrap();
+
+    data_directory_manifest::install_current_manifest_for_test(&startup_builder(&data_path))
+        .unwrap();
+    let budget =
+        crate::LocalDiskBudget::open(&data_path, crate::LocalDiskLimits::default()).unwrap();
+    let mut exact_scan_limit = 0usize;
+    loop {
+        match budget.reconcile_with_memory_limit(exact_scan_limit) {
+            Ok(_) => break,
+            Err(TsinkError::MemoryBudgetExceeded { budget, required }) => {
+                assert_eq!(budget, exact_scan_limit);
+                assert!(required > exact_scan_limit);
+                exact_scan_limit = required;
+            }
+            Err(err) => panic!("unexpected shared-budget scan calibration error: {err}"),
+        }
+    }
+    assert!(exact_scan_limit > 0);
+    let before_rejected_startup = budget.snapshot();
+
+    let rejected_builder = startup_builder(&data_path)
+        .with_memory_limit(exact_scan_limit - 1)
+        .with_shared_local_disk_budget(Arc::clone(&budget));
+    let error = planning_error(&rejected_builder);
+    assert!(
+        matches!(error, TsinkError::MemoryBudgetExceeded { budget, required }
+        if budget == exact_scan_limit - 1 && required == exact_scan_limit)
+    );
+    assert_eq!(
+        std::fs::read(&atomic_temp).unwrap(),
+        b"must-survive-the-rejected-scan"
+    );
+    assert_eq!(
+        std::fs::read(&outside_owned_namespace).unwrap(),
+        b"operator-data"
+    );
+    assert_eq!(
+        budget.snapshot().reconciliations_total,
+        before_rejected_startup.reconciliations_total
+    );
+
+    let exact_builder = startup_builder(&data_path)
+        .with_memory_limit(exact_scan_limit)
+        .with_shared_local_disk_budget(Arc::clone(&budget));
+    let plan = StartupPlanningPhase::prepare(&exact_builder)
+        .expect("the exact shared scan threshold must admit cleanup");
+    drop(plan);
+    assert!(!atomic_temp.exists());
+    assert_eq!(
+        std::fs::read(&outside_owned_namespace).unwrap(),
+        b"operator-data"
+    );
+    assert_eq!(
+        budget.snapshot().reconciliations_total,
+        before_rejected_startup.reconciliations_total + 2
+    );
+}
+
+#[test]
 fn compute_only_planning_does_not_recover_or_clean_an_unleased_writer_path() {
     let temp_dir = TempDir::new().unwrap();
     let data_path = temp_dir.path().join("writer-data");
@@ -1832,6 +2759,701 @@ fn full_startup_memory_rejection_preserves_all_blockers_until_exact_threshold() 
             b"keep"
         );
     }
+}
+
+#[test]
+fn aggregate_orphan_cleanup_uses_one_lock_reservation_generation_and_reconciliation() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    let fixed_orphan = data_path.join(".series_index.bin.tmp-123-0000000000000001");
+    let stage = data_path
+        .join(NUMERIC_LANE_ROOT)
+        .join("segments/L0/.tmp-seg-0000000000000002");
+    std::fs::create_dir_all(&stage).unwrap();
+    std::fs::write(&fixed_orphan, b"fixed").unwrap();
+    std::fs::write(stage.join("payload"), b"stage").unwrap();
+    let builder = startup_builder(&data_path);
+    let paths = config::StoragePathLayout::from(&builder);
+    let lanes = local_orphan_cleanup_lanes(&data_path);
+    let budget =
+        crate::LocalDiskBudget::open(&data_path, crate::LocalDiskLimits::default()).unwrap();
+    let before = budget.snapshot();
+    let before_generation = budget.reservation_generation_for_test();
+    let before_lock_attempts = budget.managed_file_mutation_lock_attempts_for_test();
+
+    super::planning::cleanup_owned_local_storage_orphans_with_limits_and_before_execute_for_test(
+        &paths,
+        &lanes,
+        &budget,
+        usize::MAX,
+        crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES,
+        || {},
+    )
+    .unwrap();
+
+    assert!(!fixed_orphan.exists());
+    assert!(!stage.exists());
+    assert_eq!(
+        budget.managed_file_mutation_lock_attempts_for_test(),
+        before_lock_attempts + 1
+    );
+    assert_eq!(
+        budget.reservation_generation_for_test(),
+        before_generation + 1
+    );
+    assert_eq!(
+        budget.snapshot().reconciliations_total,
+        before.reconciliations_total + 1
+    );
+}
+
+#[test]
+fn aggregate_orphan_cleanup_empty_plan_skips_reservation_and_reconciliation() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    std::fs::create_dir_all(&data_path).unwrap();
+    let builder = startup_builder(&data_path);
+    let paths = config::StoragePathLayout::from(&builder);
+    let lanes = local_orphan_cleanup_lanes(&data_path);
+    let budget =
+        crate::LocalDiskBudget::open(&data_path, crate::LocalDiskLimits::default()).unwrap();
+    let before = budget.snapshot();
+    let before_generation = budget.reservation_generation_for_test();
+
+    let mut exact = 0usize;
+    loop {
+        match super::planning::preflight_owned_local_storage_orphans_with_limits_for_test(
+            &paths,
+            &lanes,
+            &budget,
+            exact,
+            crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES,
+        ) {
+            Ok(()) => break,
+            Err(TsinkError::MemoryBudgetExceeded { budget, required }) => {
+                assert_eq!(budget, exact);
+                assert!(required > exact);
+                exact = required;
+            }
+            Err(err) => panic!("unexpected empty-plan memory calibration error: {err}"),
+        }
+    }
+    assert!(
+        exact < 4 * 1024 * 1024,
+        "an empty plan must not reserve aggregate terminal-error memory"
+    );
+
+    super::planning::cleanup_owned_local_storage_orphans_with_limits_and_before_execute_for_test(
+        &paths,
+        &lanes,
+        &budget,
+        exact,
+        crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES,
+        || panic!("an empty aggregate must not enter execution"),
+    )
+    .unwrap();
+    assert_eq!(budget.reservation_generation_for_test(), before_generation);
+    assert_eq!(
+        budget.snapshot().reconciliations_total,
+        before.reconciliations_total
+    );
+}
+
+#[test]
+fn aggregate_orphan_cleanup_has_one_mixed_category_global_namespace_threshold() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    let fixed_orphan = data_path.join(".series_index.bin.tmp-123-0000000000000001");
+    let stage = data_path
+        .join(NUMERIC_LANE_ROOT)
+        .join("segments/L0/.tmp-seg-0000000000000002");
+    let stage_payload = stage.join("payload");
+    let lanes = local_orphan_cleanup_lanes(&data_path);
+    let shards = tombstone_shards_directory(&lanes[0].manifest_path);
+    let final_orphan = shards.join("shard-007-ffffffffffffffff.bin");
+    std::fs::create_dir_all(&stage).unwrap();
+    std::fs::create_dir_all(&shards).unwrap();
+    std::fs::write(&fixed_orphan, b"fixed").unwrap();
+    std::fs::write(&stage_payload, b"stage").unwrap();
+    std::fs::write(&final_orphan, b"final").unwrap();
+    let builder = startup_builder(&data_path);
+    let paths = config::StoragePathLayout::from(&builder);
+    let budget =
+        crate::LocalDiskBudget::open(&data_path, crate::LocalDiskLimits::default()).unwrap();
+
+    let mut exact = 0usize;
+    loop {
+        match super::planning::cleanup_owned_local_storage_orphans_with_limits_and_before_execute_for_test(
+            &paths,
+            &lanes,
+            &budget,
+            usize::MAX,
+            exact,
+            || {},
+        ) {
+            Ok(()) => break,
+            Err(TsinkError::DataCorruption(message)) => {
+                assert!(message.contains("global work bound"), "{message}");
+                assert!(fixed_orphan.is_file());
+                assert_eq!(std::fs::read(&stage_payload).unwrap(), b"stage");
+                assert!(final_orphan.is_file());
+                exact += 1;
+            }
+            Err(err) => panic!("unexpected namespace-threshold error: {err}"),
+        }
+    }
+    assert!(exact > 1);
+    assert!(!fixed_orphan.exists());
+    assert!(!stage.exists());
+    assert!(!final_orphan.exists());
+}
+
+#[test]
+fn aggregate_orphan_cleanup_has_an_exact_memory_threshold_before_mutation() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    let fixed_orphan = data_path.join(".series_index.bin.tmp-123-0000000000000001");
+    let stage = data_path
+        .join(NUMERIC_LANE_ROOT)
+        .join("segments/L0/.tmp-seg-0000000000000002");
+    let stage_payload = stage.join("payload");
+    let lanes = local_orphan_cleanup_lanes(&data_path);
+    let shards = tombstone_shards_directory(&lanes[0].manifest_path);
+    let final_orphan = shards.join("shard-007-ffffffffffffffff.bin");
+    std::fs::create_dir_all(&stage).unwrap();
+    std::fs::create_dir_all(&shards).unwrap();
+    std::fs::write(&fixed_orphan, b"fixed").unwrap();
+    std::fs::write(&stage_payload, b"stage").unwrap();
+    std::fs::write(&final_orphan, b"final").unwrap();
+    let builder = startup_builder(&data_path);
+    let paths = config::StoragePathLayout::from(&builder);
+    let budget =
+        crate::LocalDiskBudget::open(&data_path, crate::LocalDiskLimits::default()).unwrap();
+
+    let mut exact = 0usize;
+    loop {
+        match super::planning::preflight_owned_local_storage_orphans_with_limits_for_test(
+            &paths,
+            &lanes,
+            &budget,
+            exact,
+            crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES,
+        ) {
+            Ok(()) => break,
+            Err(TsinkError::MemoryBudgetExceeded { budget, required }) => {
+                assert_eq!(budget, exact);
+                assert!(required > exact);
+                assert!(fixed_orphan.is_file());
+                assert_eq!(std::fs::read(&stage_payload).unwrap(), b"stage");
+                assert!(final_orphan.is_file());
+                exact = required;
+            }
+            Err(err) => panic!("unexpected memory-threshold error: {err}"),
+        }
+    }
+    assert!(exact > 0);
+    let below = super::planning::preflight_owned_local_storage_orphans_with_limits_for_test(
+        &paths,
+        &lanes,
+        &budget,
+        exact - 1,
+        crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES,
+    )
+    .expect_err("one byte below the aggregate retained peak must reject");
+    assert!(matches!(
+        below,
+        TsinkError::MemoryBudgetExceeded { budget, required }
+            if budget == exact - 1 && required == exact
+    ));
+    assert!(fixed_orphan.is_file());
+    assert!(stage_payload.is_file());
+    assert!(final_orphan.is_file());
+
+    super::planning::cleanup_owned_local_storage_orphans_with_limits_and_before_execute_for_test(
+        &paths,
+        &lanes,
+        &budget,
+        exact,
+        crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES,
+        || {},
+    )
+    .expect("the exact aggregate peak must cover execution and terminal reconciliation");
+    assert!(!fixed_orphan.exists());
+    assert!(!stage.exists());
+    assert!(!final_orphan.exists());
+}
+
+#[test]
+fn aggregate_orphan_cleanup_reserves_terminal_errors_from_a_dynamic_reconciliation() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    let lanes = local_orphan_cleanup_lanes(&data_path);
+    let shards = tombstone_shards_directory(&lanes[0].manifest_path);
+    let shard_temp = shards.join(".shard-007-0000000000000001.bin.tmp-123-0000000000000002");
+    let final_orphan = shards.join("shard-007-ffffffffffffffff.bin");
+    std::fs::create_dir_all(&shards).unwrap();
+    std::fs::write(&shard_temp, b"temporary").unwrap();
+    std::fs::write(&final_orphan, b"final").unwrap();
+    let builder = startup_builder(&data_path);
+    let paths = config::StoragePathLayout::from(&builder);
+    let budget =
+        crate::LocalDiskBudget::open(&data_path, crate::LocalDiskLimits::default()).unwrap();
+
+    let mut exact = 0usize;
+    loop {
+        match super::planning::preflight_owned_local_storage_orphans_with_limits_for_test(
+            &paths,
+            &lanes,
+            &budget,
+            exact,
+            crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES,
+        ) {
+            Ok(()) => break,
+            Err(TsinkError::MemoryBudgetExceeded { budget, required }) => {
+                assert_eq!(budget, exact);
+                assert!(required > exact);
+                exact = required;
+            }
+            Err(err) => panic!("unexpected terminal-peak calibration error: {err}"),
+        }
+    }
+    let before = budget.snapshot();
+    let before_generation = budget.reservation_generation_for_test();
+    let below = super::planning::cleanup_owned_local_storage_orphans_with_limits_and_before_execute_for_test(
+        &paths,
+        &lanes,
+        &budget,
+        exact - 1,
+        crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES,
+        || panic!("sub-threshold cleanup must reject before execution"),
+    )
+    .expect_err("one byte below the terminal peak must reject before mutation");
+    assert!(matches!(
+        below,
+        TsinkError::MemoryBudgetExceeded { budget, required }
+            if budget == exact - 1 && required == exact
+    ));
+    assert!(shard_temp.is_file());
+    assert!(final_orphan.is_file());
+    assert_eq!(budget.reservation_generation_for_test(), before_generation);
+    assert_eq!(
+        budget.snapshot().reconciliations_total,
+        before.reconciliations_total
+    );
+
+    let _sync_failure = crate::engine::fs_utils::fail_directory_sync_once(
+        shards.clone(),
+        "injected exact-terminal-peak sync failure",
+    );
+    let dynamic_directory = (0..3)
+        .fold(data_path.join("late-reconciliation-tree"), |path, index| {
+            path.join(format!("{index:02}-{}", "x".repeat(180)))
+        });
+    let dynamic_sentinel = dynamic_directory.join("sentinel.bin");
+    let error = super::planning::cleanup_owned_local_storage_orphans_with_limits_and_before_execute_for_test(
+        &paths,
+        &lanes,
+        &budget,
+        exact,
+        crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES,
+        || {
+            std::fs::create_dir_all(&dynamic_directory).unwrap();
+            std::fs::write(&dynamic_sentinel, b"late").unwrap();
+        },
+    )
+    .expect_err("cleanup and the larger late reconciliation must both fail within the exact peak");
+    let error = error.to_string();
+    assert!(error.contains("aggregate startup orphan cleanup failed"));
+    assert!(error.contains("cleanup failed"));
+    assert!(error.contains("injected exact-terminal-peak sync failure"));
+    assert!(error.contains("disk reconciliation failed"));
+    assert!(error.contains("Memory budget exceeded"));
+    assert!(!shard_temp.exists());
+    assert!(final_orphan.is_file());
+    assert_eq!(std::fs::read(&dynamic_sentinel).unwrap(), b"late");
+    assert_eq!(
+        budget.reservation_generation_for_test(),
+        before_generation + 1
+    );
+    assert_eq!(
+        budget.snapshot().reconciliations_total,
+        before.reconciliations_total
+    );
+}
+
+#[test]
+fn aggregate_orphan_cleanup_executes_source_order_and_stops_after_partial_sync_failure() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    let lanes = local_orphan_cleanup_lanes(&data_path);
+    let lane = &lanes[0];
+    let fixed_orphan = data_path.join(".series_index.bin.tmp-123-0000000000000001");
+    let registry_dir = data_path.join("series_index.delta.d");
+    let registry_orphan = registry_dir.join(".delta-0000000000000002.bin.tmp-123-0000000000000003");
+    let coordinator_dir = data_path.join(crate::engine::tombstone::TOMBSTONE_TRANSACTION_DIR_NAME);
+    let coordinator_orphan = coordinator_dir.join(".active.bin.tmp-123-0000000000000004");
+    let manifest_orphan = lane
+        .manifest_path
+        .parent()
+        .unwrap()
+        .join(".tombstones.json.tmp-123-0000000000000005");
+    let shards = tombstone_shards_directory(&lane.manifest_path);
+    let shard_temp = shards.join(".shard-007-0000000000000006.bin.tmp-123-0000000000000007");
+    let final_orphan = shards.join("shard-007-ffffffffffffffff.bin");
+    let replacement_dir = data_path
+        .join(NUMERIC_LANE_ROOT)
+        .join(".compaction-replacements");
+    let replacement_orphan = replacement_dir
+        .join(".replace-0000000000000008-0000000000000009.json.tmp-123-000000000000000a");
+    let stage = data_path
+        .join(NUMERIC_LANE_ROOT)
+        .join("segments/L0/.tmp-seg-000000000000000b");
+    for directory in [
+        &registry_dir,
+        &coordinator_dir,
+        lane.manifest_path.parent().unwrap(),
+        &shards,
+        &replacement_dir,
+        &stage,
+    ] {
+        std::fs::create_dir_all(directory).unwrap();
+    }
+    for file in [
+        &fixed_orphan,
+        &registry_orphan,
+        &coordinator_orphan,
+        &manifest_orphan,
+        &shard_temp,
+        &final_orphan,
+        &replacement_orphan,
+    ] {
+        std::fs::write(file, b"orphan").unwrap();
+    }
+    std::fs::write(stage.join("payload"), b"stage").unwrap();
+    let builder = startup_builder(&data_path);
+    let paths = config::StoragePathLayout::from(&builder);
+    let budget =
+        crate::LocalDiskBudget::open(&data_path, crate::LocalDiskLimits::default()).unwrap();
+    let before = budget.snapshot();
+    let _sync_failure = crate::engine::fs_utils::fail_directory_sync_once(
+        shards.clone(),
+        "injected aggregate shard-temp sync failure",
+    );
+
+    let error = super::planning::cleanup_owned_local_storage_orphans_with_limits_and_before_execute_for_test(
+        &paths,
+        &lanes,
+        &budget,
+        usize::MAX,
+        crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES,
+        || {},
+    )
+    .expect_err("execution must stop at the shard-temp directory sync failure");
+    assert!(error
+        .to_string()
+        .contains("injected aggregate shard-temp sync failure"));
+    for earlier in [
+        &fixed_orphan,
+        &registry_orphan,
+        &coordinator_orphan,
+        &manifest_orphan,
+        &shard_temp,
+    ] {
+        assert!(
+            !earlier.exists(),
+            "earlier operation survived: {}",
+            earlier.display()
+        );
+    }
+    assert!(final_orphan.is_file());
+    assert!(replacement_orphan.is_file());
+    assert!(stage.is_dir());
+    assert_eq!(
+        budget.snapshot().reconciliations_total,
+        before.reconciliations_total + 1
+    );
+}
+
+#[test]
+fn aggregate_orphan_cleanup_rejects_parent_identity_swap_before_removal() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    let level = data_path.join(NUMERIC_LANE_ROOT).join("segments/L0");
+    let displaced = level.with_file_name("L0-displaced");
+    let stage = level.join(".tmp-seg-0000000000000001");
+    let payload = stage.join("payload");
+    let replacement_sentinel = level.join("replacement-sentinel");
+    std::fs::create_dir_all(&stage).unwrap();
+    std::fs::write(&payload, b"planned").unwrap();
+    let builder = startup_builder(&data_path);
+    let paths = config::StoragePathLayout::from(&builder);
+    let lanes = local_orphan_cleanup_lanes(&data_path);
+    let budget =
+        crate::LocalDiskBudget::open(&data_path, crate::LocalDiskLimits::default()).unwrap();
+
+    let error = super::planning::cleanup_owned_local_storage_orphans_with_limits_and_before_execute_for_test(
+        &paths,
+        &lanes,
+        &budget,
+        usize::MAX,
+        crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES,
+        || {
+            std::fs::rename(&level, &displaced).unwrap();
+            std::fs::create_dir_all(&level).unwrap();
+            std::fs::write(&replacement_sentinel, b"replacement").unwrap();
+        },
+    )
+    .expect_err("the retained parent identity must reject a same-path replacement");
+    assert!(error
+        .to_string()
+        .contains("scanned directory identity changed"));
+    assert_eq!(
+        std::fs::read(displaced.join(".tmp-seg-0000000000000001/payload")).unwrap(),
+        b"planned"
+    );
+    assert_eq!(
+        std::fs::read(&replacement_sentinel).unwrap(),
+        b"replacement"
+    );
+}
+
+#[test]
+fn aggregate_orphan_cleanup_does_not_expand_to_a_late_descendant() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    let stage = data_path
+        .join(NUMERIC_LANE_ROOT)
+        .join("segments/L0/.tmp-seg-0000000000000001");
+    let planned = stage.join("planned");
+    let late = stage.join("late");
+    std::fs::create_dir_all(&stage).unwrap();
+    std::fs::write(&planned, b"planned").unwrap();
+    let builder = startup_builder(&data_path);
+    let paths = config::StoragePathLayout::from(&builder);
+    let lanes = local_orphan_cleanup_lanes(&data_path);
+    let budget =
+        crate::LocalDiskBudget::open(&data_path, crate::LocalDiskLimits::default()).unwrap();
+
+    super::planning::cleanup_owned_local_storage_orphans_with_limits_and_before_execute_for_test(
+        &paths,
+        &lanes,
+        &budget,
+        usize::MAX,
+        crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES,
+        || std::fs::write(&late, b"late").unwrap(),
+    )
+    .expect_err("a late descendant must make the exact root removal fail closed");
+    assert!(stage.is_dir());
+    assert!(!planned.exists());
+    assert_eq!(std::fs::read(&late).unwrap(), b"late");
+}
+
+#[test]
+fn aggregate_orphan_cleanup_rechecks_tombstone_manifest_fingerprint() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    let lanes = local_orphan_cleanup_lanes(&data_path);
+    let manifest = lanes[0].manifest_path.clone();
+    let shards = tombstone_shards_directory(&manifest);
+    let final_orphan = shards.join("shard-007-ffffffffffffffff.bin");
+    std::fs::create_dir_all(&shards).unwrap();
+    std::fs::write(&final_orphan, b"orphan").unwrap();
+    let builder = startup_builder(&data_path);
+    let paths = config::StoragePathLayout::from(&builder);
+    let budget =
+        crate::LocalDiskBudget::open(&data_path, crate::LocalDiskLimits::default()).unwrap();
+
+    let error = super::planning::cleanup_owned_local_storage_orphans_with_limits_and_before_execute_for_test(
+        &paths,
+        &lanes,
+        &budget,
+        usize::MAX,
+        crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES,
+        || std::fs::write(&manifest, b"late-manifest").unwrap(),
+    )
+    .expect_err("a manifest appearing after discovery must invalidate the orphan plan");
+    assert!(error.to_string().contains("manifest appeared"));
+    assert!(final_orphan.is_file());
+}
+
+#[test]
+fn aggregate_orphan_cleanup_rejects_a_final_shard_directory_before_any_mutation() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    let fixed_orphan = data_path.join(".series_index.bin.tmp-123-0000000000000001");
+    let lanes = local_orphan_cleanup_lanes(&data_path);
+    let shards = tombstone_shards_directory(&lanes[0].manifest_path);
+    let ambiguous = shards.join("shard-007-ffffffffffffffff.bin");
+    let lookalike = shards.join("shard-007-operator-note.bin");
+    std::fs::create_dir_all(&ambiguous).unwrap();
+    std::fs::write(&fixed_orphan, b"fixed").unwrap();
+    std::fs::write(&lookalike, b"keep").unwrap();
+    let builder = startup_builder(&data_path);
+    let paths = config::StoragePathLayout::from(&builder);
+    let budget =
+        crate::LocalDiskBudget::open(&data_path, crate::LocalDiskLimits::default()).unwrap();
+    let before = budget.snapshot();
+
+    super::planning::cleanup_owned_local_storage_orphans_with_limits_and_before_execute_for_test(
+        &paths,
+        &lanes,
+        &budget,
+        usize::MAX,
+        crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES,
+        || {},
+    )
+    .expect_err("an owned final-shaped directory must reject the complete aggregate preflight");
+    assert!(fixed_orphan.is_file());
+    assert!(ambiguous.is_dir());
+    assert_eq!(std::fs::read(&lookalike).unwrap(), b"keep");
+    assert_eq!(
+        budget.snapshot().reconciliations_total,
+        before.reconciliations_total
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn aggregate_orphan_cleanup_rejects_a_final_shard_symlink_without_following() {
+    use std::os::unix::fs::symlink;
+
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    let outside = temp_dir.path().join("outside");
+    let outside_sentinel = outside.join("sentinel");
+    let fixed_orphan = data_path.join(".series_index.bin.tmp-123-0000000000000001");
+    let lanes = local_orphan_cleanup_lanes(&data_path);
+    let shards = tombstone_shards_directory(&lanes[0].manifest_path);
+    let ambiguous = shards.join("shard-007-ffffffffffffffff.bin");
+    std::fs::create_dir_all(&shards).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(&fixed_orphan, b"fixed").unwrap();
+    std::fs::write(&outside_sentinel, b"outside").unwrap();
+    symlink(&outside_sentinel, &ambiguous).unwrap();
+    let builder = startup_builder(&data_path);
+    let paths = config::StoragePathLayout::from(&builder);
+    let budget =
+        crate::LocalDiskBudget::open(&data_path, crate::LocalDiskLimits::default()).unwrap();
+
+    super::planning::cleanup_owned_local_storage_orphans_with_limits_and_before_execute_for_test(
+        &paths,
+        &lanes,
+        &budget,
+        usize::MAX,
+        crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES,
+        || {},
+    )
+    .expect_err("an owned final-shaped symlink must reject the complete preflight");
+    assert!(fixed_orphan.is_file());
+    assert!(std::fs::symlink_metadata(&ambiguous)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(std::fs::read(&outside_sentinel).unwrap(), b"outside");
+}
+
+#[test]
+fn aggregate_orphan_cleanup_external_only_skips_local_reservation_and_reconciliation() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    let external = temp_dir.path().join("external");
+    std::fs::create_dir_all(&data_path).unwrap();
+    let lane = external_orphan_cleanup_lane(&external);
+    let shards = tombstone_shards_directory(&lane.manifest_path);
+    let orphan = shards.join("shard-007-ffffffffffffffff.bin");
+    std::fs::create_dir_all(&shards).unwrap();
+    std::fs::write(&orphan, b"external").unwrap();
+    let builder = startup_builder(&data_path);
+    let paths = config::StoragePathLayout::from(&builder);
+    let budget =
+        crate::LocalDiskBudget::open(&data_path, crate::LocalDiskLimits::default()).unwrap();
+
+    let mut exact = 0usize;
+    loop {
+        match super::planning::preflight_owned_local_storage_orphans_with_limits_for_test(
+            &paths,
+            std::slice::from_ref(&lane),
+            &budget,
+            exact,
+            crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES,
+        ) {
+            Ok(()) => break,
+            Err(TsinkError::MemoryBudgetExceeded { budget, required }) => {
+                assert_eq!(budget, exact);
+                assert!(required > exact);
+                exact = required;
+            }
+            Err(err) => panic!("unexpected external-only memory calibration error: {err}"),
+        }
+    }
+    assert!(
+        exact < 4 * 1024 * 1024,
+        "external-only cleanup must not reserve governed reconciliation errors"
+    );
+    let before = budget.snapshot();
+    let before_generation = budget.reservation_generation_for_test();
+    let before_lock_attempts = budget.managed_file_mutation_lock_attempts_for_test();
+
+    super::planning::cleanup_owned_local_storage_orphans_with_limits_and_before_execute_for_test(
+        &paths,
+        &[lane],
+        &budget,
+        exact,
+        crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES,
+        || {},
+    )
+    .unwrap();
+    assert!(!orphan.exists());
+    assert_eq!(budget.reservation_generation_for_test(), before_generation);
+    assert_eq!(
+        budget.snapshot().reconciliations_total,
+        before.reconciliations_total
+    );
+    assert_eq!(
+        budget.managed_file_mutation_lock_attempts_for_test(),
+        before_lock_attempts + 1
+    );
+}
+
+#[test]
+fn aggregate_orphan_cleanup_mixed_governed_and_external_uses_one_local_transaction() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    let external = temp_dir.path().join("external");
+    std::fs::create_dir_all(&data_path).unwrap();
+    let local_orphan = data_path.join(".series_index.bin.tmp-123-0000000000000001");
+    std::fs::write(&local_orphan, b"local").unwrap();
+    let lane = external_orphan_cleanup_lane(&external);
+    let shards = tombstone_shards_directory(&lane.manifest_path);
+    let external_orphan = shards.join("shard-007-ffffffffffffffff.bin");
+    std::fs::create_dir_all(&shards).unwrap();
+    std::fs::write(&external_orphan, b"external").unwrap();
+    let builder = startup_builder(&data_path);
+    let paths = config::StoragePathLayout::from(&builder);
+    let budget =
+        crate::LocalDiskBudget::open(&data_path, crate::LocalDiskLimits::default()).unwrap();
+    let before = budget.snapshot();
+    let before_generation = budget.reservation_generation_for_test();
+
+    super::planning::cleanup_owned_local_storage_orphans_with_limits_and_before_execute_for_test(
+        &paths,
+        &[lane],
+        &budget,
+        usize::MAX,
+        crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES,
+        || {},
+    )
+    .unwrap();
+    assert!(!local_orphan.exists());
+    assert!(!external_orphan.exists());
+    assert_eq!(
+        budget.reservation_generation_for_test(),
+        before_generation + 1
+    );
+    assert_eq!(
+        budget.snapshot().reconciliations_total,
+        before.reconciliations_total + 1
+    );
 }
 
 #[test]

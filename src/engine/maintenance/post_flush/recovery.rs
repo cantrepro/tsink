@@ -116,11 +116,12 @@ struct BackgroundPostFlushCleanFenceScan {
     _memory_reservation: RemoteCatalogMemoryReservation,
 }
 
-/// Process-local continuation for the background compactor's post-flush clean fence.
+/// Process-local continuation for finite background post-flush clean fences.
 ///
 /// Unlike replacement recovery, this cursor never interprets or mutates a marker. It proves that
-/// one generation-stable namespace cycle is empty before ordinary compaction may inspect segment
-/// roots. Foreground, flush, and catalog callers retain the strict exhaustive fence.
+/// one generation-stable namespace cycle is empty before ordinary background work may inspect or
+/// mutate segment roots. Foreground and lifecycle-drain callers retain the strict exhaustive
+/// fence.
 #[derive(Default)]
 pub(in crate::engine::storage_engine) struct BackgroundPostFlushCleanFenceCursor {
     scan: Option<BackgroundPostFlushCleanFenceScan>,

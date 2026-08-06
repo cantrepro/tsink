@@ -833,6 +833,50 @@ pub(crate) struct AccountedRebalanceSchedulerSnapshot {
     _reservation: QueryMemoryReservation,
 }
 
+/// Later-generation scheduler fields consumed by handoff status.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct HandoffRebalanceStatusSnapshot {
+    pub interval_secs: u64,
+    pub paused: bool,
+    pub active_jobs: usize,
+    pub rows_scheduled_last_run: u64,
+    pub last_error: Option<String>,
+}
+
+impl HandoffRebalanceStatusSnapshot {
+    pub(crate) fn empty() -> Self {
+        Self {
+            interval_secs: DEFAULT_REBALANCE_INTERVAL_SECS,
+            paused: false,
+            active_jobs: 0,
+            rows_scheduled_last_run: 0,
+            last_error: None,
+        }
+    }
+}
+
+#[derive(Debug)]
+#[must_use = "dropping the handoff scheduler status releases its query-memory reservation"]
+pub(crate) struct AccountedHandoffRebalanceStatusSnapshot {
+    snapshot: HandoffRebalanceStatusSnapshot,
+    _reservation: QueryMemoryReservation,
+}
+
+impl std::ops::Deref for AccountedHandoffRebalanceStatusSnapshot {
+    type Target = HandoffRebalanceStatusSnapshot;
+
+    fn deref(&self) -> &Self::Target {
+        &self.snapshot
+    }
+}
+
+impl AccountedHandoffRebalanceStatusSnapshot {
+    #[cfg(test)]
+    fn accounted_bytes(&self) -> u64 {
+        self._reservation.bytes()
+    }
+}
+
 impl std::ops::Deref for AccountedRebalanceSchedulerSnapshot {
     type Target = RebalanceSchedulerSnapshot;
 
@@ -1225,6 +1269,41 @@ impl DigestExchangeRuntime {
             .load(AtomicOrdering::Relaxed)
     }
 
+    #[cfg(test)]
+    pub(crate) fn replace_status_diagnostics_for_test(
+        &self,
+        last_error: Option<String>,
+        mismatches: Vec<DigestMismatchReport>,
+    ) {
+        let mut metrics = self
+            .metrics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        metrics.last_error = last_error;
+        metrics.mismatches = mismatches.into();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_handoff_status_diagnostics_for_test(
+        &self,
+        paused: bool,
+        rows_scheduled_last_run: u64,
+        last_error: Option<String>,
+    ) {
+        let mut control = self
+            .rebalance_control
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        control.paused = paused;
+        drop(control);
+        let mut metrics = self
+            .rebalance_metrics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        metrics.rows_scheduled_last_run = rows_scheduled_last_run;
+        metrics.last_error = last_error;
+    }
+
     /// Captures the digest values exported by `/metrics` without cloning status-only diagnostics.
     ///
     /// The caller's execution owns every dynamic byte in the returned projection. The projection
@@ -1367,6 +1446,63 @@ impl DigestExchangeRuntime {
         RebalanceSchedulerControlSnapshot {
             paused: control.paused,
         }
+    }
+
+    /// Captures the later scheduler generation consumed by handoff status.
+    ///
+    /// Sampling order intentionally matches `rebalance_snapshot`: pause control first, then the
+    /// control-state job count, then scheduler metrics. The only owned dynamic output is measured
+    /// and reserved under the metrics lock before it is copied.
+    pub(crate) fn handoff_status_snapshot_with_execution(
+        &self,
+        execution: &QueryExecution,
+    ) -> Result<AccountedHandoffRebalanceStatusSnapshot, tsink::QueryBudgetError> {
+        execution.checkpoint()?;
+        let control = self.rebalance_control_snapshot();
+        execution.checkpoint()?;
+        let active_jobs = self
+            .control_consensus
+            .handoff_active_jobs_with_execution(execution)?;
+        let metrics = self
+            .rebalance_metrics
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        execution.checkpoint()?;
+
+        let peak_bytes = metrics
+            .last_error
+            .as_deref()
+            .map(modeled_rebalance_metrics_str_bytes)
+            .unwrap_or(0);
+        let mut reservation = execution.reserve_memory(peak_bytes)?;
+        execution.checkpoint()?;
+        let rows_scheduled_last_run = metrics.rows_scheduled_last_run;
+        let last_error = metrics
+            .last_error
+            .as_deref()
+            .map(clone_rebalance_metrics_string);
+        execution.checkpoint()?;
+        drop(metrics);
+
+        let retained_bytes = last_error
+            .as_ref()
+            .map(modeled_rebalance_metrics_string_capacity_bytes)
+            .unwrap_or(0);
+        assert!(
+            retained_bytes <= peak_bytes,
+            "handoff scheduler retained-memory model exceeded its pre-allocation reservation"
+        );
+        reservation.resize(retained_bytes)?;
+        Ok(AccountedHandoffRebalanceStatusSnapshot {
+            snapshot: HandoffRebalanceStatusSnapshot {
+                interval_secs: self.config.rebalance_interval.as_secs(),
+                paused: control.paused,
+                active_jobs,
+                rows_scheduled_last_run,
+                last_error,
+            },
+            _reservation: reservation,
+        })
     }
 
     pub fn is_rebalance_run_inflight(&self) -> bool {
@@ -4261,8 +4397,8 @@ mod tests {
     use std::sync::Mutex as StdMutex;
     use tempfile::TempDir;
     use tsink::{
-        QueryBudget, QueryBudgetError, QueryBudgetLimits, QueryLimitReason, Row, StorageBuilder,
-        TimestampPrecision,
+        QueryBudget, QueryBudgetError, QueryBudgetLimits, QueryCancellationToken, QueryLimitReason,
+        Row, StorageBuilder, TimestampPrecision,
     };
 
     const TEST_DIGEST_SHARD_COUNT: u32 = 4;
@@ -5208,6 +5344,182 @@ mod tests {
         assert_eq!(status.shared_reserved_memory_bytes, 0);
         assert_eq!(status.cancellations_total, 1);
         assert_eq!(status.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn handoff_scheduler_projection_preserves_legacy_values_and_exact_peak() {
+        let temp_dir = TempDir::new().expect("temp dir should create");
+        let runtime = build_single_node_rebalance_runtime_for_test(
+            temp_dir.path(),
+            DigestExchangeConfig {
+                rebalance_interval: Duration::from_secs(17),
+                ..DigestExchangeConfig::default()
+            },
+            |state| {
+                state
+                    .apply_join_node("node-b-dynamic", "127.0.0.1:9302")
+                    .expect("join should apply");
+                let activation_ring_version = state.ring_version.saturating_add(1);
+                state
+                    .apply_begin_shard_handoff(
+                        0,
+                        "node-a",
+                        "node-b-dynamic",
+                        activation_ring_version,
+                    )
+                    .expect("handoff should begin");
+                state
+                    .apply_shard_handoff_progress(
+                        0,
+                        ShardHandoffPhase::Warmup,
+                        Some(3),
+                        Some(7),
+                        None,
+                    )
+                    .expect("handoff progress should apply");
+            },
+        );
+        {
+            let mut control = runtime
+                .rebalance_control
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            control.paused = true;
+        }
+        {
+            let mut metrics = runtime
+                .rebalance_metrics
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            metrics.rows_scheduled_last_run = 29;
+            metrics.last_error = Some("handoff scheduler diagnostic \"quoted\"\nline".to_string());
+        }
+        let legacy = runtime.rebalance_snapshot();
+
+        let calibration_budget =
+            QueryBudget::new(QueryBudgetLimits::default()).expect("budget should build");
+        let calibration = calibration_budget
+            .begin_query()
+            .expect("calibration query should admit");
+        let projected = runtime
+            .handoff_status_snapshot_with_execution(&calibration)
+            .expect("focused handoff scheduler projection should succeed");
+        assert_eq!(projected.interval_secs, legacy.interval_secs);
+        assert_eq!(projected.paused, legacy.paused);
+        assert_eq!(projected.active_jobs, legacy.active_jobs);
+        assert_eq!(
+            projected.rows_scheduled_last_run,
+            legacy.rows_scheduled_last_run
+        );
+        assert_eq!(projected.last_error, legacy.last_error);
+        let retained_bytes = projected.accounted_bytes();
+        let exact_peak = calibration_budget
+            .snapshot()
+            .peak_shared_reserved_memory_bytes;
+        assert!(retained_bytes > 0);
+        assert_eq!(exact_peak, retained_bytes);
+        assert_eq!(calibration.snapshot().memory_reserved_bytes, retained_bytes);
+        drop(projected);
+        assert_eq!(calibration.snapshot().memory_reserved_bytes, 0);
+        drop(calibration);
+        let calibration_after = calibration_budget.snapshot();
+        assert_eq!(calibration_after.active_queries, 0);
+        assert_eq!(calibration_after.shared_reserved_memory_bytes, 0);
+        assert_eq!(calibration_after.accounting_invariant_violations_total, 0);
+
+        let exact_budget = QueryBudget::new(QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(exact_peak),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(exact_peak),
+                ..QueryWorkLimits::default()
+            },
+        })
+        .expect("exact budget should build");
+        let exact = exact_budget
+            .begin_query()
+            .expect("exact query should admit");
+        let projected = runtime
+            .handoff_status_snapshot_with_execution(&exact)
+            .expect("the exact handoff scheduler peak should pass");
+        assert_eq!(projected.accounted_bytes(), retained_bytes);
+        assert_eq!(
+            exact_budget.snapshot().peak_shared_reserved_memory_bytes,
+            exact_peak
+        );
+        drop(projected);
+        assert_eq!(exact.snapshot().memory_reserved_bytes, 0);
+        drop(exact);
+        let exact_after = exact_budget.snapshot();
+        assert_eq!(exact_after.active_queries, 0);
+        assert_eq!(exact_after.shared_reserved_memory_bytes, 0);
+        assert_eq!(exact_after.accounting_invariant_violations_total, 0);
+
+        let one_under_budget = QueryBudget::new(QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(exact_peak),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(exact_peak.saturating_sub(1)),
+                ..QueryWorkLimits::default()
+            },
+        })
+        .expect("one-under budget should build");
+        let one_under = one_under_budget
+            .begin_query()
+            .expect("one-under query should admit");
+        let error = runtime
+            .handoff_status_snapshot_with_execution(&one_under)
+            .expect_err("one byte below the scheduler projection peak must reject");
+        match error {
+            QueryBudgetError::LimitExceeded(exceeded) => {
+                assert_eq!(exceeded.reason, QueryLimitReason::PerQueryMemoryBytes);
+                assert_eq!(exceeded.current, 0);
+                assert_eq!(exceeded.requested, exact_peak);
+            }
+            other => panic!("unexpected handoff scheduler projection error: {other}"),
+        }
+        assert_eq!(one_under.snapshot().memory_reserved_bytes, 0);
+        assert_eq!(
+            one_under_budget
+                .snapshot()
+                .peak_shared_reserved_memory_bytes,
+            0,
+            "the N-1 reservation must reject before cloning the scheduler diagnostic"
+        );
+        drop(one_under);
+        let one_under_after = one_under_budget.snapshot();
+        assert_eq!(one_under_after.active_queries, 0);
+        assert_eq!(one_under_after.shared_reserved_memory_bytes, 0);
+        assert_eq!(one_under_after.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn handoff_scheduler_projection_honors_precancellation_without_residue() {
+        let temp_dir = TempDir::new().expect("temp dir should create");
+        let runtime = build_single_node_rebalance_runtime_for_test(
+            temp_dir.path(),
+            DigestExchangeConfig::default(),
+            |_| {},
+        );
+        let budget = QueryBudget::new(QueryBudgetLimits::default()).expect("budget should build");
+        let cancellation = QueryCancellationToken::new();
+        let execution = budget
+            .begin_query_with(QueryWorkLimits::default(), cancellation.clone())
+            .expect("query should admit");
+        cancellation.cancel();
+
+        let error = runtime
+            .handoff_status_snapshot_with_execution(&execution)
+            .expect_err("a pre-cancelled scheduler projection must stop");
+        assert!(matches!(error, QueryBudgetError::Cancelled));
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        assert_eq!(budget.snapshot().peak_shared_reserved_memory_bytes, 0);
+        drop(execution);
+        let after = budget.snapshot();
+        assert_eq!(after.active_queries, 0);
+        assert_eq!(after.shared_reserved_memory_bytes, 0);
+        assert_eq!(after.cancellations_total, 1);
+        assert_eq!(after.accounting_invariant_violations_total, 0);
     }
 
     #[test]

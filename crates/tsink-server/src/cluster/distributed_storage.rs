@@ -1245,6 +1245,11 @@ mod tests {
             QueryExecutionAccounting::Unaccounted,
             "distributed metric-row scans must fail closed until the adapter has a bounded complete implementation",
         );
+        assert_eq!(
+            adapter.scan_metric_rows_with_matchers_execution_accounting(),
+            QueryExecutionAccounting::Unaccounted,
+            "distributed matcher-aware row scans must remain unaccounted until a paged row RPC and per-peer cursor contract exist",
+        );
     }
 
     #[tokio::test]

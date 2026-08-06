@@ -1815,6 +1815,591 @@ fn metric_row_scan_result_guard_owns_returned_rows_until_drop() {
     );
 }
 
+const MATCHER_ROW_TENANT_LABEL: &str = "__tsink_tenant__";
+
+#[test]
+fn matcher_aware_metric_row_scan_projects_and_paginates_only_matching_series() {
+    let storage = storage_with_query_limits(QueryBudgetLimits::default());
+    storage
+        .insert_rows(&[
+            Row::with_labels(
+                "matcher_row_page",
+                vec![
+                    Label::new("host", "a"),
+                    Label::new(MATCHER_ROW_TENANT_LABEL, "tenant-a"),
+                ],
+                DataPoint::new(1, 1.0),
+            ),
+            Row::with_labels(
+                "matcher_row_page",
+                vec![
+                    Label::new("host", "a"),
+                    Label::new(MATCHER_ROW_TENANT_LABEL, "tenant-a"),
+                ],
+                DataPoint::new(2, 2.0),
+            ),
+            Row::with_labels(
+                "matcher_row_page",
+                vec![
+                    Label::new("host", "b"),
+                    Label::new(MATCHER_ROW_TENANT_LABEL, "tenant-a"),
+                ],
+                DataPoint::new(1, 3.0),
+            ),
+            Row::with_labels(
+                "matcher_row_page",
+                vec![
+                    Label::new("host", "z"),
+                    Label::new(MATCHER_ROW_TENANT_LABEL, "tenant-b"),
+                ],
+                DataPoint::new(1, 4.0),
+            ),
+        ])
+        .unwrap();
+    assert_eq!(
+        storage.scan_metric_rows_with_matchers_execution_accounting(),
+        QueryExecutionAccounting::Complete
+    );
+    let matcher = SeriesMatcher::equal(MATCHER_ROW_TENANT_LABEL, "tenant-a");
+
+    let execution = storage
+        .begin_query_execution(QueryWorkLimits::default(), QueryCancellationToken::new())
+        .unwrap()
+        .unwrap();
+    let first = storage
+        .scan_metric_rows_with_matchers_with_execution_result(
+            "matcher_row_page",
+            std::slice::from_ref(&matcher),
+            Some(MATCHER_ROW_TENANT_LABEL),
+            0,
+            3,
+            crate::QueryRowsScanOptions {
+                max_rows: Some(2),
+                row_offset: None,
+            },
+            &execution,
+        )
+        .unwrap();
+    assert_eq!(first.page.rows_scanned, 2);
+    assert_eq!(first.page.rows.len(), 2);
+    assert!(first.page.truncated);
+    assert_eq!(first.page.next_row_offset, Some(2));
+    assert!(first.page.rows.iter().all(|row| {
+        row.labels() == [Label::new("host", "a")]
+            && row
+                .labels()
+                .iter()
+                .all(|label| label.name != MATCHER_ROW_TENANT_LABEL)
+    }));
+    assert_eq!(execution.snapshot().series_matched, 2);
+    assert_eq!(execution.snapshot().samples_returned, 2);
+    let retained = super::super::query_exec::modeled_query_rows_retained_bytes(&first.page.rows);
+    assert_eq!(first.reserved_memory_bytes(), retained);
+    assert_eq!(
+        storage.query_budget_snapshot().shared_reserved_memory_bytes,
+        retained
+    );
+    drop(execution);
+    assert_eq!(storage.query_budget_snapshot().active_queries, 1);
+    drop(first);
+    assert_eq!(storage.query_budget_snapshot().active_queries, 0);
+    assert_eq!(
+        storage.query_budget_snapshot().shared_reserved_memory_bytes,
+        0
+    );
+
+    let execution = storage
+        .begin_query_execution(QueryWorkLimits::default(), QueryCancellationToken::new())
+        .unwrap()
+        .unwrap();
+    let second = storage
+        .scan_metric_rows_with_matchers_with_execution_result(
+            "matcher_row_page",
+            std::slice::from_ref(&matcher),
+            Some(MATCHER_ROW_TENANT_LABEL),
+            0,
+            3,
+            crate::QueryRowsScanOptions {
+                max_rows: Some(2),
+                row_offset: Some(2),
+            },
+            &execution,
+        )
+        .unwrap();
+    assert_eq!(second.page.rows_scanned, 1);
+    assert_eq!(second.page.rows.len(), 1);
+    assert!(!second.page.truncated);
+    assert_eq!(second.page.next_row_offset, None);
+    assert_eq!(second.page.rows[0].labels(), &[Label::new("host", "b")]);
+    assert_eq!(execution.snapshot().series_matched, 2);
+    drop(second);
+    drop(execution);
+    assert_eq!(storage.query_budget_snapshot().active_queries, 0);
+    assert_eq!(
+        storage.query_budget_snapshot().shared_reserved_memory_bytes,
+        0
+    );
+}
+
+#[test]
+fn matcher_aware_metric_row_scan_preserves_input_error_precedence_before_memory_admission() {
+    let storage = storage_with_query_limits(QueryBudgetLimits {
+        max_shared_memory_bytes: Some(1),
+        per_query: QueryWorkLimits {
+            max_memory_bytes: Some(1),
+            ..QueryWorkLimits::default()
+        },
+        ..QueryBudgetLimits::default()
+    });
+    let token = QueryCancellationToken::new();
+    let execution = storage
+        .begin_query_execution(QueryWorkLimits::default(), token.clone())
+        .unwrap()
+        .unwrap();
+
+    assert!(matches!(
+        storage.scan_metric_rows_with_matchers_with_execution_result(
+            "",
+            &[],
+            Some(MATCHER_ROW_TENANT_LABEL),
+            0,
+            1,
+            crate::QueryRowsScanOptions::default(),
+            &execution,
+        ),
+        Err(TsinkError::MetricRequired)
+    ));
+    assert!(matches!(
+        storage.scan_metric_rows_with_matchers_with_execution_result(
+            "matcher_row_invalid_request",
+            &[],
+            Some(MATCHER_ROW_TENANT_LABEL),
+            1,
+            1,
+            crate::QueryRowsScanOptions::default(),
+            &execution,
+        ),
+        Err(TsinkError::InvalidTimeRange { start: 1, end: 1 })
+    ));
+    assert!(matches!(
+        storage.scan_metric_rows_with_matchers_with_execution_result(
+            "matcher_row_invalid_request",
+            &[],
+            Some(MATCHER_ROW_TENANT_LABEL),
+            0,
+            1,
+            crate::QueryRowsScanOptions {
+                max_rows: Some(0),
+                row_offset: None,
+            },
+            &execution,
+        ),
+        Err(TsinkError::InvalidConfiguration(message))
+            if message == "max_rows must be greater than zero when set"
+    ));
+    token.cancel();
+    assert!(matches!(
+        storage.scan_metric_rows_with_matchers_with_execution_result(
+            "",
+            &[],
+            Some(MATCHER_ROW_TENANT_LABEL),
+            0,
+            1,
+            crate::QueryRowsScanOptions::default(),
+            &execution,
+        ),
+        Err(TsinkError::MetricRequired)
+    ));
+
+    assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+    assert_eq!(
+        storage
+            .query_budget_snapshot()
+            .peak_shared_reserved_memory_bytes,
+        0
+    );
+    drop(execution);
+    assert_eq!(storage.query_budget_snapshot().active_queries, 0);
+}
+
+#[test]
+fn matcher_aware_metric_row_scan_rejects_unbound_projection_label_before_memory_admission() {
+    let storage = storage_with_query_limits(QueryBudgetLimits {
+        max_shared_memory_bytes: Some(1),
+        per_query: QueryWorkLimits {
+            max_memory_bytes: Some(1),
+            ..QueryWorkLimits::default()
+        },
+        ..QueryBudgetLimits::default()
+    });
+    let token = QueryCancellationToken::new();
+    let execution = storage
+        .begin_query_execution(QueryWorkLimits::default(), token.clone())
+        .unwrap()
+        .unwrap();
+    token.cancel();
+    let invalid_matcher_sets = [
+        Vec::new(),
+        vec![SeriesMatcher::not_equal(
+            MATCHER_ROW_TENANT_LABEL,
+            "tenant-a",
+        )],
+        vec![SeriesMatcher::regex_match(
+            MATCHER_ROW_TENANT_LABEL,
+            "tenant-a",
+        )],
+        vec![SeriesMatcher::equal(MATCHER_ROW_TENANT_LABEL, "")],
+        vec![SeriesMatcher::equal("different_label", "tenant-a")],
+    ];
+
+    for matchers in &invalid_matcher_sets {
+        assert!(matches!(
+            storage.scan_metric_rows_with_matchers_with_execution_result(
+                "matcher_row_invalid_projection",
+                matchers,
+                Some(MATCHER_ROW_TENANT_LABEL),
+                0,
+                1,
+                crate::QueryRowsScanOptions::default(),
+                &execution,
+            ),
+            Err(TsinkError::InvalidConfiguration(message))
+                if message
+                    == "excluded_output_label requires a non-empty exact-equality matcher for the same label"
+        ));
+    }
+    assert!(matches!(
+        storage.scan_metric_rows_with_matchers_with_execution_result(
+            "matcher_row_invalid_projection",
+            &[SeriesMatcher::equal(
+                "__name__",
+                "matcher_row_invalid_projection",
+            )],
+            Some("__name__"),
+            0,
+            1,
+            crate::QueryRowsScanOptions::default(),
+            &execution,
+        ),
+        Err(TsinkError::InvalidConfiguration(message))
+            if message == "excluded_output_label cannot be the __name__ pseudo-label"
+    ));
+
+    assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+    assert_eq!(
+        storage
+            .query_budget_snapshot()
+            .peak_shared_reserved_memory_bytes,
+        0
+    );
+    drop(execution);
+    assert_eq!(storage.query_budget_snapshot().active_queries, 0);
+}
+
+#[test]
+fn matcher_aware_metric_row_scan_charges_selected_series_once_at_exact_boundary() {
+    const MATCHED_SERIES: usize = 2;
+    const OTHER_TENANT_SERIES: usize = 32;
+    let build_storage = |series_limit| {
+        let storage = storage_with_query_limits(QueryBudgetLimits {
+            per_query: QueryWorkLimits {
+                max_series_matched: Some(series_limit),
+                ..QueryWorkLimits::default()
+            },
+            ..QueryBudgetLimits::default()
+        });
+        let rows = (0..MATCHED_SERIES)
+            .map(|index| {
+                Row::with_labels(
+                    "matcher_row_charge",
+                    vec![
+                        Label::new("host", format!("a-{index:02}")),
+                        Label::new(MATCHER_ROW_TENANT_LABEL, "tenant-a"),
+                    ],
+                    DataPoint::new(1, index as f64),
+                )
+            })
+            .chain((0..OTHER_TENANT_SERIES).map(|index| {
+                Row::with_labels(
+                    "matcher_row_charge",
+                    vec![
+                        Label::new("host", format!("b-{index:02}")),
+                        Label::new(MATCHER_ROW_TENANT_LABEL, "tenant-b"),
+                    ],
+                    DataPoint::new(1, index as f64),
+                )
+            }))
+            .collect::<Vec<_>>();
+        storage.insert_rows(&rows).unwrap();
+        storage
+    };
+    let matcher = [SeriesMatcher::equal(MATCHER_ROW_TENANT_LABEL, "tenant-a")];
+
+    for (series_limit, should_succeed) in [
+        (MATCHED_SERIES as u64, true),
+        (MATCHED_SERIES as u64 - 1, false),
+    ] {
+        let storage = build_storage(series_limit);
+        let execution = storage
+            .begin_query_execution(QueryWorkLimits::default(), QueryCancellationToken::new())
+            .unwrap()
+            .unwrap();
+        let result = storage.scan_metric_rows_with_matchers_with_execution_result(
+            "matcher_row_charge",
+            &matcher,
+            Some(MATCHER_ROW_TENANT_LABEL),
+            0,
+            2,
+            crate::QueryRowsScanOptions::default(),
+            &execution,
+        );
+        if should_succeed {
+            let result = result.expect("the exact selected-series limit must succeed");
+            assert_eq!(result.page.rows.len(), MATCHED_SERIES);
+            assert_eq!(execution.snapshot().series_matched, MATCHED_SERIES as u64);
+            drop(result);
+        } else {
+            assert_query_limit(
+                result.expect_err("one under the selected-series count must fail"),
+                QueryLimitReason::SeriesMatched,
+            );
+        }
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        drop(execution);
+        let snapshot = storage.query_budget_snapshot();
+        assert_eq!(snapshot.active_queries, 0);
+        assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+        assert_eq!(snapshot.accounting_invariant_violations_total, 0);
+    }
+}
+
+#[test]
+fn matcher_aware_metric_row_scan_charges_projected_logical_returned_bytes() {
+    let metric = "matcher_row_projected_bytes";
+    let visible_labels = vec![Label::new("host", "alpha")];
+    let hidden_value = "tenant-a-with-a-long-internal-identity";
+    let expected_visible = u64::try_from(
+        std::mem::size_of::<Row>()
+            .saturating_add(metric.len())
+            .saturating_add(std::mem::size_of::<Label>())
+            .saturating_add(visible_labels[0].name.len())
+            .saturating_add(visible_labels[0].value.len()),
+    )
+    .unwrap();
+    let hidden_bytes = u64::try_from(
+        std::mem::size_of::<Label>()
+            .saturating_add(MATCHER_ROW_TENANT_LABEL.len())
+            .saturating_add(hidden_value.len()),
+    )
+    .unwrap();
+    assert!(expected_visible.saturating_add(hidden_bytes) > expected_visible);
+
+    for (returned_limit, should_succeed) in
+        [(expected_visible, true), (expected_visible - 1, false)]
+    {
+        let storage = storage_with_query_limits(QueryBudgetLimits {
+            per_query: QueryWorkLimits {
+                max_returned_bytes: Some(returned_limit),
+                ..QueryWorkLimits::default()
+            },
+            ..QueryBudgetLimits::default()
+        });
+        let mut physical_labels = visible_labels.clone();
+        physical_labels.push(Label::new(MATCHER_ROW_TENANT_LABEL, hidden_value));
+        storage
+            .insert_rows(&[Row::with_labels(
+                metric,
+                physical_labels,
+                DataPoint::new(1, 1.0),
+            )])
+            .unwrap();
+        let execution = storage
+            .begin_query_execution(QueryWorkLimits::default(), QueryCancellationToken::new())
+            .unwrap()
+            .unwrap();
+        let result = storage.scan_metric_rows_with_matchers_with_execution_result(
+            metric,
+            &[SeriesMatcher::equal(MATCHER_ROW_TENANT_LABEL, hidden_value)],
+            Some(MATCHER_ROW_TENANT_LABEL),
+            0,
+            2,
+            crate::QueryRowsScanOptions::default(),
+            &execution,
+        );
+        if should_succeed {
+            let result = result.expect("the exact projected row-byte limit must succeed");
+            assert_eq!(result.page.rows.len(), 1);
+            assert_eq!(result.page.rows[0].labels(), visible_labels);
+            assert_eq!(
+                result.page.rows[0].labels_capacity(),
+                2,
+                "projected materialization preallocates the physical label count"
+            );
+            assert_eq!(execution.snapshot().returned_bytes, expected_visible);
+            assert_eq!(
+                result.reserved_memory_bytes(),
+                super::super::query_exec::modeled_query_rows_retained_bytes(&result.page.rows)
+            );
+            drop(result);
+        } else {
+            assert_query_limit(
+                result.expect_err("one byte below the projected row size must fail"),
+                QueryLimitReason::ReturnedBytes,
+            );
+        }
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        drop(execution);
+        let snapshot = storage.query_budget_snapshot();
+        assert_eq!(snapshot.active_queries, 0);
+        assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+        assert_eq!(snapshot.accounting_invariant_violations_total, 0);
+    }
+}
+
+fn matcher_aware_metric_row_memory_storage(limits: QueryBudgetLimits) -> ChunkStorage {
+    let storage = storage_with_query_limits(limits);
+    let long_value = "x".repeat(512);
+    let rows = (0..16usize)
+        .flat_map(|index| {
+            ["tenant-a", "tenant-b"].map(|tenant| {
+                Row::with_labels(
+                    "matcher_row_memory",
+                    vec![
+                        Label::new("host", format!("host-{index:02}-{long_value}")),
+                        Label::new(MATCHER_ROW_TENANT_LABEL, tenant),
+                    ],
+                    DataPoint::new(1, index as f64),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    storage.insert_rows(&rows).unwrap();
+    storage
+}
+
+#[test]
+fn matcher_aware_metric_row_scan_has_an_exact_memory_boundary() {
+    let matcher = [SeriesMatcher::equal(MATCHER_ROW_TENANT_LABEL, "tenant-a")];
+    let calibration = matcher_aware_metric_row_memory_storage(QueryBudgetLimits::default());
+    let execution = calibration
+        .begin_query_execution(QueryWorkLimits::default(), QueryCancellationToken::new())
+        .unwrap()
+        .unwrap();
+    let result = calibration
+        .scan_metric_rows_with_matchers_with_execution_result(
+            "matcher_row_memory",
+            &matcher,
+            Some(MATCHER_ROW_TENANT_LABEL),
+            0,
+            2,
+            crate::QueryRowsScanOptions {
+                max_rows: Some(1),
+                row_offset: None,
+            },
+            &execution,
+        )
+        .unwrap();
+    assert_eq!(result.page.rows.len(), 1);
+    assert_eq!(result.page.rows[0].labels_capacity(), 2);
+    drop(result);
+    drop(execution);
+    let exact_memory = calibration
+        .query_budget_snapshot()
+        .peak_shared_reserved_memory_bytes;
+    assert!(exact_memory > 0);
+
+    for (memory_limit, should_succeed) in [(exact_memory, true), (exact_memory - 1, false)] {
+        let storage = matcher_aware_metric_row_memory_storage(QueryBudgetLimits {
+            max_shared_memory_bytes: Some(memory_limit),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(memory_limit),
+                ..QueryWorkLimits::default()
+            },
+            ..QueryBudgetLimits::default()
+        });
+        let execution = storage
+            .begin_query_execution(QueryWorkLimits::default(), QueryCancellationToken::new())
+            .unwrap()
+            .unwrap();
+        let result = storage.scan_metric_rows_with_matchers_with_execution_result(
+            "matcher_row_memory",
+            &matcher,
+            Some(MATCHER_ROW_TENANT_LABEL),
+            0,
+            2,
+            crate::QueryRowsScanOptions {
+                max_rows: Some(1),
+                row_offset: None,
+            },
+            &execution,
+        );
+        if should_succeed {
+            let result = result.expect("the exact matcher-row memory peak must succeed");
+            assert_eq!(result.page.rows.len(), 1);
+            assert_eq!(result.page.rows[0].labels_capacity(), 2);
+            drop(result);
+        } else {
+            assert_query_limit(
+                result.expect_err("one byte below the matcher-row memory peak must fail"),
+                QueryLimitReason::PerQueryMemoryBytes,
+            );
+        }
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        drop(execution);
+        let snapshot = storage.query_budget_snapshot();
+        assert_eq!(snapshot.active_queries, 0);
+        assert_eq!(snapshot.shared_reserved_memory_bytes, 0);
+        assert_eq!(snapshot.accounting_invariant_violations_total, 0);
+    }
+}
+
+#[test]
+fn matcher_aware_metric_row_scan_cancellation_releases_prepared_state() {
+    let storage = storage_with_query_limits(QueryBudgetLimits::default());
+    let token = QueryCancellationToken::new();
+    let execution = storage
+        .begin_query_execution(QueryWorkLimits::default(), token.clone())
+        .unwrap()
+        .unwrap();
+    let hook_calls = Arc::new(AtomicUsize::new(0));
+    storage.set_metadata_matcher_regex_compile_hook({
+        let hook_calls = Arc::clone(&hook_calls);
+        move || {
+            hook_calls.fetch_add(1, Ordering::SeqCst);
+            token.cancel();
+        }
+    });
+
+    let result = storage.scan_metric_rows_with_matchers_with_execution_result(
+        "matcher_row_cancelled",
+        &[
+            SeriesMatcher::equal(MATCHER_ROW_TENANT_LABEL, "tenant-a"),
+            SeriesMatcher::regex_match("host", "("),
+        ],
+        Some(MATCHER_ROW_TENANT_LABEL),
+        0,
+        1,
+        crate::QueryRowsScanOptions::default(),
+        &execution,
+    );
+    assert!(matches!(
+        result,
+        Err(TsinkError::QueryBudget(QueryBudgetError::Cancelled))
+    ));
+    assert_eq!(hook_calls.load(Ordering::SeqCst), 1);
+    storage.clear_metadata_matcher_regex_compile_hook();
+    assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+    assert_eq!(
+        storage.query_budget_snapshot().shared_reserved_memory_bytes,
+        0
+    );
+    drop(execution);
+    let snapshot = storage.query_budget_snapshot();
+    assert_eq!(snapshot.active_queries, 0);
+    assert_eq!(snapshot.cancellations_total, 1);
+    assert_eq!(snapshot.accounting_invariant_violations_total, 0);
+}
+
 #[test]
 fn metric_row_scan_caps_allocation_for_an_unbounded_logical_page_limit() {
     let storage = metric_row_scan_storage(QueryBudgetLimits::default(), 1, 0, false);

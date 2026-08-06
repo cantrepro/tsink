@@ -183,17 +183,23 @@ impl BackgroundCatalogRefreshCycle {
         )
     }
 
-    fn new(storage: &ChunkStorage, visibility_generation: u64) -> Result<Self> {
-        let target_construction_bytes = Self::modeled_construction_bytes(storage);
-        let target_construction_work = u64::try_from(target_construction_bytes).unwrap_or(u64::MAX);
-        let byte_limit = storage.runtime.maintenance_max_bytes_per_pass;
-        if target_construction_work > byte_limit {
+    fn preflight_construction_budget(storage: &ChunkStorage) -> Result<()> {
+        let required = u64::try_from(Self::modeled_construction_bytes(storage)).unwrap_or(u64::MAX);
+        let limit = storage.runtime.maintenance_max_bytes_per_pass;
+        if required > limit {
             return Err(TsinkError::MaintenanceWorkItemTooLarge {
                 operation: CATALOG_SCAN_OPERATION,
-                limit: byte_limit,
-                required: target_construction_work,
+                limit,
+                required,
             });
         }
+        Ok(())
+    }
+
+    fn new(storage: &ChunkStorage, visibility_generation: u64) -> Result<Self> {
+        let target_construction_bytes = Self::modeled_construction_bytes(storage);
+        Self::preflight_construction_budget(storage)?;
+        let byte_limit = storage.runtime.maintenance_max_bytes_per_pass;
         let memory_reservation =
             storage.remote_catalog_memory_reservation(target_construction_bytes)?;
         let mut targets = Vec::new();
@@ -431,6 +437,19 @@ pub(super) fn segment_root_is_missing(root: &Path) -> bool {
 }
 
 impl ChunkStorage {
+    pub(super) fn preflight_bounded_unknown_dirty_catalog_refresh(&self) -> Result<()> {
+        if self
+            .coordination
+            .background_catalog_refresh_cursor
+            .lock()
+            .cycle
+            .is_some()
+        {
+            return Ok(());
+        }
+        BackgroundCatalogRefreshCycle::preflight_construction_budget(self)
+    }
+
     #[cfg(test)]
     pub(in crate::engine::storage_engine) fn modeled_unknown_dirty_catalog_construction_bytes_for_test(
         &self,
@@ -439,6 +458,19 @@ impl ChunkStorage {
             self,
         ))
         .unwrap_or(u64::MAX)
+    }
+
+    #[cfg(test)]
+    pub(in crate::engine::storage_engine) fn modeled_unknown_dirty_catalog_retained_bytes_for_test(
+        &self,
+    ) -> usize {
+        self.coordination
+            .background_catalog_refresh_cursor
+            .lock()
+            .cycle
+            .as_ref()
+            .map(BackgroundCatalogRefreshCycle::modeled_retained_bytes)
+            .unwrap_or(0)
     }
 
     pub(super) fn reset_bounded_unknown_dirty_catalog_refresh(&self) {

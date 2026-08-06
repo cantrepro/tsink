@@ -432,7 +432,10 @@ impl ChunkStorage {
 
     pub(in super::super) fn refresh_dirty_persisted_segments_claimed(&self) -> Result<()> {
         let ctx = self.catalog_refresh_context();
-        if self.coordination.lifecycle.load(Ordering::Acquire) != STORAGE_OPEN {
+        let lifecycle = self.coordination.lifecycle.load(Ordering::Acquire);
+        let finite_maintenance = self.runtime.maintenance_max_items_per_pass != usize::MAX
+            || self.runtime.maintenance_max_bytes_per_pass != u64::MAX;
+        if lifecycle != STORAGE_OPEN {
             self.drain_known_dirty_persisted_refresh_if_pending()?;
             if !ctx.persisted_index_dirty() {
                 return Ok(());
@@ -455,21 +458,52 @@ impl ChunkStorage {
             return Ok(());
         }
 
+        #[cfg(test)]
+        self.invoke_catalog_refresh_pre_compaction_gate_hook();
         let _compaction_guard = self.compaction_gate();
+        // Close resets the retained clean-fence cursor while holding this same gate. Reload the
+        // lifecycle only after acquiring it so a refresh that waited behind close cannot recreate
+        // a bounded `ReadDir` after the close-side reset; lifecycle drains use the strict fence.
+        let finite_open_maintenance = finite_maintenance
+            && self.coordination.lifecycle.load(Ordering::Acquire) == STORAGE_OPEN;
+        if finite_open_maintenance
+            && self.persisted.tiered_storage.is_none()
+            && !self.has_known_persisted_segment_changes()
+        {
+            // Preserve the downstream scan's direct minimum-work rejection without constructing
+            // a catalog cursor. Once that dependency fits, the marker fence owns the wake before
+            // any inventory handle or retained catalog state is created. Recheck under the
+            // compaction gate so a concurrently produced exact diff keeps its cheaper path.
+            self.preflight_bounded_unknown_dirty_catalog_refresh()?;
+        }
         if let Some(data_path) = self
             .persisted
             .series_index_path
             .as_deref()
             .and_then(Path::parent)
         {
-            super::ensure_no_pending_post_flush_replacement(data_path)?;
+            if finite_open_maintenance {
+                let fence = self.advance_finite_post_flush_clean_fence(
+                    data_path,
+                    self.runtime.maintenance_max_items_per_pass,
+                    self.runtime.maintenance_max_bytes_per_pass,
+                )?;
+                if matches!(
+                    fence,
+                    super::BackgroundPostFlushCleanFenceStep::EnvelopeConsumed
+                ) {
+                    // The claimed dirty bit remains set, so the worker retries without exposing a
+                    // partial inventory or beginning a staged catalog publication.
+                    return Ok(());
+                }
+            } else {
+                super::ensure_no_pending_post_flush_replacement(data_path)?;
+            }
         }
         if self.apply_known_dirty_persisted_refresh_if_pending()? {
             return Ok(());
         }
 
-        let finite_maintenance = self.runtime.maintenance_max_items_per_pass != usize::MAX
-            || self.runtime.maintenance_max_bytes_per_pass != u64::MAX;
         if finite_maintenance
             && self.persisted.tiered_storage.is_none()
             && self.coordination.lifecycle.load(Ordering::Acquire) == STORAGE_OPEN

@@ -465,6 +465,15 @@ pub(crate) struct UsageStatusReconciliationSnapshot {
 pub(crate) struct UsageStatusSnapshot {
     pub journal: UsageLedgerStatus,
     pub current_tenant: UsageTenantSummary,
+    /// Whether the requested tenant existed when the snapshot was captured.
+    ///
+    /// Direct status deliberately reports a zero-valued tenant summary for an absent tenant,
+    /// while the all-time usage report emits an empty `tenants` array. Keeping this scalar beside
+    /// the shared summary lets both adapters preserve their historical schemas without retaining
+    /// a second vector-backed report.
+    pub current_tenant_present: bool,
+    /// Number of ledger records represented by `current_tenant`, including storage snapshots.
+    pub current_tenant_records_total: u64,
     pub reconciliation: UsageStatusReconciliationSnapshot,
 }
 
@@ -479,7 +488,23 @@ pub(crate) struct AccountedUsageStatusSnapshot {
     _reservation: QueryMemoryReservation,
 }
 
+/// Query-accounted standalone journal state used by adapters whose compatibility schema samples
+/// the journal separately from a report.
+#[derive(Debug)]
+#[must_use = "dropping the ledger status releases its query-memory reservation"]
+pub(crate) struct AccountedUsageLedgerStatus {
+    status: UsageLedgerStatus,
+    _reservation: QueryMemoryReservation,
+}
+
 impl AccountedUsageStatusSnapshot {
+    #[cfg(test)]
+    fn accounted_bytes(&self) -> u64 {
+        self._reservation.bytes()
+    }
+}
+
+impl AccountedUsageLedgerStatus {
     #[cfg(test)]
     fn accounted_bytes(&self) -> u64 {
         self._reservation.bytes()
@@ -491,6 +516,14 @@ impl std::ops::Deref for AccountedUsageStatusSnapshot {
 
     fn deref(&self) -> &Self::Target {
         &self.snapshot
+    }
+}
+
+impl std::ops::Deref for AccountedUsageLedgerStatus {
+    type Target = UsageLedgerStatus;
+
+    fn deref(&self) -> &Self::Target {
+        &self.status
     }
 }
 
@@ -526,21 +559,23 @@ fn modeled_usage_status_path_peak_bytes(path: &Path) -> u64 {
         .saturating_add(USAGE_STATUS_ALLOCATION_ALLOWANCE_BYTES.saturating_mul(2))
 }
 
-fn modeled_usage_status_snapshot_retained_bytes(snapshot: &UsageStatusSnapshot) -> u64 {
-    snapshot
-        .journal
+fn modeled_usage_ledger_status_retained_bytes(status: &UsageLedgerStatus) -> u64 {
+    status
         .ledger_path
         .as_ref()
         .map(modeled_usage_status_string_bytes)
         .unwrap_or(0)
         .saturating_add(
-            snapshot
-                .journal
+            status
                 .last_record_error_code
                 .as_ref()
                 .map(modeled_usage_status_string_bytes)
                 .unwrap_or(0),
         )
+}
+
+fn modeled_usage_status_snapshot_retained_bytes(snapshot: &UsageStatusSnapshot) -> u64 {
+    modeled_usage_ledger_status_retained_bytes(&snapshot.journal)
         .saturating_add(modeled_usage_status_string_bytes(
             &snapshot.current_tenant.tenant_id,
         ))
@@ -853,6 +888,8 @@ struct UsageAccountingInner {
     health: Mutex<UsageLedgerHealth>,
     #[cfg(test)]
     status_snapshot_string_clones: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    status_snapshot_increment_failure_after_capture: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug, Clone)]
@@ -948,6 +985,10 @@ impl UsageAccounting {
                 health: Mutex::new(UsageLedgerHealth::default()),
                 #[cfg(test)]
                 status_snapshot_string_clones: std::sync::atomic::AtomicU64::new(0),
+                #[cfg(test)]
+                status_snapshot_increment_failure_after_capture: std::sync::atomic::AtomicBool::new(
+                    false,
+                ),
             }),
         }))
     }
@@ -969,6 +1010,84 @@ impl UsageAccounting {
             &health,
             self.inner.limits,
         )
+    }
+
+    /// Captures one standalone journal sample under the caller's query execution.
+    ///
+    /// The path and latest error are the only dynamic outputs. Both are measured and reserved
+    /// while the state and health locks hold, before either output string is copied.
+    pub(crate) fn ledger_status_with_execution(
+        &self,
+        execution: &QueryExecution,
+    ) -> Result<AccountedUsageLedgerStatus, tsink::QueryBudgetError> {
+        execution.checkpoint()?;
+        let state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let health = self
+            .inner
+            .health
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        execution.checkpoint()?;
+
+        let peak_bytes = self
+            .inner
+            .ledger_path
+            .as_deref()
+            .map(modeled_usage_status_path_peak_bytes)
+            .unwrap_or(0)
+            .saturating_add(
+                health
+                    .last_record_error_code
+                    .as_deref()
+                    .map(modeled_usage_status_str_bytes)
+                    .unwrap_or(0),
+            );
+        let mut reservation = execution.reserve_memory(peak_bytes)?;
+        execution.checkpoint()?;
+
+        let ledger_path = self
+            .inner
+            .ledger_path
+            .as_deref()
+            .map(|path| self.status_snapshot_path_string(path));
+        execution.checkpoint()?;
+        let last_record_error_code = health
+            .last_record_error_code
+            .as_deref()
+            .map(|error| self.clone_status_snapshot_string(error));
+        execution.checkpoint()?;
+        let status = UsageLedgerStatus {
+            durable: self.inner.ledger_path.is_some(),
+            ledger_path,
+            records_total: state.records_total,
+            retained_records: state.records.len() as u64,
+            earliest_retained_sequence: state.records.front().map(|record| record.seq),
+            tenant_count: state.tenant_summaries.len() as u64,
+            last_sequence: state.last_sequence,
+            last_record_unix_ms: state.last_record_unix_ms,
+            storage_reconciliations_total: state.storage_reconciliations_total,
+            record_failures_total: health.record_failures_total,
+            last_record_error_code,
+            limits: self.inner.limits,
+        };
+        execution.checkpoint()?;
+        drop(health);
+        drop(state);
+
+        let retained_bytes = modeled_usage_ledger_status_retained_bytes(&status);
+        assert!(
+            retained_bytes <= peak_bytes,
+            "usage ledger status retained-memory model exceeded its pre-allocation reservation"
+        );
+        reservation.resize(retained_bytes)?;
+        Ok(AccountedUsageLedgerStatus {
+            status,
+            _reservation: reservation,
+        })
     }
 
     /// Captures the journal, current tenant, and reconciliation inputs used by direct TSDB status.
@@ -995,6 +1114,10 @@ impl UsageAccounting {
         execution.checkpoint()?;
 
         let summary = state.tenant_summaries.get(tenant_id);
+        let current_tenant_present = summary.is_some();
+        let current_tenant_records_total = summary
+            .map(SummaryAccumulator::records_total)
+            .unwrap_or_default();
         let peak_bytes = self
             .inner
             .ledger_path
@@ -1094,6 +1217,8 @@ impl UsageAccounting {
         let snapshot = UsageStatusSnapshot {
             journal,
             current_tenant,
+            current_tenant_present,
+            current_tenant_records_total,
             reconciliation,
         };
         let retained_bytes = modeled_usage_status_snapshot_retained_bytes(&snapshot);
@@ -1102,6 +1227,19 @@ impl UsageAccounting {
             "usage status retained-memory model exceeded its pre-allocation reservation"
         );
         reservation.resize(retained_bytes)?;
+        #[cfg(test)]
+        if self
+            .inner
+            .status_snapshot_increment_failure_after_capture
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            let mut health = self
+                .inner
+                .health
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            health.record_failures_total = health.record_failures_total.saturating_add(1);
+        }
         Ok(AccountedUsageStatusSnapshot {
             snapshot,
             _reservation: reservation,
@@ -1134,6 +1272,13 @@ impl UsageAccounting {
         self.inner
             .status_snapshot_string_clones
             .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn increment_failure_after_next_status_snapshot_for_test(&self) {
+        self.inner
+            .status_snapshot_increment_failure_after_capture
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     #[cfg(test)]
@@ -1422,6 +1567,7 @@ impl UsageAccounting {
         result
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn report(
         &self,
         tenant_id: Option<&str>,
@@ -4379,10 +4525,19 @@ mod tests {
             UsageRecordInput::success("team-a", UsageCategory::Storage, "reconcile", "status-test");
         storage.logical_storage_series = 7;
         storage.logical_storage_samples = 31;
+        storage.logical_storage_bytes = 4_096;
+        accounting
+            .record(storage)
+            .expect("usage status first storage record should append");
+
+        let mut storage =
+            UsageRecordInput::success("team-a", UsageCategory::Storage, "reconcile", "status-test");
+        storage.logical_storage_series = 7;
+        storage.logical_storage_samples = 31;
         storage.logical_storage_bytes = 8_192;
         accounting
             .record(storage)
-            .expect("usage status storage record should append");
+            .expect("usage status latest storage record should append");
 
         let mut other_tenant =
             UsageRecordInput::success("team-b", UsageCategory::Ingest, "write", "status-test");
@@ -4999,6 +5154,15 @@ mod tests {
 
         assert_eq!(projected.journal, expected_journal);
         assert_eq!(projected.current_tenant, expected_current);
+        assert!(projected.current_tenant_present);
+        assert_eq!(
+            projected.current_tenant_records_total,
+            expected_report.page.records_aggregated
+        );
+        assert_eq!(
+            projected.current_tenant_records_total, 6,
+            "both storage reconciliation records count even though only the latest snapshot remains"
+        );
         assert_eq!(
             projected.reconciliation,
             status_reconciliation_from_report(&expected_report),
@@ -5033,6 +5197,8 @@ mod tests {
             .expect("absent tenant usage status should still build");
         assert_eq!(absent.journal, expected_journal);
         assert_eq!(absent.current_tenant, expected_absent_current);
+        assert!(!absent.current_tenant_present);
+        assert_eq!(absent.current_tenant_records_total, 0);
         assert_eq!(
             absent.reconciliation,
             status_reconciliation_from_report(&expected_absent_report)
@@ -5048,6 +5214,161 @@ mod tests {
         );
         drop(absent);
         assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        drop(execution);
+        let released = budget.snapshot();
+        assert_eq!(released.active_queries, 0);
+        assert_eq!(released.shared_reserved_memory_bytes, 0);
+        assert_eq!(released.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn usage_ledger_status_projection_preserves_legacy_values_and_exact_memory_boundary() {
+        let dir = tempdir().expect("temp dir should build");
+        let accounting = populated_usage_status_accounting(dir.path());
+        let expected = accounting.ledger_status();
+        accounting.reset_status_snapshot_string_clones();
+
+        let calibration_budget = QueryBudget::new(QueryBudgetLimits::default())
+            .expect("ledger status calibration budget should build");
+        let calibration = calibration_budget
+            .begin_query()
+            .expect("ledger status calibration query should admit");
+        let projected = accounting
+            .ledger_status_with_execution(&calibration)
+            .expect("accounted ledger status should build");
+        assert_eq!(&*projected, &expected);
+        let required = projected.accounted_bytes();
+        assert!(required > 0);
+        assert_eq!(
+            calibration_budget
+                .snapshot()
+                .peak_shared_reserved_memory_bytes,
+            required
+        );
+        assert_eq!(
+            accounting.status_snapshot_string_clones(),
+            2,
+            "the durable path and latest error should each copy exactly once"
+        );
+        drop(projected);
+        drop(calibration);
+
+        accounting.reset_status_snapshot_string_clones();
+        let exact_budget = QueryBudget::new(QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(required),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(required),
+                ..QueryWorkLimits::default()
+            },
+        })
+        .expect("exact ledger status budget should build");
+        let exact = exact_budget
+            .begin_query()
+            .expect("exact ledger status query should admit");
+        let exact_status = accounting
+            .ledger_status_with_execution(&exact)
+            .expect("the exact ledger status memory boundary should pass");
+        assert_eq!(exact_status.accounted_bytes(), required);
+        assert_eq!(accounting.status_snapshot_string_clones(), 2);
+        drop(exact_status);
+        drop(exact);
+
+        accounting.reset_status_snapshot_string_clones();
+        let below_budget = QueryBudget::new(QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(required),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(required.saturating_sub(1)),
+                ..QueryWorkLimits::default()
+            },
+        })
+        .expect("below-boundary ledger status budget should build");
+        let below = below_budget
+            .begin_query()
+            .expect("below-boundary ledger status query should admit its slot");
+        let error = accounting
+            .ledger_status_with_execution(&below)
+            .expect_err("one byte below the ledger status peak must reject before cloning");
+        match error {
+            QueryBudgetError::LimitExceeded(exceeded) => {
+                assert_eq!(exceeded.reason, QueryLimitReason::PerQueryMemoryBytes);
+                assert_eq!(exceeded.current, 0);
+                assert_eq!(exceeded.requested, required);
+            }
+            other => panic!("unexpected ledger status projection error: {other}"),
+        }
+        assert_eq!(accounting.status_snapshot_string_clones(), 0);
+        assert_eq!(below.snapshot().memory_reserved_bytes, 0);
+        drop(below);
+
+        for budget in [calibration_budget, exact_budget, below_budget] {
+            let released = budget.snapshot();
+            assert_eq!(released.active_queries, 0);
+            assert_eq!(released.shared_reserved_memory_bytes, 0);
+            assert_eq!(released.accounting_invariant_violations_total, 0);
+        }
+    }
+
+    #[test]
+    fn usage_ledger_status_projection_honors_precancellation_without_residue() {
+        let dir = tempdir().expect("temp dir should build");
+        let accounting = populated_usage_status_accounting(dir.path());
+        accounting.reset_status_snapshot_string_clones();
+        let budget = QueryBudget::new(QueryBudgetLimits::default())
+            .expect("ledger status cancellation budget should build");
+        let cancellation = QueryCancellationToken::new();
+        let execution = budget
+            .begin_query_with(QueryWorkLimits::default(), cancellation.clone())
+            .expect("ledger status cancellation query should admit");
+        cancellation.cancel();
+
+        let error = accounting
+            .ledger_status_with_execution(&execution)
+            .expect_err("pre-cancelled ledger status projection must stop");
+        assert!(matches!(error, QueryBudgetError::Cancelled));
+        assert_eq!(accounting.status_snapshot_string_clones(), 0);
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        assert_eq!(budget.snapshot().peak_shared_reserved_memory_bytes, 0);
+        drop(execution);
+        let released = budget.snapshot();
+        assert_eq!(released.active_queries, 0);
+        assert_eq!(released.shared_reserved_memory_bytes, 0);
+        assert_eq!(released.cancellations_total, 1);
+        assert_eq!(released.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn usage_ledger_status_projection_recovers_poisoned_health_like_legacy_status() {
+        let dir = tempdir().expect("temp dir should build");
+        let accounting = populated_usage_status_accounting(dir.path());
+        let poison_target = Arc::clone(&accounting);
+        let panic = std::thread::spawn(move || {
+            let _health = poison_target
+                .inner
+                .health
+                .lock()
+                .expect("health lock should initially be healthy");
+            panic!("poison usage health for projection test");
+        })
+        .join();
+        assert!(panic.is_err());
+        let expected = accounting.ledger_status();
+
+        let budget = QueryBudget::new(QueryBudgetLimits::default())
+            .expect("poison recovery budget should build");
+        let execution = budget
+            .begin_query()
+            .expect("poison recovery query should admit");
+        let projected = accounting
+            .ledger_status_with_execution(&execution)
+            .expect("accounted ledger status should recover poison");
+        assert_eq!(&*projected, &expected);
+        assert_eq!(
+            execution.snapshot().memory_reserved_bytes,
+            projected.accounted_bytes()
+        );
+        drop(projected);
         drop(execution);
         let released = budget.snapshot();
         assert_eq!(released.active_queries, 0);

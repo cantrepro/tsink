@@ -67,7 +67,7 @@ fn persist_rollup_state_returns_error_when_parent_sync_fails() {
 }
 
 #[test]
-fn source_state_event_is_durable_before_the_caller_mutates_memory() {
+fn source_state_event_installs_memory_only_after_durable_publication() {
     let temp_dir = TempDir::new().unwrap();
     let data_path = temp_dir.path().to_path_buf();
     let state_path = data_path.join(ROLLUP_DIR_NAME).join(ROLLUP_STATE_FILE_NAME);
@@ -88,26 +88,39 @@ fn source_state_event_is_durable_before_the_caller_mutates_memory() {
     let runtime = RollupRuntimeState::new_with_disk_budget(Some(data_path), None);
     *runtime.checkpoints.write() = checkpoints;
     *runtime.generations.write() = generations;
+    *runtime.state_envelope_usage.lock() = super::runtime::rollup_state_envelope_usage(
+        &[],
+        &runtime.checkpoints.read(),
+        &runtime.generations.read(),
+        &runtime.pending_materializations.read(),
+        &runtime.pending_delete_invalidations.read(),
+    )
+    .unwrap();
     let store = RollupStateStoreContext { state: &runtime };
     let pending = PendingRollupMaterialization {
         checkpoint: 10,
         materialized_through: 20,
         generation: 0,
     };
+    let mut journal = store.begin_source_state_journal_writer().unwrap();
     store
-        .persist_source_state_event(RollupSourceStateEvent::pending(
-            0,
-            "policy-a",
-            "cpu{host=\"a\"}",
-            0,
-            Some(10),
-            &pending,
-        ))
+        .persist_source_state_event(
+            &mut journal,
+            RollupSourceStateEvent::pending(
+                0,
+                "policy-a",
+                "cpu{host=\"a\"}",
+                0,
+                Some(10),
+                &pending,
+            ),
+        )
         .unwrap();
 
-    assert!(
-        runtime.pending_materializations.read().is_empty(),
-        "the persistence primitive must not publish the caller's in-memory mutation"
+    assert_eq!(
+        runtime.pending_materializations.read()["policy-a"]["cpu{host=\"a\"}"],
+        pending,
+        "a successful durable publication must atomically install its retained in-memory state"
     );
     let reloaded = load_rollup_state(Some(&state_path)).unwrap();
     assert_eq!(
@@ -258,14 +271,14 @@ fn open_budgeted_rollup_storage(
     storage
 }
 
-fn open_empty_rollup_storage(data_path: &Path) -> ChunkStorage {
+fn new_empty_rollup_storage(data_path: &Path) -> ChunkStorage {
     let options = ChunkStorageOptions {
         background_threads_enabled: false,
         max_writers: 1,
         write_timeout: std::time::Duration::ZERO,
         ..ChunkStorageOptions::default()
     };
-    let storage = ChunkStorage::new_with_data_path_and_options(
+    ChunkStorage::new_with_data_path_and_options(
         8,
         None,
         Some(data_path.join("numeric")),
@@ -273,9 +286,266 @@ fn open_empty_rollup_storage(data_path: &Path) -> ChunkStorage {
         1,
         options,
     )
-    .unwrap();
+    .unwrap()
+}
+
+fn open_empty_rollup_storage(data_path: &Path) -> ChunkStorage {
+    let storage = new_empty_rollup_storage(data_path);
     storage.load_rollup_runtime_state().unwrap();
     storage
+}
+
+fn persist_startup_envelope_fixture(
+    data_path: &Path,
+    policy: &RollupPolicy,
+    checkpoint_count: usize,
+    generations: &HashMap<String, u64>,
+    journal_epoch: u64,
+) {
+    let rollup_dir = data_path.join(ROLLUP_DIR_NAME);
+    fs::create_dir_all(&rollup_dir).unwrap();
+    fs::write(
+        rollup_dir.join(ROLLUP_POLICIES_FILE_NAME),
+        encode_rollup_policies(std::slice::from_ref(policy)).unwrap(),
+    )
+    .unwrap();
+    let checkpoints = HashMap::from([(
+        policy.id.clone(),
+        (0..checkpoint_count)
+            .map(|index| (format!("source-{index:05}"), index as i64))
+            .collect::<BTreeMap<_, _>>(),
+    )]);
+    fs::write(
+        rollup_dir.join(ROLLUP_STATE_FILE_NAME),
+        encode_rollup_state_with_epoch(
+            &checkpoints,
+            generations,
+            &HashMap::new(),
+            &[],
+            journal_epoch,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn startup_combined_envelope_admits_exact_missing_generation() {
+    let temp_dir = TempDir::new().unwrap();
+    let policy = test_policy(1_000);
+    persist_startup_envelope_fixture(
+        temp_dir.path(),
+        &policy,
+        ROLLUP_STATE_SNAPSHOT_MAX_ITEMS - 2,
+        &HashMap::new(),
+        7,
+    );
+
+    let storage = open_empty_rollup_storage(temp_dir.path());
+    let runtime = &storage.rollups.runtime;
+    assert_eq!(runtime.generations.read().get(&policy.id), Some(&0));
+    let usage = *runtime.state_envelope_usage.lock();
+    assert_eq!(usage.items, ROLLUP_STATE_SNAPSHOT_MAX_ITEMS);
+    let exact = super::runtime::rollup_state_envelope_usage(
+        &runtime.policies.read(),
+        &runtime.checkpoints.read(),
+        &runtime.generations.read(),
+        &runtime.pending_materializations.read(),
+        &runtime.pending_delete_invalidations.read(),
+    )
+    .unwrap();
+    assert_eq!(usage, exact);
+}
+
+#[test]
+fn startup_combined_envelope_rejects_missing_generation_n_plus_one_before_install() {
+    let temp_dir = TempDir::new().unwrap();
+    let policy = test_policy(1_000);
+    persist_startup_envelope_fixture(
+        temp_dir.path(),
+        &policy,
+        ROLLUP_STATE_SNAPSHOT_MAX_ITEMS - 1,
+        &HashMap::new(),
+        8,
+    );
+
+    let storage = new_empty_rollup_storage(temp_dir.path());
+    let error = storage
+        .load_rollup_runtime_state()
+        .expect_err("the missing generation must be charged before map insertion");
+    assert!(matches!(
+        error,
+        TsinkError::MaintenanceDependencyWindowExceeded {
+            operation: "rollup state snapshot encoding",
+            selected_items,
+            ..
+        } if selected_items == ROLLUP_STATE_SNAPSHOT_MAX_ITEMS + 1
+    ));
+    assert!(storage.rollups.runtime.generations.read().is_empty());
+    assert_eq!(
+        *storage.rollups.runtime.state_envelope_usage.lock(),
+        RollupStateEnvelopeUsage::empty()
+    );
+}
+
+#[test]
+fn startup_combined_policy_base_and_journal_enforce_exact_boundary() {
+    let exact_dir = TempDir::new().unwrap();
+    let policy = test_policy(1_000);
+    let generations = HashMap::from([(policy.id.clone(), 0)]);
+    persist_startup_envelope_fixture(
+        exact_dir.path(),
+        &policy,
+        ROLLUP_STATE_SNAPSHOT_MAX_ITEMS - 3,
+        &generations,
+        9,
+    );
+    let exact_rollup_dir = exact_dir.path().join(ROLLUP_DIR_NAME);
+    let mut writer =
+        super::state_journal::begin_rollup_state_journal_writer(Some(&exact_rollup_dir), None)
+            .unwrap();
+    writer
+        .persist(RollupSourceStateEvent::completed(
+            9,
+            &policy.id,
+            "journal-source",
+            0,
+            42,
+        ))
+        .unwrap();
+    drop(writer);
+
+    let exact_storage = open_empty_rollup_storage(exact_dir.path());
+    assert_eq!(
+        exact_storage
+            .rollups
+            .runtime
+            .state_envelope_usage
+            .lock()
+            .items,
+        ROLLUP_STATE_SNAPSHOT_MAX_ITEMS
+    );
+    assert_eq!(
+        exact_storage.rollups.runtime.checkpoints.read()[&policy.id]["journal-source"],
+        42
+    );
+
+    let over_dir = TempDir::new().unwrap();
+    persist_startup_envelope_fixture(
+        over_dir.path(),
+        &policy,
+        ROLLUP_STATE_SNAPSHOT_MAX_ITEMS - 2,
+        &generations,
+        10,
+    );
+    let over_rollup_dir = over_dir.path().join(ROLLUP_DIR_NAME);
+    let mut writer =
+        super::state_journal::begin_rollup_state_journal_writer(Some(&over_rollup_dir), None)
+            .unwrap();
+    writer
+        .persist(RollupSourceStateEvent::completed(
+            10,
+            &policy.id,
+            "journal-source",
+            0,
+            42,
+        ))
+        .unwrap();
+    drop(writer);
+
+    let over_storage = new_empty_rollup_storage(over_dir.path());
+    let error = over_storage
+        .load_rollup_runtime_state()
+        .expect_err("policy-seeded journal replay must reject logical item N+1");
+    assert!(matches!(
+        error,
+        TsinkError::MaintenanceDependencyWindowExceeded {
+            operation: "rollup source state journal replay",
+            selected_items,
+            ..
+        } if selected_items == ROLLUP_STATE_SNAPSHOT_MAX_ITEMS + 1
+    ));
+    assert!(over_storage.rollups.runtime.checkpoints.read().is_empty());
+    assert_eq!(
+        *over_storage.rollups.runtime.state_envelope_usage.lock(),
+        RollupStateEnvelopeUsage::empty()
+    );
+}
+
+#[test]
+fn startup_combined_policy_and_state_enforce_exact_modeled_byte_boundary() {
+    let policy = test_policy(1_000);
+    let generations = HashMap::from([(policy.id.clone(), 0)]);
+    let fixed_usage = super::runtime::rollup_state_envelope_usage(
+        std::slice::from_ref(&policy),
+        &HashMap::new(),
+        &generations,
+        &HashMap::new(),
+        &[],
+    )
+    .unwrap();
+    let checkpoint_fixed_bytes = policy.id.len().saturating_mul(6).saturating_add(128);
+    let source_bytes = ROLLUP_STATE_SNAPSHOT_MAX_MODELED_BYTES
+        .checked_sub(fixed_usage.modeled_bytes)
+        .and_then(|bytes| bytes.checked_sub(checkpoint_fixed_bytes))
+        .unwrap();
+    assert_eq!(source_bytes % 6, 0);
+    let exact_source = "s".repeat(source_bytes / 6);
+
+    let persist = |data_path: &Path, source_key: String| {
+        let rollup_dir = data_path.join(ROLLUP_DIR_NAME);
+        fs::create_dir_all(&rollup_dir).unwrap();
+        fs::write(
+            rollup_dir.join(ROLLUP_POLICIES_FILE_NAME),
+            encode_rollup_policies(std::slice::from_ref(&policy)).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            rollup_dir.join(ROLLUP_STATE_FILE_NAME),
+            encode_rollup_state_with_epoch(
+                &HashMap::from([(policy.id.clone(), BTreeMap::from([(source_key, 1)]))]),
+                &generations,
+                &HashMap::new(),
+                &[],
+                11,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    };
+
+    let exact_dir = TempDir::new().unwrap();
+    persist(exact_dir.path(), exact_source.clone());
+    let exact_storage = open_empty_rollup_storage(exact_dir.path());
+    assert_eq!(
+        exact_storage
+            .rollups
+            .runtime
+            .state_envelope_usage
+            .lock()
+            .modeled_bytes,
+        ROLLUP_STATE_SNAPSHOT_MAX_MODELED_BYTES
+    );
+
+    let over_dir = TempDir::new().unwrap();
+    persist(over_dir.path(), format!("{exact_source}s"));
+    let over_storage = new_empty_rollup_storage(over_dir.path());
+    let error = over_storage
+        .load_rollup_runtime_state()
+        .expect_err("the policy seed must reject combined modeled bytes above the exact limit");
+    assert!(matches!(
+        error,
+        TsinkError::MaintenanceDependencyWindowExceeded {
+            operation: "rollup state snapshot encoding",
+            selected_bytes,
+            ..
+        } if selected_bytes == (ROLLUP_STATE_SNAPSHOT_MAX_MODELED_BYTES as u64) + 6
+    ));
+    assert!(over_storage.rollups.runtime.checkpoints.read().is_empty());
+    assert_eq!(
+        *over_storage.rollups.runtime.state_envelope_usage.lock(),
+        RollupStateEnvelopeUsage::empty()
+    );
 }
 
 fn assert_no_rollup_reservation(budget: &crate::LocalDiskBudget, expected_bytes: u64) {

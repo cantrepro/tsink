@@ -346,6 +346,126 @@ fn persist_segment_rolls_back_published_lane_when_other_lane_fails() {
 }
 
 #[test]
+fn published_segment_rollback_batches_lane_roots_into_one_reconciliation() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    let numeric_lane_path = data_path.join(NUMERIC_LANE_ROOT);
+    let blob_lane_path = data_path.join(BLOB_LANE_ROOT);
+    let numeric_root = numeric_lane_path
+        .join("segments")
+        .join("L0")
+        .join("seg-0000000000000001");
+    let blob_root = blob_lane_path
+        .join("segments")
+        .join("L0")
+        .join("seg-0000000000000002");
+    for (root, payload) in [
+        (&numeric_root, b"numeric-segment".as_slice()),
+        (&blob_root, b"blob-segment".as_slice()),
+    ] {
+        std::fs::create_dir_all(root).unwrap();
+        std::fs::write(root.join("payload.bin"), payload).unwrap();
+    }
+    let budget =
+        crate::LocalDiskBudget::open(&data_path, crate::LocalDiskLimits::default()).unwrap();
+    let storage = ChunkStorage::new_with_data_path_and_options_and_disk_budget(
+        2,
+        None,
+        Some(numeric_lane_path),
+        Some(blob_lane_path),
+        3,
+        base_storage_test_options(TimestampPrecision::Milliseconds, None),
+        Some(Arc::clone(&budget)),
+    )
+    .unwrap();
+    let before = budget.snapshot();
+
+    storage
+        .rollback_published_segment_roots(&[numeric_root.clone(), blob_root.clone()])
+        .unwrap();
+
+    assert!(!numeric_root.exists());
+    assert!(!blob_root.exists());
+    let after = budget.snapshot();
+    assert_eq!(
+        after.reconciliations_total,
+        before.reconciliations_total + 1
+    );
+    assert_eq!(
+        after.accounted_bytes,
+        crate::disk_budget::measured_path_bytes(&data_path).unwrap()
+    );
+    assert_eq!(after.active_reservations, 0);
+    assert_eq!(after.reserved_bytes, 0);
+    assert_eq!(after.maintenance_reserved_bytes, 0);
+}
+
+#[test]
+fn published_segment_rollback_continues_after_parent_sync_failure_and_reconciles_once() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("data");
+    let numeric_lane_path = data_path.join(NUMERIC_LANE_ROOT);
+    let blob_lane_path = data_path.join(BLOB_LANE_ROOT);
+    let later_cleanup = numeric_lane_path
+        .join("segments")
+        .join("L0")
+        .join("seg-0000000000000001");
+    let failed_first = blob_lane_path
+        .join("segments")
+        .join("L0")
+        .join("seg-0000000000000002");
+    for root in [&later_cleanup, &failed_first] {
+        std::fs::create_dir_all(root).unwrap();
+        std::fs::write(root.join("payload.bin"), b"published-segment").unwrap();
+    }
+    let budget =
+        crate::LocalDiskBudget::open(&data_path, crate::LocalDiskLimits::default()).unwrap();
+    let storage = ChunkStorage::new_with_data_path_and_options_and_disk_budget(
+        2,
+        None,
+        Some(numeric_lane_path),
+        Some(blob_lane_path),
+        3,
+        base_storage_test_options(TimestampPrecision::Milliseconds, None),
+        Some(Arc::clone(&budget)),
+    )
+    .unwrap();
+    let before = budget.snapshot();
+    let _sync_failure = crate::engine::fs_utils::fail_directory_sync_once(
+        failed_first
+            .parent()
+            .expect("segment root must have a parent")
+            .to_path_buf(),
+        "injected published-segment rollback parent sync failure",
+    );
+
+    let err = storage
+        .rollback_published_segment_roots(&[later_cleanup.clone(), failed_first.clone()])
+        .expect_err("the committed unlink must retain its parent-sync error");
+
+    assert!(err
+        .to_string()
+        .contains("injected published-segment rollback parent sync failure"));
+    assert!(!failed_first.exists());
+    assert!(
+        !later_cleanup.exists(),
+        "rollback must continue with later roots after an earlier error"
+    );
+    let after = budget.snapshot();
+    assert_eq!(
+        after.reconciliations_total,
+        before.reconciliations_total + 1
+    );
+    assert_eq!(
+        after.accounted_bytes,
+        crate::disk_budget::measured_path_bytes(&data_path).unwrap()
+    );
+    assert_eq!(after.active_reservations, 0);
+    assert_eq!(after.reserved_bytes, 0);
+    assert_eq!(after.maintenance_reserved_bytes, 0);
+}
+
+#[test]
 fn persist_segment_stamps_wal_highwater_when_wal_is_enabled() {
     let temp_dir = TempDir::new().unwrap();
     let labels = vec![Label::new("host", "a")];

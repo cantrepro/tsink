@@ -818,26 +818,83 @@ impl<'a> RetentionMaintenanceContext<'a> {
         local_disk_budget: Option<&Arc<crate::LocalDiskBudget>>,
     ) -> Result<()> {
         let mut cleanup_errors = Vec::new();
-        for promotion in promotions {
-            if let Err(err) =
-                crate::engine::fs_utils::remove_path_if_exists_and_sync_parent_budgeted(
-                    &promotion.staging_root,
-                    local_disk_budget,
-                    crate::DiskCategory::Temporary,
-                )
-            {
-                cleanup_errors.push(format!("{}: {err}", promotion.staging_root.display()));
+        let mut reservation = None;
+        let mut reservation_attempted = false;
+        let mut governed_cleanup_available = true;
+        let mut governed_cleanup_mutated_or_ambiguous = false;
+        {
+            let mut cleanup_path = |path: &Path| {
+                let governed = match local_disk_budget {
+                    Some(budget) => match budget.governs_entry(path) {
+                        Ok(governed) => governed,
+                        Err(err) => {
+                            cleanup_errors.push(format!("{}: {err}", path.display()));
+                            return;
+                        }
+                    },
+                    None => false,
+                };
+                let mut reservation_failed_here = false;
+                if governed && !reservation_attempted {
+                    reservation_attempted = true;
+                    match local_disk_budget
+                        .expect("governed staged cleanup requires a local disk budget")
+                        .reserve(
+                            crate::DiskCategory::Temporary,
+                            0,
+                            crate::DiskReservationKind::Recovery,
+                        ) {
+                        Ok(admitted) => reservation = Some(admitted),
+                        Err(err) => {
+                            governed_cleanup_available = false;
+                            reservation_failed_here = true;
+                            cleanup_errors.push(format!(
+                                "{}: aggregate disk reservation failed: {err}",
+                                path.display()
+                            ));
+                        }
+                    }
+                }
+                if governed && !governed_cleanup_available {
+                    if !reservation_failed_here {
+                        cleanup_errors.push(format!(
+                            "{}: skipped because the aggregate disk reservation was unavailable",
+                            path.display()
+                        ));
+                    }
+                    return;
+                }
+
+                match crate::engine::fs_utils::remove_path_if_exists_and_sync_parent_observed(path)
+                {
+                    Ok(removed) => {
+                        governed_cleanup_mutated_or_ambiguous |= governed && removed;
+                    }
+                    Err(err) => {
+                        governed_cleanup_mutated_or_ambiguous |= governed;
+                        cleanup_errors.push(format!("{}: {err}", path.display()));
+                    }
+                }
+            };
+            for promotion in promotions {
+                cleanup_path(&promotion.staging_root);
+            }
+            for path in staging_cleanup_paths {
+                cleanup_path(path);
             }
         }
-        for path in staging_cleanup_paths {
-            if let Err(err) =
-                crate::engine::fs_utils::remove_path_if_exists_and_sync_parent_budgeted(
-                    path,
-                    local_disk_budget,
-                    crate::DiskCategory::Temporary,
-                )
+
+        let settlement_result = reservation.map_or(Ok(()), |reservation| reservation.commit(0, 0));
+        if let Err(err) = settlement_result {
+            governed_cleanup_mutated_or_ambiguous = true;
+            cleanup_errors.push(format!("disk settlement: {err}"));
+        }
+        if governed_cleanup_mutated_or_ambiguous {
+            if let Err(err) = local_disk_budget
+                .expect("governed staged cleanup requires a local disk budget")
+                .reconcile_when_idle()
             {
-                cleanup_errors.push(format!("{}: {err}", path.display()));
+                cleanup_errors.push(format!("disk reconciliation: {err}"));
             }
         }
         if !cleanup_errors.is_empty() {
@@ -1664,6 +1721,101 @@ mod tests {
         ));
         assert!(!operation_called.load(Ordering::SeqCst));
         assert!(!data_path.join("missing-final-parent").exists());
+    }
+
+    #[test]
+    fn staged_cleanup_batches_governed_paths_into_one_reconciliation() {
+        let temp = TempDir::new().unwrap();
+        let data_path = temp.path().join("data");
+        let first_stage = data_path.join("staging-a");
+        let second_stage = data_path.join("staging-b");
+        let rewrite_stage = data_path.join("rewrite-stage");
+        for (path, payload) in [
+            (&first_stage, b"one".as_slice()),
+            (&second_stage, b"two-two".as_slice()),
+            (&rewrite_stage, b"three-three".as_slice()),
+        ] {
+            std::fs::create_dir_all(path).unwrap();
+            std::fs::write(path.join("payload.bin"), payload).unwrap();
+        }
+        let budget = crate::LocalDiskBudget::open(&data_path, LocalDiskLimits::default()).unwrap();
+        let before = budget.snapshot();
+        assert!(before.accounted_bytes > 0);
+        let promotions = [
+            StagedSegmentPromotion {
+                staging_root: first_stage.clone(),
+                final_root: data_path.join("final-a"),
+            },
+            StagedSegmentPromotion {
+                staging_root: second_stage.clone(),
+                final_root: data_path.join("final-b"),
+            },
+        ];
+        let state = TestRetentionContextState::default();
+
+        state
+            .context(Some(&budget))
+            .cleanup_staged_post_flush_paths(&promotions, std::slice::from_ref(&rewrite_stage))
+            .unwrap();
+
+        assert!(!first_stage.exists());
+        assert!(!second_stage.exists());
+        assert!(!rewrite_stage.exists());
+        let after = budget.snapshot();
+        assert_eq!(after.accounted_bytes, 0);
+        assert_eq!(
+            after.reconciliations_total,
+            before.reconciliations_total + 1
+        );
+        assert_eq!(after.active_reservations, 0);
+        assert_eq!(after.reserved_bytes, 0);
+        assert_eq!(after.maintenance_reserved_bytes, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_cleanup_continues_after_an_unclassifiable_path() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let data_path = temp.path().join("data");
+        let outside = temp.path().join("outside");
+        let escaped_stage = outside.join("stage");
+        let valid_stage = data_path.join("valid-stage");
+        std::fs::create_dir_all(&escaped_stage).unwrap();
+        std::fs::write(escaped_stage.join("foreign.bin"), b"foreign").unwrap();
+        std::fs::create_dir_all(&valid_stage).unwrap();
+        std::fs::write(valid_stage.join("owned.bin"), b"owned").unwrap();
+        symlink(&outside, data_path.join("escaped-parent")).unwrap();
+        let budget = crate::LocalDiskBudget::open(&data_path, LocalDiskLimits::default()).unwrap();
+        let before = budget.snapshot();
+        let promotions = [
+            StagedSegmentPromotion {
+                staging_root: data_path.join("escaped-parent/stage"),
+                final_root: data_path.join("unused-escaped-final"),
+            },
+            StagedSegmentPromotion {
+                staging_root: valid_stage.clone(),
+                final_root: data_path.join("unused-valid-final"),
+            },
+        ];
+        let state = TestRetentionContextState::default();
+
+        let err = state
+            .context(Some(&budget))
+            .cleanup_staged_post_flush_paths(&promotions, &[])
+            .expect_err("the escaped cleanup path must remain an error");
+
+        assert!(err.to_string().contains("escapes local disk root"));
+        assert!(escaped_stage.join("foreign.bin").exists());
+        assert!(!valid_stage.exists());
+        let after = budget.snapshot();
+        assert_eq!(
+            after.reconciliations_total,
+            before.reconciliations_total + 1
+        );
+        assert_eq!(after.active_reservations, 0);
+        assert_eq!(after.reserved_bytes, 0);
     }
 
     #[test]

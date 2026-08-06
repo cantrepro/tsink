@@ -14,6 +14,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::Component;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Limits enforced by a [`LocalDiskBudget`].
@@ -637,6 +638,9 @@ struct DiskAccountingState {
     maintenance_reserved_bytes: u64,
     active_reservations: u64,
     reconciliation_waiters: u64,
+    reservation_generation: u64,
+    completed_reconciliation_reservation_generation: u64,
+    completed_reconciliation_memory_peak_bytes: usize,
     rejections_total: u64,
     reconciliations_total: u64,
     reservation_overruns_total: u64,
@@ -713,6 +717,10 @@ impl DiskAccountingState {
         let active_reservations = self.active_reservations.checked_add(1).ok_or_else(|| {
             TsinkError::Other("local disk active reservation counter overflow".to_string())
         })?;
+        let reservation_generation =
+            self.reservation_generation.checked_add(1).ok_or_else(|| {
+                TsinkError::Other("local disk reservation generation counter overflow".to_string())
+            })?;
         if maintenance_reserved_bytes > reserved_bytes {
             return Err(TsinkError::Other(format!(
                 "local disk reservation invariant violated: maintenance={maintenance_reserved_bytes}, total={reserved_bytes}"
@@ -722,6 +730,7 @@ impl DiskAccountingState {
         self.reserved_bytes = reserved_bytes;
         self.maintenance_reserved_bytes = maintenance_reserved_bytes;
         self.active_reservations = active_reservations;
+        self.reservation_generation = reservation_generation;
         Ok(())
     }
 
@@ -783,6 +792,63 @@ impl DiskAccountingState {
     }
 }
 
+/// One exact, no-rescan removal plan for a single directory of owned startup temporaries.
+///
+/// Planning captures the parent identity and every recursive descendant under caller-supplied
+/// aggregate namespace and memory envelopes. Execution is intentionally accounting-free so a
+/// startup coordinator can hold one mutation guard and one recovery reservation across plans from
+/// multiple recovery categories.
+pub(crate) struct OwnedTemporaryEntryCleanupPlan {
+    directory: PathBuf,
+    directory_identity: same_file::Handle,
+    removal_plan: crate::engine::fs_utils::RecursiveNamespaceRemovalPlan,
+}
+
+impl OwnedTemporaryEntryCleanupPlan {
+    pub(crate) fn governed_path(&self) -> &Path {
+        &self.directory
+    }
+
+    pub(crate) fn root_count(&self) -> usize {
+        self.removal_plan.root_count()
+    }
+
+    pub(crate) fn modeled_heap_bytes(&self) -> Result<usize> {
+        self.directory
+            .capacity()
+            .checked_add(self.removal_plan.modeled_heap_bytes()?)
+            .ok_or_else(|| {
+                TsinkError::Other(
+                    "startup temporary-cleanup plan retained-memory overflow".to_string(),
+                )
+            })
+    }
+
+    /// Executes the preflighted paths without taking the disk mutation lock, reserving disk, or
+    /// reconciling accounting. The caller owns those aggregate responsibilities.
+    pub(crate) fn execute_locked(self) -> Result<u64> {
+        if !crate::engine::fs_utils::path_matches_plain_directory_identity(
+            &self.directory,
+            &self.directory_identity,
+        )? {
+            return Err(TsinkError::DataCorruption(format!(
+                "refusing startup temporary cleanup because the scanned directory identity changed: {}",
+                self.directory.display()
+            )));
+        }
+
+        let removal_result = self.removal_plan.remove();
+        let sync_result = crate::engine::fs_utils::sync_dir(&self.directory);
+        match (removal_result, sync_result) {
+            (Ok(removed), Ok(())) => Ok(u64::try_from(removed).unwrap_or(u64::MAX)),
+            (Err(err), Ok(())) | (Ok(_), Err(err)) => Err(err),
+            (Err(removal_err), Err(sync_err)) => Err(TsinkError::Other(format!(
+                "startup temporary cleanup failed: {removal_err}; directory synchronization failed: {sync_err}"
+            ))),
+        }
+    }
+}
+
 /// Shared owner for one local data-directory disk envelope.
 pub struct LocalDiskBudget {
     configured_root: PathBuf,
@@ -790,8 +856,42 @@ pub struct LocalDiskBudget {
     limits: LocalDiskLimits,
     state: Mutex<DiskAccountingState>,
     managed_file_mutation_lock: Mutex<()>,
+    #[cfg(test)]
+    managed_file_mutation_lock_attempts: AtomicU64,
     reservations_released: Condvar,
+    highest_reconciliation_request_ticket: AtomicU64,
+    completed_reconciliation_request_ticket: AtomicU64,
+    #[cfg(test)]
+    before_reconciliation_scan_hook: Mutex<Option<Arc<ReconciliationBarrierHookForTest>>>,
+    #[cfg(test)]
+    after_reconciliation_request_registration_hook:
+        Mutex<Option<Arc<ReconciliationBarrierHookForTest>>>,
     space_probe: Arc<dyn SpaceProbe>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct ReconciliationBarrierHookForTest {
+    entered: std::sync::Barrier,
+    release: std::sync::Barrier,
+}
+
+#[cfg(test)]
+impl ReconciliationBarrierHookForTest {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            entered: std::sync::Barrier::new(2),
+            release: std::sync::Barrier::new(2),
+        })
+    }
+
+    fn wait_until_entered(&self) {
+        self.entered.wait();
+    }
+
+    fn release(&self) {
+        self.release.wait();
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -906,7 +1006,15 @@ impl LocalDiskBudget {
             limits,
             state: Mutex::new(DiskAccountingState::default()),
             managed_file_mutation_lock: Mutex::new(()),
+            #[cfg(test)]
+            managed_file_mutation_lock_attempts: AtomicU64::new(0),
             reservations_released: Condvar::new(),
+            highest_reconciliation_request_ticket: AtomicU64::new(0),
+            completed_reconciliation_request_ticket: AtomicU64::new(0),
+            #[cfg(test)]
+            before_reconciliation_scan_hook: Mutex::new(None),
+            #[cfg(test)]
+            after_reconciliation_request_registration_hook: Mutex::new(None),
             space_probe,
         });
         budget.reconcile_with_memory_limit(memory_limit_bytes)?;
@@ -1088,7 +1196,7 @@ impl LocalDiskBudget {
     where
         F: FnOnce(&Path, &Path, &Path) -> Result<T>,
     {
-        let _mutation_guard = self.managed_file_mutation_lock.lock();
+        let _mutation_guard = self.lock_managed_file_mutation();
         let target = self.validate_strict_descendant_directory_entry(
             target,
             ManagedDirectoryEntryExpectation::DirectoryOrMissing,
@@ -1296,8 +1404,48 @@ impl LocalDiskBudget {
         }
     }
 
+    /// Runs one aggregate managed-filesystem mutation under the coordinator's serialization lock.
+    ///
+    /// The closure must use filesystem primitives directly or private `*_locked` helpers. Calling
+    /// a public managed mutation helper from the closure would attempt to reacquire this
+    /// non-reentrant lock.
+    pub(crate) fn with_serialized_managed_file_mutation<T>(
+        &self,
+        operation: impl FnOnce() -> T,
+    ) -> T {
+        let _mutation_guard = self.lock_managed_file_mutation();
+        operation()
+    }
+
+    fn lock_managed_file_mutation(&self) -> parking_lot::MutexGuard<'_, ()> {
+        #[cfg(test)]
+        self.managed_file_mutation_lock_attempts
+            .fetch_add(1, Ordering::SeqCst);
+        self.managed_file_mutation_lock.lock()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn managed_file_mutation_lock_attempts_for_test(&self) -> u64 {
+        self.managed_file_mutation_lock_attempts
+            .load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reservation_generation_for_test(&self) -> u64 {
+        self.state.lock().reservation_generation
+    }
+
+    pub(crate) fn reconciliation_memory_peak_bytes(&self) -> usize {
+        self.state.lock().completed_reconciliation_memory_peak_bytes
+    }
+
     /// Creates a managed directory tree and synchronizes every newly-created parent entry.
     pub fn create_dir_all_and_sync_parents(&self, directory: &Path) -> Result<()> {
+        let _mutation_guard = self.lock_managed_file_mutation();
+        self.create_dir_all_and_sync_parents_locked(directory)
+    }
+
+    fn create_dir_all_and_sync_parents_locked(&self, directory: &Path) -> Result<()> {
         let directory = resolve_path_allow_missing(directory)?;
         if !directory.starts_with(&self.root) {
             return Err(TsinkError::InvalidConfiguration(format!(
@@ -1404,6 +1552,7 @@ impl LocalDiskBudget {
         )
     }
 
+    #[allow(dead_code)] // Retained as the behavior-compatible preflight adapter for internal users.
     pub(crate) fn preflight_atomic_write_temps_with_startup_memory_limit(
         self: &Arc<Self>,
         target: &Path,
@@ -1451,7 +1600,7 @@ impl LocalDiskBudget {
         path: &Path,
         category: DiskCategory,
     ) -> Result<()> {
-        let _mutation_guard = self.managed_file_mutation_lock.lock();
+        let _mutation_guard = self.lock_managed_file_mutation();
         if !self.governs_entry(path)? {
             return Err(TsinkError::InvalidConfiguration(format!(
                 "managed file is outside local disk root {}: {}",
@@ -1486,6 +1635,7 @@ impl LocalDiskBudget {
 
     /// Removes generated atomic-write temporaries whose final target name is explicitly owned by
     /// the caller. The directory is not created when absent.
+    #[allow(dead_code)] // Retained as the behavior-compatible matching-target adapter.
     pub(crate) fn cleanup_atomic_write_temps_matching_targets_with_startup_memory_limit<F>(
         self: &Arc<Self>,
         directory: &Path,
@@ -1505,6 +1655,7 @@ impl LocalDiskBudget {
         )
     }
 
+    #[allow(dead_code)] // Retained as the behavior-compatible matching-target preflight adapter.
     pub(crate) fn preflight_atomic_write_temps_matching_targets_with_startup_memory_limit<F>(
         self: &Arc<Self>,
         directory: &Path,
@@ -1526,6 +1677,7 @@ impl LocalDiskBudget {
 
     /// Removes explicitly-owned temporary directory entries. Regular files and symlinks with an
     /// owned name are also safe to unlink; special file types are rejected.
+    #[allow(dead_code)] // Retained as the behavior-compatible temporary-directory adapter.
     pub(crate) fn cleanup_temporary_directories_matching_names_with_startup_memory_limit<F>(
         self: &Arc<Self>,
         directory: &Path,
@@ -1545,6 +1697,7 @@ impl LocalDiskBudget {
         )
     }
 
+    #[allow(dead_code)] // Retained as the behavior-compatible directory preflight adapter.
     pub(crate) fn preflight_temporary_directories_matching_names_with_startup_memory_limit<F>(
         self: &Arc<Self>,
         directory: &Path,
@@ -1605,20 +1758,126 @@ impl LocalDiskBudget {
     where
         F: Fn(&str) -> bool,
     {
-        let _mutation_guard = self.managed_file_mutation_lock.lock();
-        self.validate_managed_directory_path(directory)?;
-        if !crate::engine::fs_utils::path_exists_no_follow(directory)? {
+        let _mutation_guard = self.lock_managed_file_mutation();
+        let global_limit = max_directory_entries.saturating_add(max_recursive_entries);
+        let mut namespace_budget =
+            crate::engine::fs_utils::RecoveryNamespaceBudget::new(global_limit);
+        let Some(plan) = self.plan_owned_temporary_entries_matching_with_phase_limits_locked(
+            directory,
+            allow_directories,
+            owns_name,
+            operation,
+            &mut namespace_budget,
+            max_directory_entries,
+            max_recursive_entries,
+            max_recursive_depth,
+            memory_limit_bytes,
+            0,
+        )?
+        else {
             return Ok(0);
+        };
+        let root_count = u64::try_from(plan.root_count()).unwrap_or(u64::MAX);
+        if !execute {
+            return Ok(root_count);
         }
 
-        let mut directory_budget =
-            crate::engine::fs_utils::RecoveryNamespaceBudget::new(max_directory_entries);
+        let reservation =
+            self.reserve(DiskCategory::Temporary, 0, DiskReservationKind::Recovery)?;
+        let cleanup_result = plan.execute_locked();
+        let removed = cleanup_result.as_ref().copied().unwrap_or(0);
+        let settlement_result = reservation.commit(0, 0);
+        let reconciliation_result = self
+            .reconcile_when_idle_with_memory_limit(memory_limit_bytes)
+            .map(|_| ());
+        match (cleanup_result, settlement_result, reconciliation_result) {
+            (Ok(_), Ok(()), Ok(())) => Ok(removed),
+            (cleanup, settlement, reconciliation) => {
+                let mut errors = Vec::new();
+                if let Err(err) = cleanup {
+                    errors.push(format!("cleanup failed: {err}"));
+                }
+                if let Err(err) = settlement {
+                    errors.push(format!("disk settlement failed: {err}"));
+                }
+                if let Err(err) = reconciliation {
+                    errors.push(format!("disk reconciliation failed: {err}"));
+                }
+                Err(TsinkError::Other(format!(
+                    "{operation} for {} failed: {}",
+                    directory.display(),
+                    errors.join("; ")
+                )))
+            }
+        }
+    }
+
+    /// Plans one owned-temporary scan under caller-owned aggregate startup envelopes.
+    ///
+    /// The caller must hold `managed_file_mutation_lock` through planning and later execution.
+    /// `base_retained_bytes` is the exact modeled memory retained by earlier aggregate plans;
+    /// every transient and resulting path plan is admitted on top of that baseline.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn plan_owned_temporary_entries_matching_locked<F>(
+        &self,
+        directory: &Path,
+        allow_directories: bool,
+        owns_name: F,
+        operation: &str,
+        namespace_budget: &mut crate::engine::fs_utils::RecoveryNamespaceBudget,
+        memory_limit_bytes: usize,
+        base_retained_bytes: usize,
+    ) -> Result<Option<OwnedTemporaryEntryCleanupPlan>>
+    where
+        F: Fn(&str) -> bool,
+    {
+        self.plan_owned_temporary_entries_matching_with_phase_limits_locked(
+            directory,
+            allow_directories,
+            owns_name,
+            operation,
+            namespace_budget,
+            usize::MAX,
+            usize::MAX,
+            crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_DEPTH,
+            memory_limit_bytes,
+            base_retained_bytes,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn plan_owned_temporary_entries_matching_with_phase_limits_locked<F>(
+        &self,
+        directory: &Path,
+        allow_directories: bool,
+        owns_name: F,
+        operation: &str,
+        namespace_budget: &mut crate::engine::fs_utils::RecoveryNamespaceBudget,
+        max_directory_entries: usize,
+        max_recursive_entries: usize,
+        max_recursive_depth: u32,
+        memory_limit_bytes: usize,
+        base_retained_bytes: usize,
+    ) -> Result<Option<OwnedTemporaryEntryCleanupPlan>>
+    where
+        F: Fn(&str) -> bool,
+    {
+        self.validate_managed_directory_path(directory)?;
+        if !crate::engine::fs_utils::path_exists_no_follow(directory)? {
+            return Ok(None);
+        }
+        let directory_identity =
+            crate::engine::fs_utils::capture_plain_directory_identity(directory, operation)?;
+
         let mut owned_directories = Vec::new();
         let mut owned_file_like_entries = Vec::new();
+        let retained_paths =
+            modeled_path_vectors_bytes(&owned_directories, &owned_file_like_entries)?;
         admit_startup_memory(
             memory_limit_bytes,
-            modeled_path_vectors_bytes(&owned_directories, &owned_file_like_entries)?
-                .checked_add(std::mem::size_of::<fs::ReadDir>())
+            base_retained_bytes
+                .checked_add(retained_paths)
+                .and_then(|bytes| bytes.checked_add(std::mem::size_of::<fs::ReadDir>()))
                 .ok_or_else(|| {
                     TsinkError::Other(format!("{operation} directory memory model overflow"))
                 })?,
@@ -1627,8 +1886,19 @@ impl LocalDiskBudget {
             path: directory.to_path_buf(),
             source,
         })?;
+        let directory_entry_start = namespace_budget.observed_entries();
         for entry in entries {
-            directory_budget.observe_entry(directory, operation)?;
+            if namespace_budget
+                .observed_entries()
+                .saturating_sub(directory_entry_start)
+                == max_directory_entries
+            {
+                return Err(TsinkError::DataCorruption(format!(
+                    "{operation} exceeds its {max_directory_entries}-entry global work bound: {}",
+                    directory.display()
+                )));
+            }
+            namespace_budget.observe_entry(directory, operation)?;
             let entry = entry.map_err(|source| TsinkError::IoWithPath {
                 path: directory.to_path_buf(),
                 source,
@@ -1644,17 +1914,18 @@ impl LocalDiskBudget {
                 .ok_or_else(|| {
                     TsinkError::Other(format!("{operation} path-size model overflow"))
                 })?;
-            let transient_required =
-                modeled_path_vectors_bytes(&owned_directories, &owned_file_like_entries)?
-                    .checked_add(std::mem::size_of::<fs::ReadDir>())
-                    .and_then(|bytes| bytes.checked_add(std::mem::size_of::<fs::DirEntry>()))
-                    .and_then(|bytes| bytes.checked_add(std::mem::size_of::<std::ffi::OsString>()))
-                    .and_then(|bytes| bytes.checked_add(component_bytes))
-                    .and_then(|bytes| bytes.checked_add(std::mem::size_of::<PathBuf>()))
-                    .and_then(|bytes| bytes.checked_add(anticipated_path_bytes))
-                    .ok_or_else(|| {
-                        TsinkError::Other(format!("{operation} memory model overflow"))
-                    })?;
+            let transient_required = base_retained_bytes
+                .checked_add(modeled_path_vectors_bytes(
+                    &owned_directories,
+                    &owned_file_like_entries,
+                )?)
+                .and_then(|bytes| bytes.checked_add(std::mem::size_of::<fs::ReadDir>()))
+                .and_then(|bytes| bytes.checked_add(std::mem::size_of::<fs::DirEntry>()))
+                .and_then(|bytes| bytes.checked_add(std::mem::size_of::<std::ffi::OsString>()))
+                .and_then(|bytes| bytes.checked_add(component_bytes))
+                .and_then(|bytes| bytes.checked_add(std::mem::size_of::<PathBuf>()))
+                .and_then(|bytes| bytes.checked_add(anticipated_path_bytes))
+                .ok_or_else(|| TsinkError::Other(format!("{operation} memory model overflow")))?;
             admit_startup_memory(memory_limit_bytes, transient_required)?;
             let Some(entry_name) = entry_name.to_str() else {
                 continue;
@@ -1682,6 +1953,7 @@ impl LocalDiskBudget {
                     entry_path,
                     &owned_file_like_entries,
                     memory_limit_bytes,
+                    base_retained_bytes,
                     operation,
                 )?;
             } else {
@@ -1690,75 +1962,76 @@ impl LocalDiskBudget {
                     entry_path,
                     &owned_directories,
                     memory_limit_bytes,
+                    base_retained_bytes,
                     operation,
                 )?;
             }
         }
         if owned_directories.is_empty() && owned_file_like_entries.is_empty() {
-            return Ok(0);
+            return Ok(None);
         }
 
         let retained_root_bytes =
             modeled_path_vectors_bytes(&owned_directories, &owned_file_like_entries)?;
-        let mut recursive_budget =
-            crate::engine::fs_utils::RecoveryNamespaceBudget::new(max_recursive_entries);
+        let recursive_base = base_retained_bytes
+            .checked_add(retained_root_bytes)
+            .ok_or_else(|| TsinkError::Other(format!("{operation} memory model overflow")))?;
+        let recursive_entry_start = namespace_budget.observed_entries();
         let removal_plan = crate::engine::fs_utils::validate_recursive_namespace_with_admission(
             &owned_directories,
-            &mut recursive_budget,
+            namespace_budget,
             max_recursive_depth,
             operation,
-            retained_root_bytes,
+            recursive_base,
             |required| admit_startup_memory(memory_limit_bytes, required),
         )?
         .include_file_like_roots_with_admission(
             &owned_file_like_entries,
-            retained_root_bytes,
+            recursive_base,
             |required| admit_startup_memory(memory_limit_bytes, required),
         )?;
-
-        if !execute {
-            return Ok(
-                u64::try_from(owned_directories.len() + owned_file_like_entries.len())
-                    .unwrap_or(u64::MAX),
-            );
+        if namespace_budget
+            .observed_entries()
+            .saturating_sub(recursive_entry_start)
+            > max_recursive_entries
+        {
+            return Err(TsinkError::DataCorruption(format!(
+                "{operation} exceeds its {max_recursive_entries}-entry global work bound: {}",
+                directory.display()
+            )));
         }
 
-        let reservation =
-            self.reserve(DiskCategory::Temporary, 0, DiskReservationKind::Recovery)?;
-        let removal_result = removal_plan.remove();
-        let mut cleanup_error = removal_result.as_ref().err().map(ToString::to_string);
-        if let Err(err) = crate::engine::fs_utils::sync_dir(directory) {
-            cleanup_error.get_or_insert_with(|| err.to_string());
+        if !crate::engine::fs_utils::path_matches_plain_directory_identity(
+            directory,
+            &directory_identity,
+        )? {
+            return Err(TsinkError::DataCorruption(format!(
+                "refusing {operation} because the scanned directory identity changed: {}",
+                directory.display()
+            )));
         }
-        let removed = removal_result
-            .as_ref()
-            .ok()
-            .map(|removed| u64::try_from(*removed).unwrap_or(u64::MAX))
-            .unwrap_or(0);
-        let settlement_result = reservation.commit(0, 0);
-        let reconciliation_result = self
-            .reconcile_when_idle_with_memory_limit(memory_limit_bytes)
-            .map(|_| ());
-        match (cleanup_error, settlement_result, reconciliation_result) {
-            (None, Ok(()), Ok(())) => Ok(removed),
-            (cleanup_error, settlement, reconciliation) => {
-                let mut errors = Vec::new();
-                if let Some(err) = cleanup_error {
-                    errors.push(format!("cleanup failed: {err}"));
-                }
-                if let Err(err) = settlement {
-                    errors.push(format!("disk settlement failed: {err}"));
-                }
-                if let Err(err) = reconciliation {
-                    errors.push(format!("disk reconciliation failed: {err}"));
-                }
-                Err(TsinkError::Other(format!(
-                    "{operation} for {} failed: {}",
-                    directory.display(),
-                    errors.join("; ")
-                )))
-            }
-        }
+        let anticipated_directory_bytes = directory.as_os_str().as_encoded_bytes().len();
+        let final_allocation_peak = recursive_base
+            .checked_add(removal_plan.modeled_heap_bytes()?)
+            .and_then(|bytes| bytes.checked_add(anticipated_directory_bytes))
+            .and_then(|bytes| {
+                bytes.checked_add(std::mem::size_of::<OwnedTemporaryEntryCleanupPlan>())
+            })
+            .ok_or_else(|| TsinkError::Other(format!("{operation} memory model overflow")))?;
+        admit_startup_memory(memory_limit_bytes, final_allocation_peak)?;
+        let plan = OwnedTemporaryEntryCleanupPlan {
+            directory: directory.to_path_buf(),
+            directory_identity,
+            removal_plan,
+        };
+        let actual_retained = base_retained_bytes
+            .checked_add(plan.modeled_heap_bytes()?)
+            .and_then(|bytes| {
+                bytes.checked_add(std::mem::size_of::<OwnedTemporaryEntryCleanupPlan>())
+            })
+            .ok_or_else(|| TsinkError::Other(format!("{operation} memory model overflow")))?;
+        admit_startup_memory(memory_limit_bytes, actual_retained)?;
+        Ok(Some(plan))
     }
 
     /// Stages a group of managed replacements under one growth reservation and coordinator lock.
@@ -1853,7 +2126,7 @@ impl LocalDiskBudget {
     where
         F: FnOnce(&mut StagedManagedFileReplacements) -> Result<T>,
     {
-        let _mutation_guard = self.managed_file_mutation_lock.lock();
+        let _mutation_guard = self.lock_managed_file_mutation();
         let mut prepared = Vec::with_capacity(replacements.len());
         let mut distinct_targets = BTreeSet::new();
         let mut distinct_parents = BTreeSet::new();
@@ -2204,14 +2477,14 @@ impl LocalDiskBudget {
     where
         F: FnOnce(&mut dyn Write) -> Result<()>,
     {
-        let _mutation_guard = self.managed_file_mutation_lock.lock();
+        let _mutation_guard = self.lock_managed_file_mutation();
         let parent = path.parent().ok_or_else(|| {
             TsinkError::InvalidConfiguration(format!(
                 "managed cleanup file has no parent directory: {}",
                 path.display()
             ))
         })?;
-        self.create_dir_all_and_sync_parents(parent)?;
+        self.create_dir_all_and_sync_parents_locked(parent)?;
         self.validate_managed_file_path(path)?;
         let previous_bytes = fs::metadata(path)
             .map_err(|source| TsinkError::IoWithPath {
@@ -2280,14 +2553,14 @@ impl LocalDiskBudget {
         kind: DiskReservationKind,
         require_non_growing: bool,
     ) -> Result<()> {
-        let _mutation_guard = self.managed_file_mutation_lock.lock();
+        let _mutation_guard = self.lock_managed_file_mutation();
         let parent = path.parent().ok_or_else(|| {
             TsinkError::InvalidConfiguration(format!(
                 "managed file has no parent directory: {}",
                 path.display()
             ))
         })?;
-        self.create_dir_all_and_sync_parents(parent)?;
+        self.create_dir_all_and_sync_parents_locked(parent)?;
         self.validate_managed_file_path(path)?;
         let previous = match fs::symlink_metadata(path) {
             Ok(_) => Some(fs::read(path).map_err(|source| TsinkError::IoWithPath {
@@ -2409,14 +2682,14 @@ impl LocalDiskBudget {
         category: DiskCategory,
         kind: DiskReservationKind,
     ) -> Result<()> {
-        let _mutation_guard = self.managed_file_mutation_lock.lock();
+        let _mutation_guard = self.lock_managed_file_mutation();
         let parent = path.parent().ok_or_else(|| {
             TsinkError::InvalidConfiguration(format!(
                 "managed append file has no parent directory: {}",
                 path.display()
             ))
         })?;
-        self.create_dir_all_and_sync_parents(parent)?;
+        self.create_dir_all_and_sync_parents_locked(parent)?;
         self.validate_managed_file_path(path)?;
         let existed = fs::symlink_metadata(path).is_ok();
         let initial_len = if existed {
@@ -2615,6 +2888,39 @@ impl LocalDiskBudget {
         )
     }
 
+    /// Runs one aggregate mutation under an exact terminal reconciliation and surfaces every
+    /// terminal accounting failure, including a failed scan after the filesystem operation
+    /// returned success.
+    ///
+    /// This is the strict counterpart to the committed-result-preserving helpers above. It is
+    /// intended for idempotent operations whose established contract treats reconciliation as
+    /// part of successful completion. The closure must not use nested budget helpers that wait
+    /// for idle reconciliation; all covered mutations rely on this outer reservation instead.
+    pub(crate) fn with_strict_reconciled_reservation<T, F>(
+        self: &Arc<Self>,
+        category: DiskCategory,
+        peak_bytes: u64,
+        kind: DiskReservationKind,
+        operation: F,
+    ) -> Result<T>
+    where
+        F: FnOnce() -> Result<T>,
+    {
+        let reservation = self.reserve(category, peak_bytes, kind)?;
+        let guard = ReconciledOperationReservation {
+            reservation: Some(reservation),
+        };
+        let operation_result = operation();
+        let reconciliation_result = guard.finish();
+        match (operation_result, reconciliation_result) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(err), Ok(())) | (Ok(_), Err(err)) => Err(err),
+            (Err(operation_err), Err(reconciliation_err)) => Err(TsinkError::Other(format!(
+                "disk operation failed: {operation_err}; disk reconciliation failed: {reconciliation_err}"
+            ))),
+        }
+    }
+
     fn with_reconciled_reservation<T, F>(
         self: &Arc<Self>,
         category: DiskCategory,
@@ -2699,6 +3005,102 @@ impl LocalDiskBudget {
         })
     }
 
+    /// Registers reconciliation work before the caller can block on the accounting mutex.
+    ///
+    /// Once the ticket space is exhausted, new callers deliberately stop coalescing and perform
+    /// their own scans. This keeps overflow conservative: saturation can only add work, never let
+    /// a request reuse a scan that did not cover it.
+    fn register_reconciliation_request(&self) -> Option<u64> {
+        self.highest_reconciliation_request_ticket
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |ticket| {
+                ticket.checked_add(1)
+            })
+            .ok()
+            .and_then(|previous| previous.checked_add(1))
+    }
+
+    fn reconciliation_request_is_completed(
+        &self,
+        request_ticket: Option<u64>,
+        state: &DiskAccountingState,
+        memory_limit_bytes: usize,
+    ) -> bool {
+        request_ticket.is_some_and(|ticket| {
+            self.completed_reconciliation_request_ticket
+                .load(Ordering::Acquire)
+                >= ticket
+                && state.completed_reconciliation_reservation_generation
+                    == state.reservation_generation
+                && state.completed_reconciliation_memory_peak_bytes <= memory_limit_bytes
+        })
+    }
+
+    /// Captures the requests that a scan beginning now can cover.
+    fn reconciliation_scan_coverage_ticket(&self) -> u64 {
+        self.highest_reconciliation_request_ticket
+            .load(Ordering::Acquire)
+    }
+
+    /// Publishes coverage only after exact scanned totals have been installed successfully.
+    fn publish_reconciliation_scan_coverage(
+        &self,
+        state: &mut DiskAccountingState,
+        covered_ticket: u64,
+        memory_peak_bytes: usize,
+    ) {
+        state.completed_reconciliation_reservation_generation = state.reservation_generation;
+        state.completed_reconciliation_memory_peak_bytes = memory_peak_bytes;
+        self.completed_reconciliation_request_ticket
+            .fetch_max(covered_ticket, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn pause_next_reconciliation_scan_for_test(&self) -> Arc<ReconciliationBarrierHookForTest> {
+        let hook = ReconciliationBarrierHookForTest::new();
+        let mut pending = self.before_reconciliation_scan_hook.lock();
+        assert!(
+            pending.is_none(),
+            "only one reconciliation scan hook may be pending"
+        );
+        *pending = Some(Arc::clone(&hook));
+        hook
+    }
+
+    #[cfg(test)]
+    fn pause_next_reconciliation_request_after_registration_for_test(
+        &self,
+    ) -> Arc<ReconciliationBarrierHookForTest> {
+        let hook = ReconciliationBarrierHookForTest::new();
+        let mut pending = self.after_reconciliation_request_registration_hook.lock();
+        assert!(
+            pending.is_none(),
+            "only one reconciliation request hook may be pending"
+        );
+        *pending = Some(Arc::clone(&hook));
+        hook
+    }
+
+    #[cfg(test)]
+    fn run_after_reconciliation_request_registration_hook_for_test(&self) {
+        let hook = self
+            .after_reconciliation_request_registration_hook
+            .lock()
+            .take();
+        if let Some(hook) = hook {
+            hook.entered.wait();
+            hook.release.wait();
+        }
+    }
+
+    #[cfg(test)]
+    fn run_before_reconciliation_scan_hook_for_test(&self) {
+        let hook = self.before_reconciliation_scan_hook.lock().take();
+        if let Some(hook) = hook {
+            hook.entered.wait();
+            hook.release.wait();
+        }
+    }
+
     /// Re-scans the root without following symlinks and replaces reconciled committed totals.
     ///
     /// Unknown and ambiguous files are counted under [`DiskCategory::Unknown`] and are never
@@ -2718,10 +3120,15 @@ impl LocalDiskBudget {
                 state.active_reservations
             )));
         }
-        let categories = scan_tree_with_memory_limit(&self.root, memory_limit_bytes)?;
+        let covered_ticket = self.reconciliation_scan_coverage_ticket();
+        #[cfg(test)]
+        self.run_before_reconciliation_scan_hook_for_test();
+        let (categories, memory_peak_bytes) =
+            scan_tree_with_memory_limit_and_peak(&self.root, memory_limit_bytes)?;
         checked_category_total(&categories)?;
         state.committed_by_category = categories;
         state.reconciliations_total = state.reconciliations_total.saturating_add(1);
+        self.publish_reconciliation_scan_coverage(&mut state, covered_ticket, memory_peak_bytes);
         drop(state);
         Ok(self.snapshot())
     }
@@ -2739,6 +3146,9 @@ impl LocalDiskBudget {
         &self,
         memory_limit_bytes: usize,
     ) -> Result<LocalDiskBudgetSnapshot> {
+        let request_ticket = self.register_reconciliation_request();
+        #[cfg(test)]
+        self.run_after_reconciliation_request_registration_hook_for_test();
         let mut state = self.state.lock();
         state.reconciliation_waiters =
             state.reconciliation_waiters.checked_add(1).ok_or_else(|| {
@@ -2748,14 +3158,33 @@ impl LocalDiskBudget {
             self.reservations_released.wait(&mut state);
         }
 
-        let categories_result = scan_tree_with_memory_limit(&self.root, memory_limit_bytes);
-        let categories_result = categories_result.and_then(|categories| {
+        if self.reconciliation_request_is_completed(request_ticket, &state, memory_limit_bytes) {
+            state.reconciliation_waiters = state
+                .reconciliation_waiters
+                .checked_sub(1)
+                .expect("local disk reconciliation waiter counter underflow");
+            drop(state);
+            self.reservations_released.notify_all();
+            return Ok(self.snapshot());
+        }
+
+        let covered_ticket = self.reconciliation_scan_coverage_ticket();
+        #[cfg(test)]
+        self.run_before_reconciliation_scan_hook_for_test();
+        let categories_result =
+            scan_tree_with_memory_limit_and_peak(&self.root, memory_limit_bytes);
+        let categories_result = categories_result.and_then(|(categories, memory_peak_bytes)| {
             checked_category_total(&categories)?;
-            Ok(categories)
+            Ok((categories, memory_peak_bytes))
         });
-        if let Ok(categories) = categories_result.as_ref() {
+        if let Ok((categories, memory_peak_bytes)) = categories_result.as_ref() {
             state.committed_by_category = categories.clone();
             state.reconciliations_total = state.reconciliations_total.saturating_add(1);
+            self.publish_reconciliation_scan_coverage(
+                &mut state,
+                covered_ticket,
+                *memory_peak_bytes,
+            );
         }
         state.reconciliation_waiters = state
             .reconciliation_waiters
@@ -2929,25 +3358,68 @@ impl LocalDiskBudget {
         kind: DiskReservationKind,
         reserved_bytes: u64,
     ) -> Result<()> {
+        // The covered filesystem mutation is complete before this ticket is registered. The
+        // still-live reservation prevents any reconciliation from starting until it is released
+        // below, so every later published coverage ticket necessarily observes that mutation.
+        let request_ticket = self.register_reconciliation_request();
         let mut state = self.state.lock();
-        state.reconciliation_waiters =
-            state.reconciliation_waiters.checked_add(1).ok_or_else(|| {
-                TsinkError::Other("local disk reconciliation waiter counter overflow".to_string())
-            })?;
+        let Some(reconciliation_waiters) = state.reconciliation_waiters.checked_add(1) else {
+            // The operation has already mutated the filesystem, so consuming the reservation
+            // without either scanning or installing a conservative charge would under-account a
+            // possible publication. Release the reservation and retain its complete admitted peak
+            // before returning the counter error. A later successful reconciliation removes any
+            // overcharge.
+            let became_idle =
+                state.release_reservation(reserved_bytes, kind.uses_maintenance_capacity());
+            let fallback_accounting_result =
+                state.apply_committed_delta(category, reserved_bytes, 0);
+            drop(state);
+            if became_idle {
+                self.reservations_released.notify_all();
+            }
+            let overflow_error =
+                TsinkError::Other("local disk reconciliation waiter counter overflow".to_string());
+            return match fallback_accounting_result {
+                Ok(()) => Err(overflow_error),
+                Err(accounting_error) => Err(TsinkError::Other(format!(
+                    "{overflow_error}; conservative fallback accounting failed: {accounting_error}"
+                ))),
+            };
+        };
+        state.reconciliation_waiters = reconciliation_waiters;
 
         state.release_reservation(reserved_bytes, kind.uses_maintenance_capacity());
         while state.active_reservations > 0 {
             self.reservations_released.wait(&mut state);
         }
 
-        let categories_result = scan_tree(&self.root).and_then(|categories| {
-            checked_category_total(&categories)?;
-            Ok(categories)
-        });
+        if self.reconciliation_request_is_completed(request_ticket, &state, usize::MAX) {
+            state.reconciliation_waiters = state
+                .reconciliation_waiters
+                .checked_sub(1)
+                .expect("local disk reconciliation waiter counter underflow");
+            drop(state);
+            self.reservations_released.notify_all();
+            return Ok(());
+        }
+
+        let covered_ticket = self.reconciliation_scan_coverage_ticket();
+        #[cfg(test)]
+        self.run_before_reconciliation_scan_hook_for_test();
+        let categories_result = scan_tree_with_memory_limit_and_peak(&self.root, usize::MAX)
+            .and_then(|(categories, memory_peak_bytes)| {
+                checked_category_total(&categories)?;
+                Ok((categories, memory_peak_bytes))
+            });
         let fallback_accounting_result = match categories_result.as_ref() {
-            Ok(categories) => {
+            Ok((categories, memory_peak_bytes)) => {
                 state.committed_by_category = categories.clone();
                 state.reconciliations_total = state.reconciliations_total.saturating_add(1);
+                self.publish_reconciliation_scan_coverage(
+                    &mut state,
+                    covered_ticket,
+                    *memory_peak_bytes,
+                );
                 Ok(())
             }
             Err(_) => {
@@ -3343,23 +3815,23 @@ fn scan_tree_with_memory_limit(
     root: &Path,
     memory_limit_bytes: usize,
 ) -> Result<BTreeMap<DiskCategory, u64>> {
-    scan_path_with_memory_limit(root, root, memory_limit_bytes)
+    scan_tree_with_memory_limit_and_peak(root, memory_limit_bytes).map(|(categories, _)| categories)
 }
 
-fn scan_path_with_memory_limit(
+fn scan_tree_with_memory_limit_and_peak(
     root: &Path,
-    path: &Path,
     memory_limit_bytes: usize,
-) -> Result<BTreeMap<DiskCategory, u64>> {
-    scan_path_with_namespace_limits(
+) -> Result<(BTreeMap<DiskCategory, u64>, usize)> {
+    scan_path_with_namespace_limits_and_peak(
         root,
-        path,
+        root,
         crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES,
         crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_DEPTH,
         memory_limit_bytes,
     )
 }
 
+#[cfg(test)]
 fn scan_path_with_namespace_limits(
     root: &Path,
     path: &Path,
@@ -3367,9 +3839,23 @@ fn scan_path_with_namespace_limits(
     max_depth: u32,
     memory_limit_bytes: usize,
 ) -> Result<BTreeMap<DiskCategory, u64>> {
+    scan_path_with_namespace_limits_and_peak(root, path, max_entries, max_depth, memory_limit_bytes)
+        .map(|(categories, _)| categories)
+}
+
+fn scan_path_with_namespace_limits_and_peak(
+    root: &Path,
+    path: &Path,
+    max_entries: usize,
+    max_depth: u32,
+    memory_limit_bytes: usize,
+) -> Result<(BTreeMap<DiskCategory, u64>, usize)> {
+    let mut memory_peak_bytes = 0usize;
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((BTreeMap::new(), memory_peak_bytes));
+        }
         Err(source) => {
             return Err(TsinkError::IoWithPath {
                 path: path.to_path_buf(),
@@ -3378,16 +3864,24 @@ fn scan_path_with_namespace_limits(
         }
     };
     if metadata.is_file() || crate::engine::fs_utils::is_link_or_reparse_point(&metadata) {
-        admit_startup_memory(memory_limit_bytes, DISK_RECONCILIATION_FIXED_BYTES)?;
+        admit_reconciliation_memory(
+            memory_limit_bytes,
+            DISK_RECONCILIATION_FIXED_BYTES,
+            &mut memory_peak_bytes,
+        )?;
         let mut categories = BTreeMap::new();
         categories.insert(classify_path(root, path), metadata.len());
-        return Ok(categories);
+        return Ok((categories, memory_peak_bytes));
     }
     if !metadata.is_dir() {
-        return Ok(BTreeMap::new());
+        return Ok((BTreeMap::new(), memory_peak_bytes));
     }
 
-    admit_startup_memory(memory_limit_bytes, DISK_RECONCILIATION_FIXED_BYTES)?;
+    admit_reconciliation_memory(
+        memory_limit_bytes,
+        DISK_RECONCILIATION_FIXED_BYTES,
+        &mut memory_peak_bytes,
+    )?;
     let mut totals = [0u64; DISK_CATEGORY_COUNT];
     let mut observed_entries = 0usize;
     scan_directory_streaming(
@@ -3400,6 +3894,7 @@ fn scan_path_with_namespace_limits(
         memory_limit_bytes,
         &mut observed_entries,
         &mut totals,
+        &mut memory_peak_bytes,
     )?;
     let mut categories = BTreeMap::new();
     for (category, total) in DISK_CATEGORIES.into_iter().zip(totals) {
@@ -3407,7 +3902,7 @@ fn scan_path_with_namespace_limits(
             categories.insert(category, total);
         }
     }
-    Ok(categories)
+    Ok((categories, memory_peak_bytes))
 }
 
 const DISK_CATEGORIES: [DiskCategory; 12] = [
@@ -3445,6 +3940,7 @@ fn scan_directory_streaming(
     memory_limit_bytes: usize,
     observed_entries: &mut usize,
     totals: &mut [u64; DISK_CATEGORY_COUNT],
+    memory_peak_bytes: &mut usize,
 ) -> Result<()> {
     let active_depth = usize::try_from(depth)
         .unwrap_or(usize::MAX)
@@ -3467,7 +3963,7 @@ fn scan_directory_streaming(
         .ok_or_else(|| {
             TsinkError::Other("local disk reconciliation memory model overflow".to_string())
         })?;
-    admit_startup_memory(memory_limit_bytes, directory_required)?;
+    admit_reconciliation_memory(memory_limit_bytes, directory_required, memory_peak_bytes)?;
     let read_dir = fs::read_dir(directory).map_err(|source| TsinkError::IoWithPath {
         path: directory.to_path_buf(),
         source,
@@ -3513,7 +4009,7 @@ fn scan_directory_streaming(
             .ok_or_else(|| {
                 TsinkError::Other("local disk reconciliation memory model overflow".to_string())
             })?;
-        admit_startup_memory(memory_limit_bytes, required)?;
+        admit_reconciliation_memory(memory_limit_bytes, required, memory_peak_bytes)?;
 
         let path = directory.join(&file_name);
         let metadata = fs::symlink_metadata(&path).map_err(|source| TsinkError::IoWithPath {
@@ -3552,6 +4048,7 @@ fn scan_directory_streaming(
                 memory_limit_bytes,
                 observed_entries,
                 totals,
+                memory_peak_bytes,
             )?;
         } else if file_type.is_file()
             || crate::engine::fs_utils::is_link_or_reparse_point(&metadata)
@@ -3567,6 +4064,15 @@ fn scan_directory_streaming(
         }
     }
     Ok(())
+}
+
+fn admit_reconciliation_memory(
+    memory_limit_bytes: usize,
+    required: usize,
+    memory_peak_bytes: &mut usize,
+) -> Result<()> {
+    *memory_peak_bytes = (*memory_peak_bytes).max(required);
+    admit_startup_memory(memory_limit_bytes, required)
 }
 
 fn disk_category_index(category: DiskCategory) -> usize {
@@ -3624,6 +4130,7 @@ fn push_modeled_cleanup_path(
     path: PathBuf,
     other: &Vec<PathBuf>,
     memory_limit_bytes: usize,
+    base_retained_bytes: usize,
     operation: &str,
 ) -> Result<()> {
     let prospective_capacity = if target.len() == target.capacity() {
@@ -3647,10 +4154,14 @@ fn push_modeled_cleanup_path(
                     .checked_add(retained.capacity())
                     .ok_or_else(|| TsinkError::Other(format!("{operation} retained-path overflow")))
             })?;
-    let prospective = 2usize
-        .checked_mul(std::mem::size_of::<Vec<PathBuf>>())
-        .and_then(|bytes| bytes.checked_add(prospective_storage))
-        .and_then(|bytes| bytes.checked_add(prospective_paths))
+    let prospective = base_retained_bytes
+        .checked_add(
+            2usize
+                .checked_mul(std::mem::size_of::<Vec<PathBuf>>())
+                .and_then(|bytes| bytes.checked_add(prospective_storage))
+                .and_then(|bytes| bytes.checked_add(prospective_paths))
+                .ok_or_else(|| TsinkError::Other(format!("{operation} memory model overflow")))?,
+        )
         .ok_or_else(|| TsinkError::Other(format!("{operation} memory model overflow")))?;
     admit_startup_memory(memory_limit_bytes, prospective)?;
     if target.len() == target.capacity() {
@@ -3663,11 +4174,13 @@ fn push_modeled_cleanup_path(
     target.push(path);
     admit_startup_memory(
         memory_limit_bytes,
-        modeled_path_vectors_bytes(target, other)?,
+        base_retained_bytes
+            .checked_add(modeled_path_vectors_bytes(target, other)?)
+            .ok_or_else(|| TsinkError::Other(format!("{operation} memory model overflow")))?,
     )
 }
 
-fn atomic_write_temp_target_name(file_name: &str) -> Option<&str> {
+pub(crate) fn atomic_write_temp_target_name(file_name: &str) -> Option<&str> {
     let generated = file_name.strip_prefix('.')?;
     let (target, suffix) = generated.rsplit_once(".tmp-")?;
     if target.is_empty() {
@@ -3689,6 +4202,21 @@ fn is_exact_lower_hex(value: &str, len: usize) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_segment_catalog_generation_file(relative: &Path, file_name: &str) -> bool {
+    if relative
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|component| component.to_str())
+        != Some("segment_catalog.d")
+    {
+        return false;
+    }
+    file_name
+        .strip_prefix("catalog-")
+        .and_then(|name| name.strip_suffix(".bin"))
+        .is_some_and(|generation| is_exact_lower_hex(generation, 16))
 }
 
 fn classify_path(root: &Path, path: &Path) -> DiskCategory {
@@ -3726,6 +4254,8 @@ fn classify_path(root: &Path, path: &Path) -> DiskCategory {
         || file_name.eq_ignore_ascii_case("series_index.delta.bin")
         || file_name.eq_ignore_ascii_case("series_index.catalog.json")
         || file_name.eq_ignore_ascii_case("segment_catalog.json")
+        || file_name == "segment_catalog.current"
+        || is_segment_catalog_generation_file(relative, file_name)
         || file_name.eq_ignore_ascii_case(
             crate::engine::storage_engine::data_directory_manifest::
                 DATA_DIRECTORY_MANIFEST_FILE_NAME,
@@ -4098,6 +4628,79 @@ mod tests {
         assert_eq!(state.reserved_bytes, u64::MAX);
         assert_eq!(state.maintenance_reserved_bytes, 0);
         assert_eq!(state.active_reservations, 1);
+    }
+
+    #[test]
+    fn reservation_generation_rejects_overflow_without_partial_mutation() {
+        let mut state = DiskAccountingState {
+            reservation_generation: u64::MAX,
+            ..DiskAccountingState::default()
+        };
+
+        assert!(state.admit_reservation(1, false).is_err());
+        assert_eq!(state.reserved_bytes, 0);
+        assert_eq!(state.maintenance_reserved_bytes, 0);
+        assert_eq!(state.active_reservations, 0);
+        assert_eq!(state.reservation_generation, u64::MAX);
+    }
+
+    #[test]
+    fn reconciled_reservation_waiter_overflow_releases_with_conservative_accounting() {
+        let temp = TempDir::new().unwrap();
+        let budget = budget_with_space(temp.path(), LocalDiskLimits::default(), 1_000);
+        let reservation = budget
+            .reserve(DiskCategory::Unknown, 7, DiskReservationKind::Maintenance)
+            .unwrap();
+        budget.state.lock().reconciliation_waiters = u64::MAX;
+
+        let error = reservation
+            .finish_by_reconciling()
+            .expect_err("a saturated waiter counter must reject reconciliation");
+
+        assert!(error
+            .to_string()
+            .contains("local disk reconciliation waiter counter overflow"));
+        let after_error = budget.snapshot();
+        assert_eq!(after_error.accounted_bytes, 7);
+        assert_eq!(after_error.active_reservations, 0);
+        assert_eq!(after_error.reserved_bytes, 0);
+        assert_eq!(after_error.maintenance_reserved_bytes, 0);
+
+        // The saturated value is fault injection rather than a reachable live waiter set. Restore
+        // it to prove that the failed finish left no reservation capable of blocking later work.
+        budget.state.lock().reconciliation_waiters = 0;
+        fs::write(temp.path().join("surviving.bin"), b"x").unwrap();
+        let reconciled = budget.reconcile_when_idle().unwrap();
+        assert_eq!(reconciled.accounted_bytes, 1);
+        assert_eq!(reconciled.active_reservations, 0);
+        assert_eq!(reconciled.reserved_bytes, 0);
+    }
+
+    #[test]
+    fn saturated_reconciliation_tickets_disable_reuse_without_wrapping() {
+        let temp = TempDir::new().unwrap();
+        let budget = budget_with_space(temp.path(), LocalDiskLimits::default(), 1_000);
+        budget
+            .highest_reconciliation_request_ticket
+            .store(u64::MAX, Ordering::Release);
+        budget
+            .completed_reconciliation_request_ticket
+            .store(u64::MAX, Ordering::Release);
+
+        assert_eq!(
+            budget.reconcile_when_idle().unwrap().reconciliations_total,
+            2
+        );
+        assert_eq!(
+            budget.reconcile_when_idle().unwrap().reconciliations_total,
+            3
+        );
+        assert_eq!(
+            budget
+                .highest_reconciliation_request_ticket
+                .load(Ordering::Acquire),
+            u64::MAX
+        );
     }
 
     #[test]
@@ -5583,6 +6186,189 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_idle_reconciliations_share_one_terminal_scan() {
+        let temp = TempDir::new().unwrap();
+        let budget = budget_with_space(temp.path(), LocalDiskLimits::default(), 1_000);
+        fs::write(temp.path().join("externally-added.bin"), b"external").unwrap();
+        let reservation = budget
+            .reserve(DiskCategory::Wal, 1, DiskReservationKind::Growth)
+            .unwrap();
+        let start = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let waiting_budget = Arc::clone(&budget);
+            let start = Arc::clone(&start);
+            workers.push(std::thread::spawn(move || {
+                start.wait();
+                waiting_budget.reconcile_when_idle()
+            }));
+        }
+
+        start.wait();
+        while budget.state.lock().reconciliation_waiters < 2 {
+            std::thread::yield_now();
+        }
+        drop(reservation);
+
+        for worker in workers {
+            let snapshot = worker.join().unwrap().unwrap();
+            assert_eq!(snapshot.accounted_bytes, 8);
+            assert_eq!(snapshot.reconciliations_total, 2);
+        }
+        let snapshot = budget.snapshot();
+        assert_eq!(snapshot.accounted_bytes, 8);
+        assert_eq!(snapshot.active_reservations, 0);
+        assert_eq!(snapshot.reconciliations_total, 2);
+        assert_eq!(budget.state.lock().reconciliation_waiters, 0);
+    }
+
+    #[test]
+    fn coalesced_unbounded_scan_does_not_bypass_a_finite_memory_limit() {
+        let temp = TempDir::new().unwrap();
+        let budget = budget_with_space(temp.path(), LocalDiskLimits::default(), 1_000);
+        let deepest = temp.path().join("one/two/three/four");
+        fs::create_dir_all(&deepest).unwrap();
+        fs::write(deepest.join("payload.bin"), b"x").unwrap();
+        budget.reconcile_when_idle().unwrap();
+        let exact_peak = budget
+            .state
+            .lock()
+            .completed_reconciliation_memory_peak_bytes;
+        assert!(exact_peak > 0);
+
+        let request_hook = budget.pause_next_reconciliation_request_after_registration_for_test();
+        let finite_budget = Arc::clone(&budget);
+        let finite = std::thread::spawn(move || {
+            finite_budget.reconcile_when_idle_with_memory_limit(exact_peak - 1)
+        });
+        request_hook.wait_until_entered();
+
+        let before = budget.snapshot().reconciliations_total;
+        assert_eq!(
+            budget.reconcile_when_idle().unwrap().reconciliations_total,
+            before + 1
+        );
+        request_hook.release();
+
+        let error = finite
+            .join()
+            .unwrap()
+            .expect_err("a covering unlimited scan must not waive the waiter's finite bound");
+        assert!(matches!(
+            error,
+            TsinkError::MemoryBudgetExceeded { budget, required }
+                if budget == exact_peak - 1 && required == exact_peak
+        ));
+        assert_eq!(budget.snapshot().reconciliations_total, before + 1);
+        assert_eq!(budget.state.lock().reconciliation_waiters, 0);
+    }
+
+    #[test]
+    fn request_registered_after_scan_coverage_capture_requires_a_followup_scan() {
+        let temp = TempDir::new().unwrap();
+        let budget = budget_with_space(temp.path(), LocalDiskLimits::default(), 1_000);
+        let scan_hook = budget.pause_next_reconciliation_scan_for_test();
+        let strict_budget = Arc::clone(&budget);
+        let strict_reconciliation = std::thread::spawn(move || strict_budget.reconcile());
+
+        scan_hook.wait_until_entered();
+        fs::write(temp.path().join("late-external.bin"), b"late").unwrap();
+        let later_budget = Arc::clone(&budget);
+        let later_reconciliation = std::thread::spawn(move || later_budget.reconcile_when_idle());
+        while budget
+            .highest_reconciliation_request_ticket
+            .load(Ordering::Acquire)
+            < 1
+        {
+            std::thread::yield_now();
+        }
+        scan_hook.release();
+
+        strict_reconciliation.join().unwrap().unwrap();
+        let later_snapshot = later_reconciliation.join().unwrap().unwrap();
+        assert_eq!(later_snapshot.accounted_bytes, 4);
+        assert_eq!(later_snapshot.reconciliations_total, 3);
+        assert_eq!(
+            budget
+                .completed_reconciliation_request_ticket
+                .load(Ordering::Acquire),
+            1
+        );
+    }
+
+    #[test]
+    fn reservation_admitted_after_covering_scan_invalidates_ticket_reuse() {
+        let temp = TempDir::new().unwrap();
+        let budget = budget_with_space(temp.path(), LocalDiskLimits::default(), 1_000);
+        let request_hook = budget.pause_next_reconciliation_request_after_registration_for_test();
+        let delayed_budget = Arc::clone(&budget);
+        let delayed_reconciliation =
+            std::thread::spawn(move || delayed_budget.reconcile_when_idle());
+
+        request_hook.wait_until_entered();
+        assert_eq!(budget.reconcile().unwrap().reconciliations_total, 2);
+        let reservation = budget
+            .reserve(DiskCategory::Unknown, 1, DiskReservationKind::Growth)
+            .unwrap();
+        fs::write(temp.path().join("after-scan.bin"), b"x").unwrap();
+        reservation.commit(1, 0).unwrap();
+        request_hook.release();
+
+        let snapshot = delayed_reconciliation.join().unwrap().unwrap();
+        assert_eq!(snapshot.accounted_bytes, 1);
+        assert_eq!(snapshot.active_reservations, 0);
+        assert_eq!(snapshot.reconciliations_total, 3);
+        let state = budget.state.lock();
+        assert_eq!(
+            state.completed_reconciliation_reservation_generation,
+            state.reservation_generation
+        );
+    }
+
+    #[test]
+    fn concurrent_reconciled_operation_finishes_share_one_terminal_scan() {
+        let temp = TempDir::new().unwrap();
+        let budget = budget_with_space(temp.path(), LocalDiskLimits::default(), 1_000);
+        let operations_entered = Arc::new(Barrier::new(3));
+        let release_operations = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+        for path in [
+            temp.path().join("first.bin"),
+            temp.path().join("second.bin"),
+        ] {
+            let worker_budget = Arc::clone(&budget);
+            let operations_entered = Arc::clone(&operations_entered);
+            let release_operations = Arc::clone(&release_operations);
+            workers.push(std::thread::spawn(move || {
+                worker_budget.with_reconciled_maintenance_reservation(
+                    DiskCategory::Unknown,
+                    1,
+                    || {
+                        fs::write(path, b"x").unwrap();
+                        operations_entered.wait();
+                        release_operations.wait();
+                        Ok(())
+                    },
+                )
+            }));
+        }
+
+        operations_entered.wait();
+        assert_eq!(budget.state.lock().active_reservations, 2);
+        release_operations.wait();
+
+        for worker in workers {
+            worker.join().unwrap().unwrap();
+        }
+        let state = budget.state.lock();
+        assert_eq!(state.accounted_bytes(), 2);
+        assert_eq!(state.active_reservations, 0);
+        assert_eq!(state.reserved_bytes, 0);
+        assert_eq!(state.reconciliation_waiters, 0);
+        assert_eq!(state.reconciliations_total, 2);
+    }
+
+    #[test]
     fn reservation_overrun_is_reported_after_surviving_bytes_are_accounted() {
         let temp = TempDir::new().unwrap();
         let budget = budget_with_space(temp.path(), LocalDiskLimits::default(), 1_000);
@@ -5632,6 +6418,45 @@ mod tests {
         assert_eq!(category_bytes(DiskCategory::Segments), 5);
         assert_eq!(category_bytes(DiskCategory::Tombstones), 7);
         assert_eq!(category_bytes(DiskCategory::Unknown), 9);
+    }
+
+    #[test]
+    fn reconciliation_classifies_only_canonical_v3_segment_catalog_paths_as_registry() {
+        let temp = TempDir::new().unwrap();
+        let generation_directory = temp.path().join("segment_catalog.d");
+        fs::create_dir_all(&generation_directory).unwrap();
+        fs::write(temp.path().join("segment_catalog.current"), b"point").unwrap();
+        fs::write(
+            generation_directory.join("catalog-000000000000000a.bin"),
+            b"current",
+        )
+        .unwrap();
+        fs::write(temp.path().join("catalog-000000000000000b.bin"), b"a").unwrap();
+        fs::write(
+            generation_directory.join("catalog-000000000000000B.bin"),
+            b"bb",
+        )
+        .unwrap();
+        fs::write(
+            generation_directory.join("catalog-000000000000000c.bin.extra"),
+            b"ccc",
+        )
+        .unwrap();
+        fs::write(temp.path().join("segment_catalog.current.backup"), b"dddd").unwrap();
+
+        let budget = budget_with_space(temp.path(), LocalDiskLimits::default(), 1_000);
+        let snapshot = budget.snapshot();
+        let category_bytes = |category| {
+            snapshot
+                .categories
+                .iter()
+                .find(|entry| entry.category == category)
+                .map_or(0, |entry| entry.bytes)
+        };
+
+        assert_eq!(category_bytes(DiskCategory::Registry), 12);
+        assert_eq!(category_bytes(DiskCategory::Unknown), 10);
+        assert_eq!(snapshot.accounted_bytes, 22);
     }
 
     #[test]

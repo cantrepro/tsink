@@ -576,45 +576,7 @@ impl SeriesSelection {
                 return Err(SeriesSelectionValidationError::InvalidMetricName);
             }
         }
-        crate::query_matcher::validate_matcher_shapes(
-            self.matchers.len(),
-            self.matchers
-                .iter()
-                .map(|matcher| (matcher.name.as_str(), matcher.value.as_str())),
-        )
-        .map_err(|error| match error {
-            crate::query_matcher::MatcherShapeError::TooManyMatchers { actual } => {
-                SeriesSelectionValidationError::TooManyMatchers {
-                    actual,
-                    maximum: crate::MAX_SERIES_SELECTION_MATCHERS,
-                }
-            }
-            crate::query_matcher::MatcherShapeError::EmptyName { index } => {
-                SeriesSelectionValidationError::EmptyMatcherName {
-                    matcher_index: index,
-                }
-            }
-            crate::query_matcher::MatcherShapeError::NameTooLong { index, actual } => {
-                SeriesSelectionValidationError::MatcherNameTooLong {
-                    matcher_index: index,
-                    actual,
-                    maximum: crate::MAX_SERIES_MATCHER_NAME_BYTES,
-                }
-            }
-            crate::query_matcher::MatcherShapeError::ValueTooLong { index, actual } => {
-                SeriesSelectionValidationError::MatcherValueTooLong {
-                    matcher_index: index,
-                    actual,
-                    maximum: crate::MAX_SERIES_MATCHER_VALUE_BYTES,
-                }
-            }
-            crate::query_matcher::MatcherShapeError::TotalTooLong { actual } => {
-                SeriesSelectionValidationError::MatcherBytesTooLong {
-                    actual,
-                    maximum: crate::MAX_SERIES_SELECTION_MATCHER_BYTES,
-                }
-            }
-        })?;
+        validate_series_matcher_shapes(&self.matchers)?;
 
         match (self.start, self.end) {
             (None, None) => Ok(None),
@@ -631,6 +593,75 @@ impl SeriesSelection {
     }
 }
 
+pub(crate) fn validate_series_matcher_shapes(
+    matchers: &[SeriesMatcher],
+) -> std::result::Result<(), SeriesSelectionValidationError> {
+    crate::query_matcher::validate_matcher_shapes(
+        matchers.len(),
+        matchers
+            .iter()
+            .map(|matcher| (matcher.name.as_str(), matcher.value.as_str())),
+    )
+    .map_err(|error| match error {
+        crate::query_matcher::MatcherShapeError::TooManyMatchers { actual } => {
+            SeriesSelectionValidationError::TooManyMatchers {
+                actual,
+                maximum: crate::MAX_SERIES_SELECTION_MATCHERS,
+            }
+        }
+        crate::query_matcher::MatcherShapeError::EmptyName { index } => {
+            SeriesSelectionValidationError::EmptyMatcherName {
+                matcher_index: index,
+            }
+        }
+        crate::query_matcher::MatcherShapeError::NameTooLong { index, actual } => {
+            SeriesSelectionValidationError::MatcherNameTooLong {
+                matcher_index: index,
+                actual,
+                maximum: crate::MAX_SERIES_MATCHER_NAME_BYTES,
+            }
+        }
+        crate::query_matcher::MatcherShapeError::ValueTooLong { index, actual } => {
+            SeriesSelectionValidationError::MatcherValueTooLong {
+                matcher_index: index,
+                actual,
+                maximum: crate::MAX_SERIES_MATCHER_VALUE_BYTES,
+            }
+        }
+        crate::query_matcher::MatcherShapeError::TotalTooLong { actual } => {
+            SeriesSelectionValidationError::MatcherBytesTooLong {
+                actual,
+                maximum: crate::MAX_SERIES_SELECTION_MATCHER_BYTES,
+            }
+        }
+    })
+}
+
+pub(crate) fn validate_metric_row_output_projection(
+    matchers: &[SeriesMatcher],
+    excluded_output_label: Option<&str>,
+) -> Result<()> {
+    let Some(excluded_output_label) = excluded_output_label else {
+        return Ok(());
+    };
+    if excluded_output_label == "__name__" {
+        return Err(TsinkError::InvalidConfiguration(
+            "excluded_output_label cannot be the __name__ pseudo-label".to_string(),
+        ));
+    }
+    if matchers.iter().any(|matcher| {
+        matcher.name == excluded_output_label
+            && matcher.op == SeriesMatcherOp::Equal
+            && !matcher.value.is_empty()
+    }) {
+        return Ok(());
+    }
+    Err(TsinkError::InvalidConfiguration(
+        "excluded_output_label requires a non-empty exact-equality matcher for the same label"
+            .to_string(),
+    ))
+}
+
 #[cfg(test)]
 mod series_selection_validation_tests {
     use super::*;
@@ -640,6 +671,80 @@ mod series_selection_validation_tests {
         MAX_SERIES_SELECTION_MATCHERS, MAX_SERIES_SELECTION_MATCHER_BYTES,
     };
     use std::time::Instant;
+
+    struct CompatibilityMatcherRowStorage;
+
+    impl Storage for CompatibilityMatcherRowStorage {
+        fn insert_rows(&self, _rows: &[Row]) -> Result<()> {
+            Ok(())
+        }
+
+        fn select(
+            &self,
+            _metric: &str,
+            _labels: &[Label],
+            _start: i64,
+            _end: i64,
+        ) -> Result<Vec<DataPoint>> {
+            Ok(vec![DataPoint::new(1, 1.0)])
+        }
+
+        fn list_metrics(&self) -> Result<Vec<MetricSeries>> {
+            Ok(vec![MetricSeries {
+                name: "compatibility_matcher_rows".to_string(),
+                labels: vec![Label::new("host", "a"), Label::new("internal", "hidden")],
+            }])
+        }
+
+        fn select_with_options(
+            &self,
+            _metric: &str,
+            _opts: QueryOptions,
+        ) -> Result<Vec<DataPoint>> {
+            Ok(vec![DataPoint::new(1, 1.0)])
+        }
+
+        fn select_all(
+            &self,
+            _metric: &str,
+            _start: i64,
+            _end: i64,
+        ) -> Result<Vec<(Vec<Label>, Vec<DataPoint>)>> {
+            Ok(Vec::new())
+        }
+
+        fn close(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn matcher_aware_metric_row_default_is_projected_but_conservatively_unaccounted() {
+        let storage = CompatibilityMatcherRowStorage;
+        assert_eq!(
+            storage.scan_metric_rows_with_matchers_execution_accounting(),
+            QueryExecutionAccounting::Unaccounted
+        );
+        let budget = QueryBudget::new(QueryBudgetLimits::default()).unwrap();
+        let execution = budget.begin_query().unwrap();
+        let result = storage
+            .scan_metric_rows_with_matchers_with_execution_result(
+                "compatibility_matcher_rows",
+                &[SeriesMatcher::equal("internal", "hidden")],
+                Some("internal"),
+                0,
+                2,
+                QueryRowsScanOptions::default(),
+                &execution,
+            )
+            .unwrap();
+        assert_eq!(result.page.rows.len(), 1);
+        assert_eq!(result.page.rows[0].labels(), &[Label::new("host", "a")]);
+        assert_eq!(result.reserved_memory_bytes(), 0);
+        drop(result);
+        drop(execution);
+        assert_eq!(budget.snapshot().active_queries, 0);
+    }
 
     #[test]
     fn public_validation_accepts_exact_matcher_shape_limits_and_returns_typed_one_over_errors() {
@@ -986,6 +1091,18 @@ pub struct QueryRowsScanOptions {
     pub max_rows: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub row_offset: Option<u64>,
+}
+
+impl QueryRowsScanOptions {
+    /// Validates the allocation-free input contract shared by metric row scans and wrappers.
+    #[doc(hidden)]
+    pub fn validate_metric_row_request(&self, metric: &str, start: i64, end: i64) -> Result<()> {
+        validate_metric(metric)?;
+        if start >= end {
+            return Err(TsinkError::InvalidTimeRange { start, end });
+        }
+        validate_query_rows_scan_options(*self)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -3792,11 +3909,7 @@ pub trait Storage: Send + Sync {
         end: i64,
         options: QueryRowsScanOptions,
     ) -> Result<QueryRowsPage> {
-        validate_metric(metric)?;
-        if start >= end {
-            return Err(TsinkError::InvalidTimeRange { start, end });
-        }
-        validate_query_rows_scan_options(options)?;
+        options.validate_metric_row_request(metric, start, end)?;
 
         let series = self
             .list_metrics()?
@@ -3831,6 +3944,66 @@ pub trait Storage: Send + Sync {
     ) -> Result<QueryRowsExecutionResult> {
         self.scan_metric_rows_with_execution(metric, start, end, options, execution)
             .map(QueryRowsExecutionResult::unaccounted)
+    }
+
+    /// Scans one metric restricted by structured series matchers while retaining any query-memory
+    /// reservation owned by the result.
+    ///
+    /// The additive contract lets wrappers push isolation matchers into the backend instead of
+    /// listing identities and scanning them as two separately charged operations. Compatibility
+    /// backends use their existing selection and row-scan methods and conservatively return an
+    /// unaccounted result. When `excluded_output_label` is set, it must not be the `__name__`
+    /// pseudo-label, and the matchers must include a non-empty exact-equality matcher for that same
+    /// label. This keeps the projected series identity one-to-one; every returned row must omit
+    /// that label and logical returned-byte charging must use the same projected row shape. A
+    /// bounded caller must require
+    /// [`QueryExecutionAccounting::Complete`] from
+    /// [`Storage::scan_metric_rows_with_matchers_execution_accounting`] before invoking it.
+    #[allow(clippy::too_many_arguments)]
+    fn scan_metric_rows_with_matchers_with_execution_result(
+        &self,
+        metric: &str,
+        matchers: &[SeriesMatcher],
+        excluded_output_label: Option<&str>,
+        start: i64,
+        end: i64,
+        options: QueryRowsScanOptions,
+        execution: &QueryExecution,
+    ) -> Result<QueryRowsExecutionResult> {
+        options.validate_metric_row_request(metric, start, end)?;
+        validate_series_matcher_shapes(matchers).map_err(TsinkError::from)?;
+        validate_metric_row_output_projection(matchers, excluded_output_label)?;
+        let selection = SeriesSelection::new()
+            .with_metric(metric)
+            .with_matchers(matchers.to_vec());
+        let series = self.select_series(&selection)?;
+        let mut page =
+            self.scan_series_rows_with_execution(&series, start, end, options, execution)?;
+        if let Some(excluded_output_label) = excluded_output_label {
+            page.rows = page
+                .rows
+                .into_iter()
+                .map(|row| {
+                    let labels = row
+                        .labels()
+                        .iter()
+                        .filter(|label| label.name != excluded_output_label)
+                        .cloned()
+                        .collect();
+                    Row::with_labels(row.metric().to_string(), labels, row.data_point().clone())
+                })
+                .collect();
+        }
+        Ok(QueryRowsExecutionResult::unaccounted(page))
+    }
+
+    /// Reports whether the matcher-aware metric row scan accounts all selected work and retains a
+    /// query-memory reservation for the returned page.
+    ///
+    /// The conservative default prevents bounded wrappers from composing independently charged
+    /// metadata and row operations and then claiming one canonical metric scan.
+    fn scan_metric_rows_with_matchers_execution_accounting(&self) -> QueryExecutionAccounting {
+        QueryExecutionAccounting::Unaccounted
     }
 
     /// Reports whether [`Storage::scan_metric_rows_with_execution_result`] fully accounts for its

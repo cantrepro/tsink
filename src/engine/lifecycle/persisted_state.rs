@@ -181,16 +181,58 @@ impl ChunkStorage {
         &self,
         segment_roots: &[PathBuf],
     ) -> Result<()> {
+        let local_disk_budget = self.persisted.local_disk_budget.as_ref();
+        let mut reservation = None;
+        let mut governed_mutation_or_ambiguity = false;
         let mut rollback_errors = Vec::new();
         for root in segment_roots.iter().rev() {
-            if let Err(err) =
-                crate::engine::fs_utils::remove_path_if_exists_and_sync_parent_budgeted(
-                    root,
-                    self.persisted.local_disk_budget.as_ref(),
-                    crate::DiskCategory::Segments,
-                )
+            let governed = match local_disk_budget {
+                Some(budget) => match budget.governs_entry(root) {
+                    Ok(governed) => governed,
+                    Err(err) => {
+                        rollback_errors.push(format!("{}: {err}", root.display()));
+                        continue;
+                    }
+                },
+                None => false,
+            };
+            if governed && reservation.is_none() {
+                match local_disk_budget
+                    .expect("governed segment rollback requires a local disk budget")
+                    .reserve(
+                        crate::DiskCategory::Segments,
+                        0,
+                        crate::DiskReservationKind::Recovery,
+                    ) {
+                    Ok(admitted) => reservation = Some(admitted),
+                    Err(err) => {
+                        rollback_errors.push(format!("{}: {err}", root.display()));
+                        continue;
+                    }
+                }
+            }
+
+            match crate::engine::fs_utils::remove_path_if_exists_and_sync_parent_observed(root) {
+                Ok(removed) => governed_mutation_or_ambiguity |= governed && removed,
+                Err(err) => {
+                    governed_mutation_or_ambiguity |= governed;
+                    rollback_errors.push(format!("{}: {err}", root.display()));
+                }
+            }
+        }
+
+        if let Some(reservation) = reservation {
+            if let Err(err) = reservation.commit(0, 0) {
+                governed_mutation_or_ambiguity = true;
+                rollback_errors.push(format!("disk settlement: {err}"));
+            }
+        }
+        if governed_mutation_or_ambiguity {
+            if let Err(err) = local_disk_budget
+                .expect("governed segment rollback requires a local disk budget")
+                .reconcile_when_idle()
             {
-                rollback_errors.push(format!("{}: {err}", root.display()));
+                rollback_errors.push(format!("disk reconciliation: {err}"));
             }
         }
         if !rollback_errors.is_empty() {

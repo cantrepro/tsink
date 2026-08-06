@@ -9,8 +9,8 @@ use super::tiering::SegmentLaneFamily;
 use super::*;
 use crate::engine::fs_utils::{
     collect_directory_entries_bounded, create_dir_all_and_sync_parents,
-    remove_path_if_exists_and_sync_parent_budgeted, write_file_atomically_and_sync_parent_budgeted,
-    MAX_RECOVERY_NAMESPACE_ENTRIES,
+    remove_path_if_exists_and_sync_parent_budgeted, remove_path_if_exists_and_sync_parent_observed,
+    write_file_atomically_and_sync_parent_budgeted, MAX_RECOVERY_NAMESPACE_ENTRIES,
 };
 use crate::engine::segment::IndexedSegment;
 use crate::engine::series::{SeriesId, SeriesRegistry};
@@ -665,13 +665,13 @@ pub(super) fn persist_registry_catalog_delta_budgeted_with_kind(
         .copied()
         .collect::<Vec<_>>();
 
-    let pending = if let Some(pending) = manifest.pending_delta.clone() {
+    let (pending, publish_intent) = if let Some(pending) = manifest.pending_delta.clone() {
         if pending.added != desired_added || pending.removed != desired_removed {
             return Err(TsinkError::DataCorruption(
                 "persisted registry catalog has a different incomplete root delta".to_string(),
             ));
         }
-        pending
+        (pending, false)
     } else {
         if !manifest.complete {
             // A legacy migration marker or a torn complete rebuild cannot be made exact from one
@@ -713,20 +713,76 @@ pub(super) fn persist_registry_catalog_delta_budgeted_with_kind(
         manifest.complete = false;
         manifest.series_fingerprint = None;
         manifest.pending_delta = Some(pending.clone());
-        persist_store_manifest(&store_path, &manifest, local_disk_budget, reservation_kind)?;
-        pending
+        (pending, true)
     };
 
-    for key in &pending.removed {
-        remove_path_if_exists_and_sync_parent_budgeted(
-            &catalog_entry_path(&store_path, *key),
+    persist_planned_registry_catalog_delta(
+        snapshot_path,
+        &store_path,
+        &mut manifest,
+        &pending,
+        publish_intent,
+        local_disk_budget,
+        reservation_kind,
+    )
+}
+
+fn persist_planned_registry_catalog_delta(
+    snapshot_path: &Path,
+    store_path: &Path,
+    manifest: &mut PersistedRegistryCatalogStoreManifest,
+    pending: &PersistedRegistryCatalogPendingDelta,
+    publish_intent: bool,
+    local_disk_budget: Option<&Arc<crate::LocalDiskBudget>>,
+    reservation_kind: crate::DiskReservationKind,
+) -> Result<()> {
+    let apply = |manifest: &mut PersistedRegistryCatalogStoreManifest,
+                 local_disk_budget: Option<&Arc<crate::LocalDiskBudget>>| {
+        apply_planned_registry_catalog_delta(
+            snapshot_path,
+            store_path,
+            manifest,
+            pending,
+            publish_intent,
             local_disk_budget,
-            crate::DiskCategory::Registry,
-        )?;
+            reservation_kind,
+        )
+    };
+    let Some(budget) = local_disk_budget else {
+        return apply(manifest, None);
+    };
+    let manifest_path = store_path.join(REGISTRY_CATALOG_STORE_MANIFEST_FILE_NAME);
+    let legacy_path = catalog_path(snapshot_path);
+    if !budget.governs_entry(&manifest_path)? || !budget.governs_entry(&legacy_path)? {
+        return apply(manifest, Some(budget));
     }
+
+    let peak_bytes =
+        planned_registry_catalog_delta_publication_peak(manifest, pending, publish_intent)?;
+    budget.with_strict_reconciled_reservation(
+        crate::DiskCategory::Registry,
+        peak_bytes,
+        reservation_kind,
+        || apply(manifest, None),
+    )
+}
+
+fn apply_planned_registry_catalog_delta(
+    snapshot_path: &Path,
+    store_path: &Path,
+    manifest: &mut PersistedRegistryCatalogStoreManifest,
+    pending: &PersistedRegistryCatalogPendingDelta,
+    publish_intent: bool,
+    local_disk_budget: Option<&Arc<crate::LocalDiskBudget>>,
+    reservation_kind: crate::DiskReservationKind,
+) -> Result<()> {
+    if publish_intent {
+        persist_store_manifest(store_path, manifest, local_disk_budget, reservation_kind)?;
+    }
+    remove_registry_catalog_entries_budgeted(store_path, &pending.removed, local_disk_budget)?;
     for entry in &pending.added {
         persist_store_entry(
-            &catalog_entry_path(&store_path, entry.key()),
+            &catalog_entry_path(store_path, entry.key()),
             entry,
             local_disk_budget,
             reservation_kind,
@@ -737,13 +793,122 @@ pub(super) fn persist_registry_catalog_delta_budgeted_with_kind(
     manifest.entry_count = pending.target_entry_count;
     manifest.series_fingerprint = None;
     manifest.pending_delta = None;
-    persist_store_manifest(&store_path, &manifest, local_disk_budget, reservation_kind)?;
+    persist_store_manifest(store_path, manifest, local_disk_budget, reservation_kind)?;
 
     remove_path_if_exists_and_sync_parent_budgeted(
         &catalog_path(snapshot_path),
         local_disk_budget,
         crate::DiskCategory::Registry,
     )
+}
+
+fn planned_registry_catalog_delta_publication_peak(
+    manifest: &PersistedRegistryCatalogStoreManifest,
+    pending: &PersistedRegistryCatalogPendingDelta,
+    publish_intent: bool,
+) -> Result<u64> {
+    let mut peak_bytes = 0u64;
+    if publish_intent {
+        peak_bytes = peak_bytes
+            .checked_add(u64::try_from(encode_store_manifest(manifest)?.len()).unwrap_or(u64::MAX))
+            .ok_or_else(|| {
+                TsinkError::Other("registry catalog delta publication peak overflowed".to_string())
+            })?;
+    }
+    for entry in &pending.added {
+        peak_bytes = peak_bytes
+            .checked_add(u64::try_from(encode_store_entry(entry)?.len()).unwrap_or(u64::MAX))
+            .ok_or_else(|| {
+                TsinkError::Other("registry catalog delta publication peak overflowed".to_string())
+            })?;
+    }
+    let mut complete = manifest.clone();
+    complete.complete = true;
+    complete.entry_count = pending.target_entry_count;
+    complete.series_fingerprint = None;
+    complete.pending_delta = None;
+    peak_bytes
+        .checked_add(u64::try_from(encode_store_manifest(&complete)?.len()).unwrap_or(u64::MAX))
+        .ok_or_else(|| {
+            TsinkError::Other("registry catalog delta publication peak overflowed".to_string())
+        })
+}
+
+fn remove_registry_catalog_entries_budgeted(
+    store_path: &Path,
+    keys: &[PersistedRegistryCatalogEntryKey],
+    local_disk_budget: Option<&Arc<crate::LocalDiskBudget>>,
+) -> Result<()> {
+    let mut reservation = None;
+    let mut governed_deletion_or_ambiguous_error = false;
+    let operation_result = (|| -> Result<()> {
+        for key in keys {
+            let path = catalog_entry_path(store_path, *key);
+            let governed = match local_disk_budget {
+                Some(budget) => budget.governs_entry(&path)?,
+                None => false,
+            };
+            if governed && reservation.is_none() {
+                reservation = Some(
+                    local_disk_budget
+                        .expect("governed registry catalog cleanup requires a disk budget")
+                        .reserve(
+                            crate::DiskCategory::Registry,
+                            0,
+                            crate::DiskReservationKind::Recovery,
+                        )?,
+                );
+            }
+            match remove_path_if_exists_and_sync_parent_observed(&path) {
+                Ok(removed) => {
+                    governed_deletion_or_ambiguous_error |= governed && removed;
+                }
+                Err(err) => {
+                    governed_deletion_or_ambiguous_error |= governed;
+                    return Err(err);
+                }
+            }
+        }
+        Ok(())
+    })();
+
+    let settlement_result = reservation.map_or(Ok(()), |reservation| reservation.commit(0, 0));
+    if settlement_result.is_err() {
+        governed_deletion_or_ambiguous_error = true;
+    }
+    let reconciliation_result = if governed_deletion_or_ambiguous_error {
+        local_disk_budget
+            .expect("governed registry catalog cleanup requires a disk budget")
+            .reconcile_when_idle()
+            .map(|_| ())
+    } else {
+        Ok(())
+    };
+
+    let mut errors = Vec::new();
+    if let Err(err) = &operation_result {
+        errors.push(format!("cleanup failed: {err}"));
+    }
+    if let Err(err) = &settlement_result {
+        errors.push(format!("disk settlement failed: {err}"));
+    }
+    if let Err(err) = &reconciliation_result {
+        errors.push(format!("disk reconciliation failed: {err}"));
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else if errors.len() == 1 {
+        match (operation_result, settlement_result, reconciliation_result) {
+            (Err(err), _, _) | (_, Err(err), _) | (_, _, Err(err)) => Err(err),
+            _ => unreachable!("one recorded cleanup error must have a matching failed result"),
+        }
+    } else {
+        Err(TsinkError::Other(format!(
+            "registry catalog entry cleanup in {} failed: {}",
+            store_path.display(),
+            errors.join("; ")
+        )))
+    }
 }
 
 fn ensure_catalog_store_directory(path: &Path) -> Result<()> {
@@ -859,14 +1024,7 @@ fn persist_store_manifest(
     local_disk_budget: Option<&Arc<crate::LocalDiskBudget>>,
     reservation_kind: crate::DiskReservationKind,
 ) -> Result<()> {
-    let bytes = serde_json::to_vec(manifest)?;
-    if bytes.len() as u64 > REGISTRY_CATALOG_STORE_MANIFEST_MAX_BYTES {
-        return Err(TsinkError::MaintenanceWorkItemTooLarge {
-            operation: "persisted registry catalog manifest",
-            limit: REGISTRY_CATALOG_STORE_MANIFEST_MAX_BYTES,
-            required: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-        });
-    }
+    let bytes = encode_store_manifest(manifest)?;
     write_file_atomically_and_sync_parent_budgeted(
         &store_path.join(REGISTRY_CATALOG_STORE_MANIFEST_FILE_NAME),
         &bytes,
@@ -876,12 +1034,35 @@ fn persist_store_manifest(
     )
 }
 
+fn encode_store_manifest(manifest: &PersistedRegistryCatalogStoreManifest) -> Result<Vec<u8>> {
+    let bytes = serde_json::to_vec(manifest)?;
+    if bytes.len() as u64 > REGISTRY_CATALOG_STORE_MANIFEST_MAX_BYTES {
+        return Err(TsinkError::MaintenanceWorkItemTooLarge {
+            operation: "persisted registry catalog manifest",
+            limit: REGISTRY_CATALOG_STORE_MANIFEST_MAX_BYTES,
+            required: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        });
+    }
+    Ok(bytes)
+}
+
 fn persist_store_entry(
     path: &Path,
     entry: &PersistedRegistryCatalogEntry,
     local_disk_budget: Option<&Arc<crate::LocalDiskBudget>>,
     reservation_kind: crate::DiskReservationKind,
 ) -> Result<()> {
+    let bytes = encode_store_entry(entry)?;
+    write_file_atomically_and_sync_parent_budgeted(
+        path,
+        &bytes,
+        local_disk_budget,
+        crate::DiskCategory::Registry,
+        reservation_kind,
+    )
+}
+
+fn encode_store_entry(entry: &PersistedRegistryCatalogEntry) -> Result<Vec<u8>> {
     let bytes = serde_json::to_vec(entry)?;
     if bytes.len() as u64 > REGISTRY_CATALOG_ENTRY_MAX_BYTES {
         return Err(TsinkError::MaintenanceWorkItemTooLarge {
@@ -890,13 +1071,7 @@ fn persist_store_entry(
             required: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
         });
     }
-    write_file_atomically_and_sync_parent_budgeted(
-        path,
-        &bytes,
-        local_disk_budget,
-        crate::DiskCategory::Registry,
-        reservation_kind,
-    )
+    Ok(bytes)
 }
 
 fn catalog_entry_path(store_path: &Path, key: PersistedRegistryCatalogEntryKey) -> PathBuf {
@@ -1314,6 +1489,292 @@ mod tests {
             crate::disk_budget::measured_path_bytes(temp.path()).unwrap()
         );
         assert_eq!(budget.snapshot().active_reservations, 0);
+    }
+
+    #[test]
+    fn planned_delta_batches_overwrites_and_retirement_into_one_reconciliation() {
+        let temp = TempDir::new().unwrap();
+        let snapshot_path = temp.path().join("series_index.bin");
+        seed_native_store(&snapshot_path, 8);
+        let store_path = catalog_store_path(&snapshot_path);
+        let legacy_path = catalog_path(&snapshot_path);
+        fs::write(&legacy_path, b"legacy catalog").unwrap();
+        let unknown = store_path.join("host-owned");
+        fs::write(&unknown, b"external").unwrap();
+        let mut first_added = fake_entry(2);
+        first_added.point_count = 20;
+        let mut second_added = fake_entry(4);
+        second_added.point_count = 40;
+        let pending = PersistedRegistryCatalogPendingDelta {
+            added: vec![first_added.clone(), second_added.clone()],
+            removed: vec![fake_entry(6).key()],
+            target_entry_count: 7,
+        };
+        let mut manifest = load_complete_store_manifest(&store_path)
+            .unwrap()
+            .expect("seeded manifest should load");
+        manifest.complete = false;
+        manifest.series_fingerprint = None;
+        manifest.pending_delta = Some(pending.clone());
+        let budget =
+            crate::LocalDiskBudget::open(temp.path(), crate::LocalDiskLimits::default()).unwrap();
+        let before = budget.snapshot();
+        assert_eq!(before.reconciliations_total, 1);
+
+        persist_planned_registry_catalog_delta(
+            &snapshot_path,
+            &store_path,
+            &mut manifest,
+            &pending,
+            true,
+            Some(&budget),
+            crate::DiskReservationKind::Maintenance,
+        )
+        .unwrap();
+
+        let snapshot = budget.snapshot();
+        assert_eq!(
+            snapshot.reconciliations_total,
+            before.reconciliations_total + 1
+        );
+        assert_eq!(
+            snapshot.accounted_bytes,
+            crate::disk_budget::measured_path_bytes(temp.path()).unwrap()
+        );
+        assert_eq!(snapshot.active_reservations, 0);
+        assert_eq!(snapshot.reserved_bytes, 0);
+        assert_eq!(snapshot.maintenance_reserved_bytes, 0);
+        assert_eq!(
+            serde_json::from_slice::<PersistedRegistryCatalogEntry>(
+                &fs::read(catalog_entry_path(&store_path, first_added.key())).unwrap()
+            )
+            .unwrap(),
+            first_added
+        );
+        assert_eq!(
+            serde_json::from_slice::<PersistedRegistryCatalogEntry>(
+                &fs::read(catalog_entry_path(&store_path, second_added.key())).unwrap()
+            )
+            .unwrap(),
+            second_added
+        );
+        assert!(!catalog_entry_path(&store_path, fake_entry(6).key()).exists());
+        assert!(!legacy_path.exists());
+        assert!(unknown.is_file());
+        let completed = load_complete_store_manifest(&store_path)
+            .unwrap()
+            .expect("the completed manifest should load");
+        assert_eq!(completed.entry_count, 7);
+        assert!(completed.pending_delta.is_none());
+    }
+
+    #[test]
+    fn planned_delta_intent_sync_failure_reconciles_and_retries_idempotently() {
+        let temp = TempDir::new().unwrap();
+        let snapshot_path = temp.path().join("series_index.bin");
+        seed_native_store(&snapshot_path, 4);
+        let store_path = catalog_store_path(&snapshot_path);
+        let legacy_path = catalog_path(&snapshot_path);
+        fs::write(&legacy_path, b"legacy catalog").unwrap();
+        let mut added = fake_entry(2);
+        added.point_count = 200;
+        let removed = fake_entry(3).key();
+        let pending = PersistedRegistryCatalogPendingDelta {
+            added: vec![added.clone()],
+            removed: vec![removed],
+            target_entry_count: 3,
+        };
+        let mut manifest = load_complete_store_manifest(&store_path)
+            .unwrap()
+            .expect("seeded manifest should load");
+        manifest.complete = false;
+        manifest.series_fingerprint = None;
+        manifest.pending_delta = Some(pending.clone());
+        let budget =
+            crate::LocalDiskBudget::open(temp.path(), crate::LocalDiskLimits::default()).unwrap();
+        let before = budget.snapshot();
+        let sync_failure = crate::engine::fs_utils::fail_directory_sync_once(
+            store_path.clone(),
+            "injected registry catalog intent sync failure",
+        );
+
+        let err = persist_planned_registry_catalog_delta(
+            &snapshot_path,
+            &store_path,
+            &mut manifest,
+            &pending,
+            true,
+            Some(&budget),
+            crate::DiskReservationKind::Maintenance,
+        )
+        .expect_err("the committed incomplete intent must retain its synchronization error");
+        drop(sync_failure);
+
+        assert!(matches!(
+            err,
+            TsinkError::Other(ref message)
+                if message == "injected registry catalog intent sync failure"
+        ));
+        let after_fault = budget.snapshot();
+        assert_eq!(
+            after_fault.reconciliations_total,
+            before.reconciliations_total + 1
+        );
+        assert_eq!(after_fault.active_reservations, 0);
+        let mut recovered = load_store_manifest(&store_path)
+            .unwrap()
+            .expect("the durable incomplete intent should load");
+        assert!(!recovered.complete);
+        assert_eq!(recovered.pending_delta.as_ref(), Some(&pending));
+        assert_eq!(
+            serde_json::from_slice::<PersistedRegistryCatalogEntry>(
+                &fs::read(catalog_entry_path(&store_path, added.key())).unwrap()
+            )
+            .unwrap(),
+            fake_entry(2)
+        );
+        assert!(catalog_entry_path(&store_path, removed).is_file());
+        assert!(legacy_path.is_file());
+
+        persist_planned_registry_catalog_delta(
+            &snapshot_path,
+            &store_path,
+            &mut recovered,
+            &pending,
+            false,
+            Some(&budget),
+            crate::DiskReservationKind::Maintenance,
+        )
+        .unwrap();
+
+        let snapshot = budget.snapshot();
+        assert_eq!(
+            snapshot.reconciliations_total,
+            before.reconciliations_total + 2
+        );
+        assert_eq!(
+            snapshot.accounted_bytes,
+            crate::disk_budget::measured_path_bytes(temp.path()).unwrap()
+        );
+        assert_eq!(snapshot.active_reservations, 0);
+        assert_eq!(snapshot.reserved_bytes, 0);
+        assert_eq!(snapshot.maintenance_reserved_bytes, 0);
+        assert_eq!(
+            serde_json::from_slice::<PersistedRegistryCatalogEntry>(
+                &fs::read(catalog_entry_path(&store_path, added.key())).unwrap()
+            )
+            .unwrap(),
+            added
+        );
+        assert!(!catalog_entry_path(&store_path, removed).exists());
+        assert!(!legacy_path.exists());
+        let completed = load_complete_store_manifest(&store_path)
+            .unwrap()
+            .expect("the retry should publish the complete manifest");
+        assert_eq!(completed.entry_count, 3);
+        assert!(completed.pending_delta.is_none());
+    }
+
+    #[test]
+    fn catalog_entry_removal_batches_managed_entries_into_one_reconciliation() {
+        let temp = TempDir::new().unwrap();
+        let snapshot_path = temp.path().join("series_index.bin");
+        seed_native_store(&snapshot_path, 8);
+        let store_path = catalog_store_path(&snapshot_path);
+        let budget =
+            crate::LocalDiskBudget::open(temp.path(), crate::LocalDiskLimits::default()).unwrap();
+        let before = budget.snapshot();
+        assert_eq!(before.reconciliations_total, 1);
+
+        remove_registry_catalog_entries_budgeted(
+            &store_path,
+            &[
+                fake_entry(2).key(),
+                fake_entry(4).key(),
+                fake_entry(6).key(),
+            ],
+            Some(&budget),
+        )
+        .unwrap();
+
+        assert!(!catalog_entry_path(&store_path, fake_entry(2).key()).exists());
+        assert!(!catalog_entry_path(&store_path, fake_entry(4).key()).exists());
+        assert!(!catalog_entry_path(&store_path, fake_entry(6).key()).exists());
+        let snapshot = budget.snapshot();
+        assert_eq!(
+            snapshot.reconciliations_total,
+            before.reconciliations_total + 1
+        );
+        assert_eq!(
+            snapshot.accounted_bytes,
+            crate::disk_budget::measured_path_bytes(temp.path()).unwrap()
+        );
+        assert_eq!(snapshot.active_reservations, 0);
+        assert_eq!(snapshot.reserved_bytes, 0);
+        assert_eq!(snapshot.maintenance_reserved_bytes, 0);
+    }
+
+    #[test]
+    fn delta_removal_reconciles_once_after_post_unlink_sync_failure() {
+        let temp = TempDir::new().unwrap();
+        let snapshot_path = temp.path().join("series_index.bin");
+        seed_native_store(&snapshot_path, 4);
+        let store_path = catalog_store_path(&snapshot_path);
+        let first_removed = fake_entry(2).key();
+        let later_removal = fake_entry(3).key();
+        let mut manifest = load_complete_store_manifest(&store_path)
+            .unwrap()
+            .expect("seeded manifest should load");
+        manifest.complete = false;
+        manifest.series_fingerprint = None;
+        manifest.pending_delta = Some(PersistedRegistryCatalogPendingDelta {
+            added: Vec::new(),
+            removed: vec![first_removed, later_removal],
+            target_entry_count: 2,
+        });
+        fs::write(
+            store_path.join(REGISTRY_CATALOG_STORE_MANIFEST_FILE_NAME),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let budget =
+            crate::LocalDiskBudget::open(temp.path(), crate::LocalDiskLimits::default()).unwrap();
+        let before = budget.snapshot();
+        let _sync_failure = crate::engine::fs_utils::fail_directory_sync_once(
+            store_path.clone(),
+            "injected registry catalog cleanup sync failure",
+        );
+
+        let err = persist_registry_catalog_delta_budgeted_with_kind(
+            &snapshot_path,
+            &PersistedRegistryCatalogDelta {
+                added: Vec::new(),
+                removed: vec![first_removed, later_removal],
+            },
+            Some(&budget),
+            crate::DiskReservationKind::Maintenance,
+        )
+        .expect_err("the committed unlink must retain its synchronization error");
+
+        assert!(matches!(
+            err,
+            TsinkError::Other(ref message)
+                if message == "injected registry catalog cleanup sync failure"
+        ));
+        assert!(!catalog_entry_path(&store_path, first_removed).exists());
+        assert!(catalog_entry_path(&store_path, later_removal).is_file());
+        let snapshot = budget.snapshot();
+        assert_eq!(
+            snapshot.reconciliations_total,
+            before.reconciliations_total + 1
+        );
+        assert_eq!(
+            snapshot.accounted_bytes,
+            crate::disk_budget::measured_path_bytes(temp.path()).unwrap()
+        );
+        assert_eq!(snapshot.active_reservations, 0);
+        assert_eq!(snapshot.reserved_bytes, 0);
+        assert_eq!(snapshot.maintenance_reserved_bytes, 0);
     }
 
     #[test]

@@ -79,6 +79,12 @@ struct FlushSnapshotContext<'a> {
 struct FlushPublishContext<'a>(&'a AtomicBool);
 
 impl ChunkStorage {
+    fn uses_finite_background_flush_fence(&self, policy: PersistSnapshotPolicy) -> bool {
+        policy != PersistSnapshotPolicy::All
+            && (self.runtime.maintenance_max_items_per_pass != usize::MAX
+                || self.runtime.maintenance_max_bytes_per_pass != u64::MAX)
+    }
+
     fn is_disk_capacity_rejection(error: &TsinkError) -> bool {
         matches!(
             error,
@@ -390,6 +396,20 @@ impl ChunkStorage {
             ));
         }
 
+        if !self.uses_finite_background_flush_fence(policy) {
+            if let Some(data_path) = self
+                .persisted
+                .series_index_path
+                .as_deref()
+                .and_then(Path::parent)
+            {
+                // The caller already holds the compaction gate. Prove the namespace clean after
+                // finding real flush work but before writing any discoverable segment root, then
+                // retain that gate through recovery metadata and visibility publication.
+                super::super::maintenance::ensure_no_pending_post_flush_replacement(data_path)?;
+            }
+        }
+
         let published_segment_roots = {
             let registry = snapshot_ctx.registry.read();
             let mut published_segment_roots = Vec::new();
@@ -504,15 +524,8 @@ impl ChunkStorage {
         // from before segment staging through the visibility swap, so a compactor cannot
         // discover and retire these roots while the flush transaction is still preparing.
         // If this step fails, roll the new roots back rather than exposing data that restart
-        // cannot fully recover.
-        if let Some(data_path) = self
-            .persisted
-            .series_index_path
-            .as_deref()
-            .and_then(Path::parent)
-        {
-            super::super::maintenance::ensure_no_pending_post_flush_replacement(data_path)?;
-        }
+        // cannot fully recover. Both finite and exhaustive clean-fence modes have already proved
+        // the marker namespace safe under the caller's still-live compaction gate.
         if publish_ctx.0.load(Ordering::SeqCst) && policy == PersistSnapshotPolicy::All {
             if let Err(err) = self.drain_known_dirty_persisted_refresh_if_pending() {
                 if let Err(rollback_err) =
@@ -527,14 +540,13 @@ impl ChunkStorage {
         }
 
         let persist_result = match policy {
-            PersistSnapshotPolicy::All => {
-                let registry_catalog_sources = self
-                    .persisted_registry_catalog_sources_with_root_changes(
-                        published_segment_roots,
-                        &[],
-                    )?;
-                self.persist_series_registry_index_with_catalog_sources(&registry_catalog_sources)
-            }
+            PersistSnapshotPolicy::All => self
+                .persisted_registry_catalog_sources_with_root_changes(published_segment_roots, &[])
+                .and_then(|registry_catalog_sources| {
+                    self.persist_series_registry_index_with_catalog_sources(
+                        &registry_catalog_sources,
+                    )
+                }),
             PersistSnapshotPolicy::BackgroundBounded { .. } => {
                 self.persist_selected_series_registry_index_without_catalog(selected_series_ids)
             }
@@ -824,6 +836,62 @@ impl ChunkStorage {
             // preplanned delta behind the flush transition. Leave sealed/WAL state untouched and
             // let the persisted-refresh worker establish the current catalog first.
             return Ok(None);
+        }
+        if self.uses_finite_background_flush_fence(policy) {
+            let PersistSnapshotPolicy::BackgroundBounded {
+                max_items,
+                max_bytes,
+            } = policy
+            else {
+                unreachable!("only bounded persistence can have a finite maintenance envelope")
+            };
+            // A pass with no remaining envelope or no sealed candidate preserves the established
+            // bounded no-op behavior. In particular, active finalization may have consumed the
+            // complete shared pass before persistence is reached.
+            if max_items == 0
+                || max_bytes == 0
+                || snapshot_ctx.chunks.pending_sealed_chunks.read().is_empty()
+            {
+                return Ok(None);
+            }
+            if let Some(required) = snapshot_ctx
+                .chunks
+                .pending_sealed_chunks
+                .read()
+                .by_sequence
+                .values()
+                .next()
+                .map(|location| location.input_bytes)
+                .filter(|required| *required > max_bytes)
+            {
+                // Preserve the direct sealed-work dependency error without allocating or
+                // inspecting a snapshot that cannot fit this pass. The fence is relevant only
+                // once there is a publishable candidate to protect.
+                return Err(TsinkError::MaintenanceWorkItemTooLarge {
+                    operation: "sealed chunk persistence",
+                    limit: max_bytes,
+                    required,
+                });
+            }
+
+            if let Some(data_path) = self
+                .persisted
+                .series_index_path
+                .as_deref()
+                .and_then(Path::parent)
+            {
+                // Prove the marker namespace clean before writing any discoverable segment root.
+                // The compaction gate remains held through staging and visibility publication, so
+                // a marker publisher cannot invalidate this terminal generation in between.
+                let fence =
+                    self.advance_finite_post_flush_clean_fence(data_path, max_items, max_bytes)?;
+                if matches!(
+                    fence,
+                    super::super::maintenance::BackgroundPostFlushCleanFenceStep::EnvelopeConsumed
+                ) {
+                    return Ok(None);
+                }
+            }
         }
         let Some(staged_flush) = self.stage_flush_segment_publication(snapshot_ctx, policy)? else {
             return Ok(None);

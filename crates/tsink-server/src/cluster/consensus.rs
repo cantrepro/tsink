@@ -1,5 +1,6 @@
 use crate::cluster::control::{
-    encode_control_state_file, modeled_control_metrics_projection_retained_bytes,
+    encode_control_state_file, modeled_cluster_handoff_snapshot_retained_bytes,
+    modeled_control_metrics_projection_retained_bytes,
     modeled_control_status_projection_retained_bytes, AccountedControlRebalanceProjection,
     ClusterHandoffSnapshot, ControlHandoffMutationOutcome, ControlHotspotSnapshot,
     ControlMembershipMutationOutcome, ControlMetricsProjection, ControlNodeStatus, ControlState,
@@ -681,6 +682,36 @@ pub(crate) struct ControlStatusSnapshot {
     pub persistence: ControlPersistenceStatus,
     pub handoff: ClusterHandoffSnapshot,
     pub hotspot: ControlHotspotSnapshot,
+}
+
+/// Minimal first-generation control input used by the handoff status endpoint and support child.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ControlHandoffStatusSnapshot {
+    pub ring_version: u64,
+    pub leader_node_id: Option<String>,
+    pub handoff: ClusterHandoffSnapshot,
+}
+
+#[derive(Debug)]
+#[must_use = "dropping the handoff status releases its query-memory reservation"]
+pub(crate) struct AccountedControlHandoffStatusSnapshot {
+    snapshot: ControlHandoffStatusSnapshot,
+    _reservation: tsink::QueryMemoryReservation,
+}
+
+impl Deref for AccountedControlHandoffStatusSnapshot {
+    type Target = ControlHandoffStatusSnapshot;
+
+    fn deref(&self) -> &Self::Target {
+        &self.snapshot
+    }
+}
+
+impl AccountedControlHandoffStatusSnapshot {
+    #[cfg(test)]
+    fn accounted_bytes(&self) -> u64 {
+        self._reservation.bytes()
+    }
 }
 
 /// Status output whose dynamic allocations remain charged until every borrowed field is dropped.
@@ -2363,6 +2394,86 @@ impl ControlConsensusRuntime {
         state
             .control_state
             .rebalance_projection_with_execution(&self.local_node_id, execution)
+    }
+
+    /// Captures the first control-state generation consumed by handoff status.
+    ///
+    /// The complete leader and handoff clone peak is reserved while the consensus lock holds.
+    /// The temporary hotspot projection reuses the canonical status builder, then is discarded
+    /// before returning and the reservation is reconciled to the fields visible to handoff.
+    pub(crate) fn handoff_status_snapshot_with_execution(
+        &self,
+        execution: &tsink::QueryExecution,
+    ) -> Result<AccountedControlHandoffStatusSnapshot, tsink::QueryBudgetError> {
+        execution.checkpoint()?;
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        execution.checkpoint()?;
+
+        let leader_bytes = state
+            .control_state
+            .leader_node_id
+            .as_deref()
+            .map(modeled_control_metrics_str_bytes)
+            .unwrap_or(0);
+        let control_bytes = state
+            .control_state
+            .status_projection_retained_bytes_with_execution(execution)?;
+        let peak_bytes = leader_bytes.saturating_add(control_bytes);
+        let mut reservation = execution.reserve_memory(peak_bytes)?;
+        execution.checkpoint()?;
+
+        let ring_version = state.control_state.ring_version;
+        let leader_node_id = state
+            .control_state
+            .leader_node_id
+            .as_deref()
+            .map(clone_control_metrics_string);
+        let ControlStatusProjection { handoff, hotspot } = state
+            .control_state
+            .status_projection_with_execution(execution)?;
+        drop(hotspot);
+        let retained_bytes = leader_node_id
+            .as_ref()
+            .map(modeled_control_metrics_string_bytes)
+            .unwrap_or(0)
+            .saturating_add(modeled_cluster_handoff_snapshot_retained_bytes(&handoff));
+        assert!(
+            retained_bytes <= peak_bytes,
+            "handoff control status retained-memory model exceeded its pre-allocation reservation"
+        );
+        reservation.resize(retained_bytes)?;
+        Ok(AccountedControlHandoffStatusSnapshot {
+            snapshot: ControlHandoffStatusSnapshot {
+                ring_version,
+                leader_node_id,
+                handoff,
+            },
+            _reservation: reservation,
+        })
+    }
+
+    /// Counts the later control-state generation used by the rebalance portion of handoff status.
+    pub(crate) fn handoff_active_jobs_with_execution(
+        &self,
+        execution: &tsink::QueryExecution,
+    ) -> Result<usize, tsink::QueryBudgetError> {
+        execution.checkpoint()?;
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        execution.checkpoint()?;
+        let mut active_jobs = 0usize;
+        for transition in &state.control_state.transitions {
+            execution.checkpoint()?;
+            if transition.handoff.phase.is_active() {
+                active_jobs = active_jobs.saturating_add(1);
+            }
+        }
+        Ok(active_jobs)
     }
 
     /// Captures every schema-visible consensus/control input needed by TSDB status under one lock.
@@ -6462,6 +6573,163 @@ mod tests {
         assert_eq!(budget_status.shared_reserved_memory_bytes, 0);
         assert_eq!(budget_status.cancellations_total, 1);
         assert_eq!(budget_status.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn handoff_status_projection_preserves_legacy_values_and_enforces_exact_peak() {
+        let temp_dir = TempDir::new().expect("temp dir should create");
+        let runtime = open_runtime_for_node(
+            &temp_dir,
+            "node-a",
+            "127.0.0.1:9301",
+            &["node-b@127.0.0.1:9302"],
+            "handoff-status",
+            64,
+        );
+        configure_metrics_projection_fixture(&runtime);
+        {
+            let mut state = runtime
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.control_state.transitions.reverse();
+        }
+        let legacy_state = runtime.current_state();
+        let legacy_handoff = legacy_state.handoff_snapshot();
+
+        let calibration_budget =
+            QueryBudget::new(QueryBudgetLimits::default()).expect("budget should build");
+        let calibration = calibration_budget
+            .begin_query()
+            .expect("calibration query should admit");
+        let projected = runtime
+            .handoff_status_snapshot_with_execution(&calibration)
+            .expect("handoff projection should succeed");
+        assert_eq!(projected.ring_version, legacy_state.ring_version);
+        assert_eq!(projected.leader_node_id, legacy_state.leader_node_id);
+        assert_eq!(projected.handoff, legacy_handoff);
+        assert_eq!(
+            projected
+                .handoff
+                .shards
+                .iter()
+                .map(|shard| shard.shard)
+                .collect::<Vec<_>>(),
+            vec![0, 1],
+            "the focused projection must preserve legacy handoff sorting"
+        );
+        let retained_bytes = projected.accounted_bytes();
+        let exact_peak = calibration_budget
+            .snapshot()
+            .peak_shared_reserved_memory_bytes;
+        assert!(retained_bytes > 0);
+        assert!(exact_peak >= retained_bytes);
+        assert_eq!(calibration.snapshot().memory_reserved_bytes, retained_bytes);
+        drop(projected);
+        assert_eq!(calibration.snapshot().memory_reserved_bytes, 0);
+        drop(calibration);
+        let calibration_after = calibration_budget.snapshot();
+        assert_eq!(calibration_after.active_queries, 0);
+        assert_eq!(calibration_after.shared_reserved_memory_bytes, 0);
+        assert_eq!(calibration_after.accounting_invariant_violations_total, 0);
+
+        let exact_budget = QueryBudget::new(QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(exact_peak),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(exact_peak),
+                ..QueryWorkLimits::default()
+            },
+        })
+        .expect("exact budget should build");
+        let exact = exact_budget
+            .begin_query()
+            .expect("exact query should admit");
+        let projected = runtime
+            .handoff_status_snapshot_with_execution(&exact)
+            .expect("the exact handoff projection peak should pass");
+        assert_eq!(projected.accounted_bytes(), retained_bytes);
+        assert_eq!(
+            exact_budget.snapshot().peak_shared_reserved_memory_bytes,
+            exact_peak
+        );
+        drop(projected);
+        assert_eq!(exact.snapshot().memory_reserved_bytes, 0);
+        drop(exact);
+        let exact_after = exact_budget.snapshot();
+        assert_eq!(exact_after.active_queries, 0);
+        assert_eq!(exact_after.shared_reserved_memory_bytes, 0);
+        assert_eq!(exact_after.accounting_invariant_violations_total, 0);
+
+        let one_under_budget = QueryBudget::new(QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(exact_peak),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(exact_peak.saturating_sub(1)),
+                ..QueryWorkLimits::default()
+            },
+        })
+        .expect("one-under budget should build");
+        let one_under = one_under_budget
+            .begin_query()
+            .expect("one-under query should admit");
+        let error = runtime
+            .handoff_status_snapshot_with_execution(&one_under)
+            .expect_err("one byte below the complete handoff projection peak must reject");
+        match error {
+            QueryBudgetError::LimitExceeded(exceeded) => {
+                assert_eq!(exceeded.reason, QueryLimitReason::PerQueryMemoryBytes);
+                assert_eq!(exceeded.current, 0);
+                assert_eq!(exceeded.requested, exact_peak);
+            }
+            other => panic!("unexpected handoff projection error: {other}"),
+        }
+        assert_eq!(one_under.snapshot().memory_reserved_bytes, 0);
+        assert_eq!(
+            one_under_budget
+                .snapshot()
+                .peak_shared_reserved_memory_bytes,
+            0,
+            "the N-1 reservation must reject before leader or handoff strings are cloned"
+        );
+        drop(one_under);
+        let one_under_after = one_under_budget.snapshot();
+        assert_eq!(one_under_after.active_queries, 0);
+        assert_eq!(one_under_after.shared_reserved_memory_bytes, 0);
+        assert_eq!(one_under_after.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn handoff_status_projection_honors_precancellation_without_residue() {
+        let temp_dir = TempDir::new().expect("temp dir should create");
+        let runtime = open_runtime_for_node(
+            &temp_dir,
+            "node-a",
+            "127.0.0.1:9301",
+            &["node-b@127.0.0.1:9302"],
+            "handoff-status-cancel",
+            64,
+        );
+        configure_metrics_projection_fixture(&runtime);
+        let budget = QueryBudget::new(QueryBudgetLimits::default()).expect("budget should build");
+        let cancellation = QueryCancellationToken::new();
+        let execution = budget
+            .begin_query_with(QueryWorkLimits::default(), cancellation.clone())
+            .expect("query should admit");
+        cancellation.cancel();
+
+        let error = runtime
+            .handoff_status_snapshot_with_execution(&execution)
+            .expect_err("a pre-cancelled handoff projection must stop");
+        assert!(matches!(error, QueryBudgetError::Cancelled));
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        assert_eq!(budget.snapshot().peak_shared_reserved_memory_bytes, 0);
+        drop(execution);
+        let after = budget.snapshot();
+        assert_eq!(after.active_queries, 0);
+        assert_eq!(after.shared_reserved_memory_bytes, 0);
+        assert_eq!(after.cancellations_total, 1);
+        assert_eq!(after.accounting_invariant_violations_total, 0);
     }
 
     #[test]

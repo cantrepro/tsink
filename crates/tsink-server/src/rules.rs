@@ -37,6 +37,7 @@ const DEFAULT_RULES_SCHEDULER_TICK_MS: u64 = 1_000;
 const DEFAULT_MAX_RECORDING_ROWS_PER_EVAL: usize = 10_000;
 const DEFAULT_MAX_ALERT_INSTANCES_PER_RULE: usize = 10_000;
 const RULES_ALLOCATION_ALLOWANCE_BYTES: usize = 64;
+const RULES_STATUS_BTREE_ENTRY_ALLOWANCE_BYTES: usize = 1_024;
 const RULES_STARTUP_MAX_JSON_DEPTH: usize = 64;
 const RULES_MAX_DIAGNOSTIC_BYTES: usize = 512;
 const RECORDING_RULE_ATTEMPT_PENDING: &str =
@@ -1248,6 +1249,62 @@ pub struct RulesStatusSnapshot {
     pub groups: Vec<RuleGroupStatusSnapshot>,
 }
 
+#[derive(Debug)]
+#[must_use = "dropping the rules status releases its query-memory reservation"]
+pub(crate) struct AccountedRulesStatusSnapshot {
+    snapshot: RulesStatusSnapshot,
+    _reservation: tsink::QueryMemoryReservation,
+}
+
+impl std::ops::Deref for AccountedRulesStatusSnapshot {
+    type Target = RulesStatusSnapshot;
+
+    fn deref(&self) -> &Self::Target {
+        &self.snapshot
+    }
+}
+
+impl AccountedRulesStatusSnapshot {
+    #[cfg(test)]
+    fn accounted_bytes(&self) -> u64 {
+        self._reservation.bytes()
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum RulesStatusProjectionError {
+    QueryBudget(tsink::QueryBudgetError),
+    StoreReadPoisoned,
+    StatusLimit,
+    Serialization(&'static str),
+}
+
+impl std::fmt::Display for RulesStatusProjectionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::QueryBudget(error) => write!(formatter, "{error}"),
+            Self::StoreReadPoisoned => formatter.write_str("rules store read lock poisoned"),
+            Self::StatusLimit => formatter.write_str(RulesLimitSurface::SnapshotStatus.message()),
+            Self::Serialization(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for RulesStatusProjectionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::QueryBudget(error) => Some(error),
+            Self::StoreReadPoisoned | Self::StatusLimit | Self::Serialization(_) => None,
+        }
+    }
+}
+
+impl From<tsink::QueryBudgetError> for RulesStatusProjectionError {
+    fn from(error: tsink::QueryBudgetError) -> Self {
+        Self::QueryBudget(error)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RulesExpositionMetrics {
     pub scheduler_runs_total: u64,
@@ -1630,6 +1687,216 @@ impl RulesRuntime {
         snapshot.metrics.snapshot_rejections_total = latest_accounting.snapshot_rejections_total;
         snapshot.metrics.limit_rejections_total = latest_accounting.limit_rejections_total;
         Ok(snapshot)
+    }
+
+    /// Builds the complete rules status tree under the caller's query-memory budget.
+    ///
+    /// Sampling intentionally matches `snapshot`: runtime metrics are captured first, followed by
+    /// the later rules-store generation and its accounting counters. Every owned output byte is
+    /// modeled and reserved before group, rule, label, diagnostic, or alert-instance cloning.
+    pub(crate) fn status_snapshot_with_execution(
+        &self,
+        execution: &tsink::QueryExecution,
+    ) -> Result<AccountedRulesStatusSnapshot, RulesStatusProjectionError> {
+        execution.checkpoint()?;
+        let metrics = {
+            let metrics = self
+                .metrics
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let initial_bytes = metrics
+                .last_error
+                .as_deref()
+                .map(modeled_string_clone_upper_bytes)
+                .unwrap_or(0);
+            let reservation = execution.reserve_memory(saturating_u64(initial_bytes))?;
+            execution.checkpoint()?;
+            (reservation, metrics.clone())
+        };
+        let (mut reservation, metrics) = metrics;
+        execution.checkpoint()?;
+
+        let store = self
+            .store
+            .state
+            .read()
+            .map_err(|_| RulesStatusProjectionError::StoreReadPoisoned)?;
+        execution.checkpoint()?;
+        let (legacy_output_upper, query_output_upper) =
+            modeled_rules_status_output_upper_bytes_with_execution(&store, &metrics, execution)?;
+        self.store
+            .enforce_limit(
+                RulesLimitSurface::SnapshotStatus,
+                legacy_output_upper,
+                self.config.store_limits.max_snapshot_status_bytes,
+            )
+            .map_err(|_| RulesStatusProjectionError::StatusLimit)?;
+        reservation.resize(saturating_u64(query_output_upper))?;
+        execution.checkpoint()?;
+
+        let cluster_leader = self.scheduler_enabled_here();
+        execution.checkpoint()?;
+        let mut pending_alerts = 0u64;
+        let mut firing_alerts = 0u64;
+        for runtime in store.runtime.values() {
+            execution.checkpoint()?;
+            for instance in &runtime.alert_instances {
+                execution.checkpoint()?;
+                match instance.state {
+                    AlertInstanceStatus::Pending => {
+                        pending_alerts = pending_alerts.saturating_add(1);
+                    }
+                    AlertInstanceStatus::Firing => {
+                        firing_alerts = firing_alerts.saturating_add(1);
+                    }
+                }
+            }
+        }
+        let configured_groups = store.groups.len() as u64;
+        let mut configured_rules = 0u64;
+        for group in &store.groups {
+            execution.checkpoint()?;
+            configured_rules = configured_rules.saturating_add(group.rules.len() as u64);
+        }
+        let mut group_snapshots = Vec::with_capacity(store.groups.len());
+        for group in &store.groups {
+            execution.checkpoint()?;
+            group_snapshots.push(build_group_snapshot_with_execution(
+                group,
+                &store.runtime,
+                execution,
+            )?);
+        }
+        let store_accounting = self.store.accounting.snapshot();
+        execution.checkpoint()?;
+        let mut snapshot = RulesStatusSnapshot {
+            scheduler_tick_ms: u64::try_from(self.config.scheduler_tick.as_millis())
+                .unwrap_or(u64::MAX),
+            max_recording_rows_per_eval: self.config.max_recording_rows_per_eval,
+            max_alert_instances_per_rule: self.config.max_alert_instances_per_rule,
+            store_limits: self.config.store_limits,
+            cluster_enabled: self.cluster_context.is_some(),
+            cluster_leader,
+            metrics: RulesMetricsSnapshot {
+                scheduler_runs_total: metrics.scheduler_runs_total,
+                scheduler_skipped_not_leader_total: metrics.scheduler_skipped_not_leader_total,
+                scheduler_skipped_inflight_total: metrics.scheduler_skipped_inflight_total,
+                evaluated_rules_total: metrics.evaluated_rules_total,
+                evaluation_failures_total: metrics.evaluation_failures_total,
+                recording_rows_written_total: metrics.recording_rows_written_total,
+                last_run_unix_ms: metrics.last_run_unix_ms,
+                last_error: metrics.last_error,
+                configured_groups,
+                configured_rules,
+                pending_alerts,
+                firing_alerts,
+                local_scheduler_active: cluster_leader,
+                retained_state_bytes: store_accounting.retained_state_bytes,
+                peak_retained_state_bytes: store_accounting.peak_retained_state_bytes,
+                durable_file_bytes: store_accounting.durable_file_bytes,
+                peak_startup_transient_bytes: store_accounting.peak_startup_transient_bytes,
+                peak_replacement_transient_bytes: store_accounting.peak_replacement_transient_bytes,
+                peak_runtime_update_transient_bytes: store_accounting
+                    .peak_runtime_update_transient_bytes,
+                peak_snapshot_status_bytes: store_accounting.peak_snapshot_status_bytes,
+                peak_snapshot_file_bytes: store_accounting.peak_snapshot_file_bytes,
+                limit_rejections_total: store_accounting.limit_rejections_total,
+                startup_rejections_total: store_accounting.startup_rejections_total,
+                replacement_rejections_total: store_accounting.replacement_rejections_total,
+                runtime_update_rejections_total: store_accounting.runtime_update_rejections_total,
+                snapshot_rejections_total: store_accounting.snapshot_rejections_total,
+                persistence_failures_total: store_accounting.persistence_failures_total,
+            },
+            groups: group_snapshots,
+        };
+        let (legacy_actual_output_bytes, query_actual_output_bytes) =
+            modeled_rules_status_actual_bytes_with_execution(&snapshot, execution)?;
+        assert!(
+            query_actual_output_bytes <= query_output_upper,
+            "rules status retained-memory model exceeded its pre-allocation reservation"
+        );
+        self.store
+            .enforce_limit(
+                RulesLimitSurface::SnapshotStatus,
+                legacy_actual_output_bytes,
+                self.config.store_limits.max_snapshot_status_bytes,
+            )
+            .map_err(|_| RulesStatusProjectionError::StatusLimit)?;
+        let latest_accounting = self.store.accounting.snapshot();
+        execution.checkpoint()?;
+        snapshot.metrics.peak_snapshot_status_bytes = latest_accounting.peak_snapshot_status_bytes;
+        snapshot.metrics.snapshot_rejections_total = latest_accounting.snapshot_rejections_total;
+        snapshot.metrics.limit_rejections_total = latest_accounting.limit_rejections_total;
+        reservation.resize(saturating_u64(query_actual_output_bytes))?;
+        drop(store);
+        execution.checkpoint()?;
+
+        Ok(AccountedRulesStatusSnapshot {
+            snapshot,
+            _reservation: reservation,
+        })
+    }
+
+    /// Stabilizes the self-observing rules status counters without allocating the HTTP body.
+    ///
+    /// The direct endpoint reserves the same conservative encoded-vector upper bound before its
+    /// exact allocation. Replaying that fixed-point loop here preserves its visible counters while
+    /// the support-bundle serializer owns the separately query-accounted body allocation.
+    pub(crate) fn prepare_success_snapshot_iteration_with_execution(
+        &self,
+        snapshot: &mut AccountedRulesStatusSnapshot,
+        execution: &tsink::QueryExecution,
+    ) -> Result<Option<usize>, RulesStatusProjectionError> {
+        execution.checkpoint()?;
+        let accounting = self.store.accounting.snapshot();
+        execution.checkpoint()?;
+        snapshot.snapshot.metrics.peak_snapshot_status_bytes =
+            accounting.peak_snapshot_status_bytes;
+        snapshot.snapshot.metrics.snapshot_rejections_total = accounting.snapshot_rejections_total;
+        snapshot.snapshot.metrics.limit_rejections_total = accounting.limit_rejections_total;
+
+        let (snapshot_bytes, _) =
+            modeled_rules_status_actual_bytes_with_execution(&snapshot.snapshot, execution)?;
+        let encoded_len =
+            measure_rules_success_snapshot_with_execution(&snapshot.snapshot, execution)?;
+        if encoded_len > crate::http::MAX_BODY_BYTES {
+            self.store
+                .accounting
+                .reject(RulesLimitSurface::SnapshotStatus);
+            return Err(RulesStatusProjectionError::StatusLimit);
+        }
+        self.store
+            .enforce_limit(
+                RulesLimitSurface::SnapshotStatus,
+                snapshot_bytes.saturating_add(modeled_vec_clone_upper_bytes::<u8>(encoded_len)),
+                self.config.store_limits.max_snapshot_status_bytes,
+            )
+            .map_err(|_| RulesStatusProjectionError::StatusLimit)?;
+        let latest = self.store.accounting.snapshot();
+        let stable = latest.peak_snapshot_status_bytes
+            == snapshot.snapshot.metrics.peak_snapshot_status_bytes;
+        Ok(stable.then_some(encoded_len))
+    }
+
+    pub(crate) fn finalize_success_snapshot_with_execution(
+        &self,
+        snapshot: &AccountedRulesStatusSnapshot,
+        encoded_capacity: usize,
+        execution: &tsink::QueryExecution,
+    ) -> Result<bool, RulesStatusProjectionError> {
+        execution.checkpoint()?;
+        let (snapshot_bytes, _) =
+            modeled_rules_status_actual_bytes_with_execution(&snapshot.snapshot, execution)?;
+        self.store
+            .enforce_limit(
+                RulesLimitSurface::SnapshotStatus,
+                snapshot_bytes.saturating_add(modeled_allocation_bytes(encoded_capacity)),
+                self.config.store_limits.max_snapshot_status_bytes,
+            )
+            .map_err(|_| RulesStatusProjectionError::StatusLimit)?;
+        let latest = self.store.accounting.snapshot();
+        Ok(latest.peak_snapshot_status_bytes
+            == snapshot.snapshot.metrics.peak_snapshot_status_bytes)
     }
 
     pub(crate) fn metrics_snapshot_with_execution(
@@ -2342,6 +2609,81 @@ fn modeled_rules_status_output_upper_bytes(
     bytes
 }
 
+fn modeled_rules_status_output_upper_bytes_with_execution(
+    state: &PersistedRulesStoreState,
+    metrics: &RulesRuntimeMetrics,
+    execution: &tsink::QueryExecution,
+) -> Result<(usize, usize), RulesStatusProjectionError> {
+    let mut bytes = std::mem::size_of::<RulesStatusSnapshot>()
+        .saturating_add(modeled_vec_clone_upper_bytes::<RuleGroupStatusSnapshot>(
+            state.groups.len(),
+        ))
+        .saturating_add(
+            metrics
+                .last_error
+                .as_deref()
+                .map(modeled_string_clone_upper_bytes)
+                .unwrap_or(0),
+        );
+    let mut configured_rules = 0usize;
+    let mut map_entries = 0usize;
+    for group in &state.groups {
+        execution.checkpoint()?;
+        configured_rules = configured_rules.saturating_add(group.rules.len());
+        map_entries = map_entries.saturating_add(group.labels.len());
+        bytes = bytes
+            .saturating_add(modeled_string_clone_upper_bytes(&group.name))
+            .saturating_add(modeled_string_clone_upper_bytes(&group.tenant_id))
+            .saturating_add(modeled_string_map_clone_upper_bytes(&group.labels))
+            .saturating_add(modeled_vec_clone_upper_bytes::<RuleStatusSnapshot>(
+                group.rules.len(),
+            ));
+        for rule in &group.rules {
+            execution.checkpoint()?;
+            map_entries = map_entries
+                .saturating_add(rule_labels(rule).len())
+                .saturating_add(rule_annotations(rule).len());
+            let rule_id_len = group
+                .tenant_id
+                .len()
+                .saturating_add(group.name.len())
+                .saturating_add(rule_kind(rule).len())
+                .saturating_add(rule_name(rule).len())
+                .saturating_add(3);
+            bytes = bytes
+                .saturating_add(modeled_allocation_bytes(rule_id_len))
+                .saturating_add(modeled_string_clone_upper_bytes(rule_name(rule)))
+                .saturating_add(modeled_string_clone_upper_bytes(rule_kind(rule)))
+                .saturating_add(modeled_string_clone_upper_bytes(rule_expr(rule)))
+                .saturating_add(modeled_string_map_clone_upper_bytes(rule_labels(rule)))
+                .saturating_add(modeled_string_map_clone_upper_bytes(rule_annotations(rule)))
+                .saturating_add(modeled_string_clone_upper_bytes("inactive"));
+        }
+    }
+    for runtime in state.runtime.values() {
+        execution.checkpoint()?;
+        bytes = bytes
+            .saturating_add(
+                runtime
+                    .last_error
+                    .as_deref()
+                    .map(modeled_string_clone_upper_bytes)
+                    .unwrap_or(0),
+            )
+            .saturating_add(modeled_vec_clone_upper_bytes::<AlertInstanceState>(
+                runtime.alert_instances.len(),
+            ));
+        for instance in &runtime.alert_instances {
+            execution.checkpoint()?;
+            bytes = bytes.saturating_add(modeled_alert_instance_clone_upper_bytes(instance));
+        }
+    }
+    let query_upper = bytes
+        .saturating_add(configured_rules.saturating_mul(std::mem::size_of::<RuleStatusSnapshot>()))
+        .saturating_add(map_entries.saturating_mul(RULES_STATUS_BTREE_ENTRY_ALLOWANCE_BYTES));
+    Ok((bytes, query_upper))
+}
+
 fn modeled_rule_status_actual_bytes(rule: &RuleStatusSnapshot) -> usize {
     std::mem::size_of::<RuleStatusSnapshot>()
         .saturating_add(modeled_owned_string_bytes(&rule.id))
@@ -2386,6 +2728,61 @@ fn modeled_rules_status_actual_bytes(snapshot: &RulesStatusSnapshot) -> usize {
         }))
 }
 
+fn modeled_rules_status_actual_bytes_with_execution(
+    snapshot: &RulesStatusSnapshot,
+    execution: &tsink::QueryExecution,
+) -> Result<(usize, usize), RulesStatusProjectionError> {
+    let mut bytes = std::mem::size_of::<RulesStatusSnapshot>()
+        .saturating_add(
+            snapshot
+                .metrics
+                .last_error
+                .as_ref()
+                .map(modeled_owned_string_bytes)
+                .unwrap_or(0),
+        )
+        .saturating_add(modeled_owned_vec_bytes(&snapshot.groups));
+    let mut map_entries = 0usize;
+    for group in &snapshot.groups {
+        execution.checkpoint()?;
+        map_entries = map_entries.saturating_add(group.labels.len());
+        bytes = bytes
+            .saturating_add(modeled_owned_string_bytes(&group.name))
+            .saturating_add(modeled_owned_string_bytes(&group.tenant_id))
+            .saturating_add(modeled_string_map_bytes(&group.labels))
+            .saturating_add(modeled_owned_vec_bytes(&group.rules));
+        for rule in &group.rules {
+            execution.checkpoint()?;
+            map_entries = map_entries
+                .saturating_add(rule.labels.len())
+                .saturating_add(rule.annotations.len());
+            bytes = bytes
+                .saturating_add(std::mem::size_of::<RuleStatusSnapshot>())
+                .saturating_add(modeled_owned_string_bytes(&rule.id))
+                .saturating_add(modeled_owned_string_bytes(&rule.name))
+                .saturating_add(modeled_owned_string_bytes(&rule.kind))
+                .saturating_add(modeled_owned_string_bytes(&rule.expr))
+                .saturating_add(modeled_string_map_bytes(&rule.labels))
+                .saturating_add(modeled_string_map_bytes(&rule.annotations))
+                .saturating_add(
+                    rule.last_error
+                        .as_ref()
+                        .map(modeled_owned_string_bytes)
+                        .unwrap_or(0),
+                )
+                .saturating_add(modeled_owned_string_bytes(&rule.state))
+                .saturating_add(modeled_owned_vec_bytes(&rule.alert_instances));
+            for instance in &rule.alert_instances {
+                execution.checkpoint()?;
+                bytes = bytes.saturating_add(modeled_alert_instance_heap_bytes(instance));
+            }
+        }
+    }
+    let query_bytes =
+        bytes.saturating_add(map_entries.saturating_mul(RULES_STATUS_BTREE_ENTRY_ALLOWANCE_BYTES));
+    Ok((bytes, query_bytes))
+}
+
 fn build_group_snapshot(
     group: &RuleGroupSpec,
     runtime: &BTreeMap<String, PersistedRuleRuntimeState>,
@@ -2426,18 +2823,115 @@ fn build_group_snapshot(
     })
 }
 
+fn clone_string_map_with_execution(
+    values: &BTreeMap<String, String>,
+    execution: &tsink::QueryExecution,
+) -> Result<BTreeMap<String, String>, RulesStatusProjectionError> {
+    let mut cloned = BTreeMap::new();
+    for (name, value) in values {
+        execution.checkpoint()?;
+        cloned.insert(name.clone(), value.clone());
+    }
+    Ok(cloned)
+}
+
+fn clone_labels_with_execution(
+    labels: &[Label],
+    execution: &tsink::QueryExecution,
+) -> Result<Vec<Label>, RulesStatusProjectionError> {
+    let mut cloned = Vec::with_capacity(labels.len());
+    for label in labels {
+        execution.checkpoint()?;
+        cloned.push(label.clone());
+    }
+    Ok(cloned)
+}
+
+fn clone_alert_instances_with_execution(
+    instances: &[AlertInstanceState],
+    execution: &tsink::QueryExecution,
+) -> Result<Vec<AlertInstanceState>, RulesStatusProjectionError> {
+    let mut cloned = Vec::with_capacity(instances.len());
+    for instance in instances {
+        execution.checkpoint()?;
+        cloned.push(AlertInstanceState {
+            key: instance.key.clone(),
+            source_metric: instance.source_metric.clone(),
+            labels: clone_labels_with_execution(&instance.labels, execution)?,
+            active_since_timestamp: instance.active_since_timestamp,
+            last_seen_timestamp: instance.last_seen_timestamp,
+            firing_since_timestamp: instance.firing_since_timestamp,
+            state: instance.state,
+            sample_type: instance.sample_type.clone(),
+            sample_value: instance.sample_value.clone(),
+        });
+    }
+    Ok(cloned)
+}
+
+fn build_group_snapshot_with_execution(
+    group: &RuleGroupSpec,
+    runtime: &BTreeMap<String, PersistedRuleRuntimeState>,
+    execution: &tsink::QueryExecution,
+) -> Result<RuleGroupStatusSnapshot, RulesStatusProjectionError> {
+    let mut rules = Vec::with_capacity(group.rules.len());
+    for rule in &group.rules {
+        execution.checkpoint()?;
+        let rule_id = rule_id(group, rule);
+        let state = runtime.get(&rule_id);
+        rules.push(RuleStatusSnapshot {
+            id: rule_id,
+            name: rule_name(rule).to_string(),
+            kind: rule_kind(rule).to_string(),
+            expr: rule_expr(rule).to_string(),
+            interval_secs: rule_interval_secs(group, rule),
+            for_secs: rule_for_secs(rule),
+            labels: clone_string_map_with_execution(rule_labels(rule), execution)?,
+            annotations: clone_string_map_with_execution(rule_annotations(rule), execution)?,
+            last_eval_timestamp: state.and_then(|state| state.last_eval_timestamp),
+            last_eval_unix_ms: state.and_then(|state| state.last_eval_unix_ms),
+            last_success_unix_ms: state.and_then(|state| state.last_success_unix_ms),
+            last_duration_ms: state.map_or(0, |state| state.last_duration_ms),
+            last_error: state.and_then(|state| state.last_error.clone()),
+            last_sample_count: state.map_or(0, |state| state.last_sample_count),
+            last_recorded_rows: state.map_or(0, |state| state.last_recorded_rows),
+            state: state
+                .map(|state| summarize_rule_state_str(rule, state))
+                .unwrap_or("inactive")
+                .to_string(),
+            alert_instances: match state {
+                Some(state) => {
+                    clone_alert_instances_with_execution(&state.alert_instances, execution)?
+                }
+                None => Vec::new(),
+            },
+        });
+    }
+    Ok(RuleGroupStatusSnapshot {
+        name: group.name.clone(),
+        tenant_id: group.tenant_id.clone(),
+        interval_secs: group.interval_secs,
+        labels: clone_string_map_with_execution(&group.labels, execution)?,
+        rules,
+    })
+}
+
 fn summarize_rule_state(rule: &RuleSpec, state: &PersistedRuleRuntimeState) -> String {
+    summarize_rule_state_str(rule, state).to_string()
+}
+
+fn summarize_rule_state_str(rule: &RuleSpec, state: &PersistedRuleRuntimeState) -> &'static str {
     if state.last_error.is_some()
         && matches!(state.last_outcome, Some(RuleEvaluationOutcome::Error))
     {
-        return "error".to_string();
+        return "error";
     }
     match rule {
         RuleSpec::Recording(_) => {
             if state.last_eval_timestamp.is_some() {
-                "ok".to_string()
+                "ok"
             } else {
-                "inactive".to_string()
+                "inactive"
             }
         }
         RuleSpec::Alert(_) => {
@@ -2446,15 +2940,15 @@ fn summarize_rule_state(rule: &RuleSpec, state: &PersistedRuleRuntimeState) -> S
                 .iter()
                 .any(|instance| instance.state == AlertInstanceStatus::Firing)
             {
-                "firing".to_string()
+                "firing"
             } else if state
                 .alert_instances
                 .iter()
                 .any(|instance| instance.state == AlertInstanceStatus::Pending)
             {
-                "pending".to_string()
+                "pending"
             } else {
-                "inactive".to_string()
+                "inactive"
             }
         }
     }
@@ -3228,6 +3722,56 @@ fn measure_json_value<S: Serialize + ?Sized>(value: &S) -> Result<usize, RulesSt
     Ok(counter.bytes)
 }
 
+struct RulesExecutionJsonLengthWriter<'a> {
+    bytes: usize,
+    execution: &'a tsink::QueryExecution,
+    control_error: Option<tsink::QueryBudgetError>,
+}
+
+impl Write for RulesExecutionJsonLengthWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if let Err(error) = self.execution.checkpoint() {
+            self.control_error = Some(error);
+            return Err(io::Error::other(
+                "rules status JSON measurement was canceled",
+            ));
+        }
+        self.bytes = self
+            .bytes
+            .checked_add(bytes.len())
+            .ok_or_else(|| io::Error::other("rules status JSON length overflow"))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn measure_rules_success_snapshot_with_execution(
+    snapshot: &RulesStatusSnapshot,
+    execution: &tsink::QueryExecution,
+) -> Result<usize, RulesStatusProjectionError> {
+    let envelope = RulesSuccessEnvelope {
+        status: "success",
+        data: snapshot,
+    };
+    let mut counter = RulesExecutionJsonLengthWriter {
+        bytes: 0,
+        execution,
+        control_error: None,
+    };
+    if serde_json::to_writer(&mut counter, &envelope).is_err() {
+        return Err(match counter.control_error {
+            Some(error) => RulesStatusProjectionError::QueryBudget(error),
+            None => {
+                RulesStatusProjectionError::Serialization("failed to measure bounded rules JSON")
+            }
+        });
+    }
+    Ok(counter.bytes)
+}
+
 fn encode_json_value_exact<S: Serialize + ?Sized>(
     value: &S,
     encoded_len: usize,
@@ -3619,6 +4163,315 @@ mod tests {
             max_runtime_update_transient_bytes: 16 * 1024 * 1024,
             max_snapshot_status_bytes: 16 * 1024 * 1024,
         }
+    }
+
+    fn rich_status_projection_runtime() -> Arc<RulesRuntime> {
+        let storage: Arc<dyn Storage> =
+            StorageBuilder::new().build().expect("storage should build");
+        let runtime = RulesRuntime::open_with_config(
+            None,
+            storage,
+            TimestampPrecision::Milliseconds,
+            None,
+            None,
+            None,
+            RulesRuntimeConfig {
+                store_limits: test_store_limits(),
+                max_alert_instances_per_rule: test_store_limits().max_alert_instances_per_rule,
+                ..RulesRuntimeConfig::default()
+            },
+        )
+        .expect("rules runtime should open");
+        let group = RuleGroupSpec {
+            name: "status-\u{2603}-group".to_string(),
+            tenant_id: "team-\"quoted\"".to_string(),
+            interval_secs: 45,
+            labels: BTreeMap::from([
+                ("environment".to_string(), "staging\\blue".to_string()),
+                ("region".to_string(), "central".to_string()),
+            ]),
+            rules: vec![
+                RuleSpec::Recording(RecordingRuleSpec {
+                    record: "status_recording_one".to_string(),
+                    expr: "sum(source_metric{path=\"a\\\\b\"})".to_string(),
+                    interval_secs: Some(15),
+                    labels: BTreeMap::from([(
+                        "recording_label".to_string(),
+                        "value-one".to_string(),
+                    )]),
+                }),
+                RuleSpec::Alert(AlertRuleSpec {
+                    alert: "StatusAlertOne".to_string(),
+                    expr: "source_metric > 0".to_string(),
+                    interval_secs: None,
+                    for_secs: 30,
+                    labels: BTreeMap::from([("severity".to_string(), "warning".to_string())]),
+                    annotations: BTreeMap::from([(
+                        "summary".to_string(),
+                        "snowman \u{2603} says \"hello\"".to_string(),
+                    )]),
+                }),
+                RuleSpec::Recording(RecordingRuleSpec {
+                    record: "status_recording_two".to_string(),
+                    expr: "max(secondary_metric)".to_string(),
+                    interval_secs: None,
+                    labels: BTreeMap::from([("zone".to_string(), "z2".to_string())]),
+                }),
+                RuleSpec::Alert(AlertRuleSpec {
+                    alert: "StatusAlertTwo".to_string(),
+                    expr: "secondary_metric == 0".to_string(),
+                    interval_secs: Some(10),
+                    for_secs: 0,
+                    labels: BTreeMap::from([("severity".to_string(), "critical".to_string())]),
+                    annotations: BTreeMap::from([(
+                        "runbook".to_string(),
+                        "https://example.invalid/runbook?q=\"status\"".to_string(),
+                    )]),
+                }),
+            ],
+        };
+        runtime
+            .store
+            .apply_groups(vec![group.clone()])
+            .expect("rich rules group should apply");
+        let alert_rule_id = rule_id(&group, &group.rules[1]);
+        let recording_rule_id = rule_id(&group, &group.rules[0]);
+        {
+            let mut state = runtime
+                .store
+                .state
+                .write()
+                .expect("rules state should remain writable");
+            state.runtime.insert(
+                alert_rule_id,
+                PersistedRuleRuntimeState {
+                    fingerprint: 41,
+                    last_eval_timestamp: Some(1_700_000_001_000),
+                    last_eval_unix_ms: Some(1_700_000_001_111),
+                    last_success_unix_ms: Some(1_700_000_001_222),
+                    last_duration_ms: 17,
+                    last_error: Some("diagnostic: escaped \\\"value\\\" \u{2603}".to_string()),
+                    last_sample_count: 2,
+                    last_recorded_rows: 0,
+                    last_outcome: Some(RuleEvaluationOutcome::Error),
+                    alert_instances: vec![
+                        AlertInstanceState {
+                            key: "pending-key".to_string(),
+                            source_metric: "source_metric".to_string(),
+                            labels: vec![Label::new("host", "alpha")],
+                            active_since_timestamp: 1_700_000_000_000,
+                            last_seen_timestamp: 1_700_000_001_000,
+                            firing_since_timestamp: None,
+                            state: AlertInstanceStatus::Pending,
+                            sample_type: "float".to_string(),
+                            sample_value: Some("1.5".to_string()),
+                        },
+                        AlertInstanceState {
+                            key: "firing-key".to_string(),
+                            source_metric: "source_metric".to_string(),
+                            labels: vec![Label::new("host", "beta")],
+                            active_since_timestamp: 1_699_999_999_000,
+                            last_seen_timestamp: 1_700_000_001_000,
+                            firing_since_timestamp: Some(1_700_000_000_500),
+                            state: AlertInstanceStatus::Firing,
+                            sample_type: "histogram".to_string(),
+                            sample_value: None,
+                        },
+                    ],
+                },
+            );
+            state.runtime.insert(
+                recording_rule_id,
+                PersistedRuleRuntimeState {
+                    fingerprint: 42,
+                    last_eval_timestamp: Some(1_700_000_002_000),
+                    last_eval_unix_ms: Some(1_700_000_002_111),
+                    last_success_unix_ms: Some(1_700_000_002_222),
+                    last_duration_ms: 9,
+                    last_sample_count: 4,
+                    last_recorded_rows: 3,
+                    last_outcome: Some(RuleEvaluationOutcome::Success),
+                    ..PersistedRuleRuntimeState::default()
+                },
+            );
+        }
+        {
+            let mut metrics = runtime
+                .metrics
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            metrics.scheduler_runs_total = 11;
+            metrics.evaluated_rules_total = 19;
+            metrics.evaluation_failures_total = 3;
+            metrics.recording_rows_written_total = 7;
+            metrics.last_run_unix_ms = Some(1_700_000_003_000);
+            metrics.last_error = Some("scheduler diagnostic \u{2603}".to_string());
+        }
+        runtime
+    }
+
+    #[test]
+    fn accounted_status_projection_preserves_rich_legacy_snapshot_bytes() {
+        let runtime = rich_status_projection_runtime();
+        let legacy = runtime.snapshot().expect("legacy status should build");
+        let expected = serde_json::to_vec(&legacy).expect("legacy status should serialize");
+        let budget = tsink::QueryBudget::new(tsink::QueryBudgetLimits::default())
+            .expect("query budget should build");
+        let execution = budget
+            .begin_query()
+            .expect("rules status query should admit");
+
+        let projected = runtime
+            .status_snapshot_with_execution(&execution)
+            .expect("accounted rules status should build");
+        assert_eq!(
+            serde_json::to_vec(&*projected).expect("accounted status should serialize"),
+            expected
+        );
+        assert_eq!(projected.groups[0].rules.len(), 4);
+        assert_eq!(projected.metrics.pending_alerts, 1);
+        assert_eq!(projected.metrics.firing_alerts, 1);
+        assert_eq!(
+            execution.snapshot().memory_reserved_bytes,
+            projected.accounted_bytes()
+        );
+        assert!(projected.accounted_bytes() > 0);
+        drop(projected);
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        drop(execution);
+        let after = budget.snapshot();
+        assert_eq!(after.active_queries, 0);
+        assert_eq!(after.shared_reserved_memory_bytes, 0);
+        assert_eq!(after.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn accounted_status_projection_enforces_exact_query_memory_peak() {
+        let runtime = rich_status_projection_runtime();
+        let calibration_budget = tsink::QueryBudget::new(tsink::QueryBudgetLimits::default())
+            .expect("calibration budget should build");
+        let calibration = calibration_budget
+            .begin_query()
+            .expect("calibration query should admit");
+        let calibrated = runtime
+            .status_snapshot_with_execution(&calibration)
+            .expect("calibration status should build");
+        let retained = calibrated.accounted_bytes();
+        let required = calibration_budget
+            .snapshot()
+            .peak_shared_reserved_memory_bytes;
+        assert!(required >= retained);
+        assert!(retained > 0);
+        drop(calibrated);
+        drop(calibration);
+
+        let exact_budget = tsink::QueryBudget::new(tsink::QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(required),
+            per_query: tsink::QueryWorkLimits {
+                max_memory_bytes: Some(required),
+                ..tsink::QueryWorkLimits::default()
+            },
+        })
+        .expect("exact budget should build");
+        let exact = exact_budget
+            .begin_query()
+            .expect("exact query should admit");
+        let exact_snapshot = runtime
+            .status_snapshot_with_execution(&exact)
+            .expect("the exact status projection peak should pass");
+        assert_eq!(exact_snapshot.accounted_bytes(), retained);
+        assert_eq!(
+            exact_budget.snapshot().peak_shared_reserved_memory_bytes,
+            required
+        );
+        drop(exact_snapshot);
+        assert_eq!(exact.snapshot().memory_reserved_bytes, 0);
+        drop(exact);
+
+        let one_under_budget = tsink::QueryBudget::new(tsink::QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(required),
+            per_query: tsink::QueryWorkLimits {
+                max_memory_bytes: Some(required.saturating_sub(1)),
+                ..tsink::QueryWorkLimits::default()
+            },
+        })
+        .expect("one-under budget should build");
+        let one_under = one_under_budget
+            .begin_query()
+            .expect("one-under query should admit");
+        assert!(matches!(
+            runtime.status_snapshot_with_execution(&one_under),
+            Err(RulesStatusProjectionError::QueryBudget(
+                tsink::QueryBudgetError::LimitExceeded(_)
+            ))
+        ));
+        assert_eq!(one_under.snapshot().memory_reserved_bytes, 0);
+        drop(one_under);
+
+        for budget in [calibration_budget, exact_budget, one_under_budget] {
+            let after = budget.snapshot();
+            assert_eq!(after.active_queries, 0);
+            assert_eq!(after.shared_reserved_memory_bytes, 0);
+            assert_eq!(after.accounting_invariant_violations_total, 0);
+        }
+    }
+
+    #[test]
+    fn accounted_status_projection_honors_precancellation_without_residue() {
+        let runtime = rich_status_projection_runtime();
+        let budget = tsink::QueryBudget::new(tsink::QueryBudgetLimits::default())
+            .expect("query budget should build");
+        let cancellation = tsink::QueryCancellationToken::new();
+        let execution = budget
+            .begin_query_with_token(cancellation.clone())
+            .expect("rules status query should admit");
+        cancellation.cancel();
+
+        assert!(matches!(
+            runtime.status_snapshot_with_execution(&execution),
+            Err(RulesStatusProjectionError::QueryBudget(
+                tsink::QueryBudgetError::Cancelled
+            ))
+        ));
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        drop(execution);
+        let after = budget.snapshot();
+        assert_eq!(after.active_queries, 0);
+        assert_eq!(after.shared_reserved_memory_bytes, 0);
+        assert_eq!(after.cancellations_total, 1);
+        assert_eq!(after.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn accounted_status_projection_releases_memory_when_store_lock_is_poisoned() {
+        let runtime = rich_status_projection_runtime();
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _state = runtime
+                .store
+                .state
+                .write()
+                .expect("rules state should initially be writable");
+            panic!("poison rules status source lock");
+        }));
+        assert!(poisoned.is_err());
+        let budget = tsink::QueryBudget::new(tsink::QueryBudgetLimits::default())
+            .expect("query budget should build");
+        let execution = budget
+            .begin_query()
+            .expect("rules status query should admit");
+
+        assert!(matches!(
+            runtime.status_snapshot_with_execution(&execution),
+            Err(RulesStatusProjectionError::StoreReadPoisoned)
+        ));
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        drop(execution);
+        let after = budget.snapshot();
+        assert_eq!(after.active_queries, 0);
+        assert_eq!(after.shared_reserved_memory_bytes, 0);
+        assert_eq!(after.accounting_invariant_violations_total, 0);
     }
 
     #[test]

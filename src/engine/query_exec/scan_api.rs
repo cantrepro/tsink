@@ -1,15 +1,16 @@
 use crate::engine::query::TieredQueryPlan;
 use crate::validation::{validate_labels, validate_metric};
-use crate::{MetricSeries, Result, Row, TsinkError};
+use crate::{MetricSeries, Result, Row, SeriesMatcher, SeriesSelection, TsinkError};
 
 use super::{
     modeled_metric_series_retained_bytes, modeled_metric_series_shape_retained_bytes,
-    modeled_points_retained_bytes, modeled_string_capacity_bytes, modeled_vec_capacity_bytes,
-    modeled_vec_growth_capacity_upper, shard_window_fnv1a_update, shard_window_hash_data_point,
-    sort_data_points_for_shard_window_with_execution, validate_query_rows_scan_options,
-    validate_shard_window_request, validate_shard_window_scan_options, ChunkStorage,
-    MetadataShardScope, PersistedTierFetchStats, QueryExecution, QueryRowsExecutionResult,
-    QueryRowsPage, QueryRowsScanOptions, RawSeriesScanPage, SeriesId, ShardWindowDigest,
+    modeled_points_retained_bytes, modeled_row_parts_returned_bytes, modeled_string_capacity_bytes,
+    modeled_vec_capacity_bytes, modeled_vec_growth_capacity_upper, shard_window_fnv1a_update,
+    shard_window_hash_data_point, sort_data_points_for_shard_window_with_execution,
+    validate_query_rows_scan_options, validate_shard_window_request,
+    validate_shard_window_scan_options, ChunkStorage, MetadataShardScope, PersistedTierFetchStats,
+    QueryExecution, QueryRowsExecutionResult, QueryRowsPage, QueryRowsScanOptions,
+    RawSeriesScanPage, RuntimeMetadataCandidatePlan, SeriesId, ShardWindowDigest,
     ShardWindowRowsExecutionResult, ShardWindowRowsPage, ShardWindowScanOptions,
     SHARD_WINDOW_FNV_OFFSET_BASIS,
 };
@@ -29,6 +30,73 @@ fn modeled_resolved_series_retained_bytes(series: &[MetricSeries]) -> u64 {
             ))
         }),
     )
+}
+
+fn modeled_metric_matcher_selection_retained_bytes(
+    metric_capacity: usize,
+    matcher_capacity: usize,
+    matchers: &[SeriesMatcher],
+) -> u64 {
+    modeled_string_capacity_bytes(metric_capacity)
+        .saturating_add(modeled_vec_capacity_bytes::<SeriesMatcher>(
+            matcher_capacity,
+        ))
+        .saturating_add(matchers.iter().fold(0u64, |bytes, matcher| {
+            bytes
+                .saturating_add(modeled_string_capacity_bytes(matcher.name.capacity()))
+                .saturating_add(modeled_string_capacity_bytes(matcher.value.capacity()))
+        }))
+}
+
+fn modeled_metric_matcher_selection_clone_upper_bytes(
+    metric: &str,
+    matchers: &[SeriesMatcher],
+) -> u64 {
+    modeled_string_capacity_bytes(metric.len())
+        .saturating_add(modeled_vec_capacity_bytes::<SeriesMatcher>(matchers.len()))
+        .saturating_add(matchers.iter().fold(0u64, |bytes, matcher| {
+            bytes
+                .saturating_add(modeled_string_capacity_bytes(matcher.name.capacity()))
+                .saturating_add(modeled_string_capacity_bytes(matcher.value.capacity()))
+        }))
+}
+
+fn modeled_resolved_metric_rows_retained_bytes(
+    resolved: &Vec<(MetricSeries, Option<SeriesId>)>,
+) -> u64 {
+    modeled_vec_capacity_bytes::<(MetricSeries, Option<SeriesId>)>(resolved.capacity())
+        .saturating_add(resolved.iter().fold(0u64, |bytes, (series, _)| {
+            bytes.saturating_add(modeled_metric_series_retained_bytes(series))
+        }))
+}
+
+fn charge_projected_row_before_materialization(
+    execution: &QueryExecution,
+    metric: &str,
+    labels: &[crate::Label],
+    point: &crate::DataPoint,
+    excluded_output_label: Option<&str>,
+) -> Result<()> {
+    let excluded_label_bytes = excluded_output_label.map_or(0u64, |excluded_name| {
+        labels.iter().fold(0u64, |bytes, label| {
+            if label.name != excluded_name {
+                return bytes;
+            }
+            bytes
+                .saturating_add(
+                    u64::try_from(std::mem::size_of::<crate::Label>()).unwrap_or(u64::MAX),
+                )
+                .saturating_add(u64::try_from(label.name.len()).unwrap_or(u64::MAX))
+                .saturating_add(u64::try_from(label.value.len()).unwrap_or(u64::MAX))
+        })
+    });
+    execution.checkpoint()?;
+    execution.charge_samples_returned(1)?;
+    execution.charge_returned_bytes(
+        modeled_row_parts_returned_bytes(metric, labels, point)
+            .saturating_sub(excluded_label_bytes),
+    )?;
+    Ok(())
 }
 
 fn shard_scan_identity_key_len(
@@ -178,6 +246,7 @@ impl ChunkStorage {
         Ok((entries, candidate_reservation, entries_reservation))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn scan_resolved_series_rows_with_plan(
         &self,
         resolved: &[(MetricSeries, Option<SeriesId>)],
@@ -185,6 +254,7 @@ impl ChunkStorage {
         end: i64,
         plan: TieredQueryPlan,
         options: QueryRowsScanOptions,
+        excluded_output_label: Option<&str>,
         execution: &QueryExecution,
     ) -> Result<QueryRowsExecutionResult> {
         let context = self.series_query_context();
@@ -244,17 +314,30 @@ impl ChunkStorage {
                     .rows_scanned
                     .saturating_add(u64::try_from(points.len()).unwrap_or(u64::MAX));
                 for point in points {
-                    self.charge_row_before_materialization(
+                    charge_projected_row_before_materialization(
                         execution,
                         &series.name,
                         &series.labels,
                         &point,
+                        excluded_output_label,
                     )?;
-                    response.rows.push(Row::with_labels(
-                        series.name.clone(),
-                        series.labels.clone(),
-                        point,
-                    ));
+                    let labels = match excluded_output_label {
+                        Some(excluded_name) => {
+                            let mut labels = Vec::with_capacity(series.labels.len());
+                            labels.extend(
+                                series
+                                    .labels
+                                    .iter()
+                                    .filter(|label| label.name != excluded_name)
+                                    .cloned(),
+                            );
+                            labels
+                        }
+                        None => series.labels.clone(),
+                    };
+                    response
+                        .rows
+                        .push(Row::with_labels(series.name.clone(), labels, point));
                 }
                 let mut source_reservations = [row_reservation, raw_points_reservation];
                 row_reservation = match execution.coalesce_memory_reservation_array(
@@ -573,7 +656,9 @@ impl ChunkStorage {
         drop(matched_series_ids);
         drop(matched_series_ids_reservation);
         let plan = context.query_tier_plan(start, end);
-        self.scan_resolved_series_rows_with_plan(&resolved, start, end, plan, options, execution)
+        self.scan_resolved_series_rows_with_plan(
+            &resolved, start, end, plan, options, None, execution,
+        )
     }
 
     pub(in crate::engine::storage_engine) fn scan_metric_rows_result_api(
@@ -586,11 +671,7 @@ impl ChunkStorage {
     ) -> Result<QueryRowsExecutionResult> {
         let context = self.series_query_context();
         self.ensure_open()?;
-        validate_metric(metric)?;
-        if start >= end {
-            return Err(TsinkError::InvalidTimeRange { start, end });
-        }
-        validate_query_rows_scan_options(options)?;
+        options.validate_metric_row_request(metric, start, end)?;
         self.request_background_persisted_refresh_if_needed();
 
         let mut resolved_with_reservation =
@@ -606,9 +687,160 @@ impl ChunkStorage {
             end,
             plan,
             options,
+            None,
             execution,
         );
         drop(resolved_with_reservation);
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::engine::storage_engine) fn scan_metric_rows_with_matchers_result_api(
+        &self,
+        metric: &str,
+        matchers: &[SeriesMatcher],
+        excluded_output_label: Option<&str>,
+        start: i64,
+        end: i64,
+        options: QueryRowsScanOptions,
+        execution: &QueryExecution,
+    ) -> Result<QueryRowsExecutionResult> {
+        let context = self.series_query_context();
+        self.ensure_open()?;
+        options.validate_metric_row_request(metric, start, end)?;
+        crate::storage::validate_series_matcher_shapes(matchers).map_err(TsinkError::from)?;
+        crate::storage::validate_metric_row_output_projection(matchers, excluded_output_label)?;
+        self.request_background_persisted_refresh_if_needed();
+        execution.checkpoint()?;
+
+        // The candidate planner consumes an owned `SeriesSelection`. Admit the complete cloned
+        // metric/matcher shape before constructing it; callers retain ownership of the borrowed
+        // matchers and are not charged for that input allocation here.
+        let mut selection_reservation = execution.reserve_memory(
+            modeled_metric_matcher_selection_clone_upper_bytes(metric, matchers),
+        )?;
+        let selection = SeriesSelection {
+            metric: Some(metric.to_string()),
+            matchers: matchers.to_vec(),
+            start: None,
+            end: None,
+        };
+        selection_reservation.resize(modeled_metric_matcher_selection_retained_bytes(
+            selection
+                .metric
+                .as_ref()
+                .map_or(0, |selected_metric| selected_metric.capacity()),
+            selection.matchers.capacity(),
+            &selection.matchers,
+        ))?;
+
+        // Keep the selection clone, matcher programs, and complete candidate working set live
+        // together. Candidate planning applies both the exact metric and every supplied matcher,
+        // so the resulting unique ID set is the one canonical `series_matched` charge.
+        let candidate_reservation = self.reserve_metadata_candidate_working_set(execution)?;
+        #[cfg(test)]
+        let prepared = {
+            let before_regex_compile = || self.invoke_metadata_matcher_regex_compile_hook();
+            crate::query_selection::prepare_series_selection_with_execution(
+                &selection,
+                execution,
+                Some(&before_regex_compile),
+            )?
+        };
+        #[cfg(not(test))]
+        let prepared = crate::query_selection::prepare_series_selection_with_execution(
+            &selection, execution, None,
+        )?;
+        let candidate_plan = self.runtime_metadata_candidate_plan(
+            &selection,
+            &prepared.compiled_matchers,
+            None,
+            execution,
+        )?;
+        #[cfg(test)]
+        self.record_runtime_metadata_candidate_plan_hooks(
+            &candidate_plan,
+            &prepared.compiled_matchers,
+        );
+        let RuntimeMetadataCandidatePlan {
+            candidate_series_ids,
+            ..
+        } = candidate_plan;
+        let candidate_count = candidate_series_ids.len();
+        execution.charge_series_matched(candidate_count)?;
+        execution.observe_intermediate_vector_size(candidate_count)?;
+
+        let candidate_len = usize::try_from(candidate_count).map_err(|_| {
+            TsinkError::Other(
+                "matcher-aware metric row scan candidate count exceeds the supported range"
+                    .to_string(),
+            )
+        })?;
+        let resolved_capacity = modeled_vec_growth_capacity_upper(candidate_len);
+        let mut resolved_bytes =
+            modeled_vec_capacity_bytes::<(MetricSeries, Option<SeriesId>)>(resolved_capacity);
+        {
+            let registry = self.catalog.registry.read();
+            for series_id in candidate_series_ids.iter() {
+                execution.checkpoint()?;
+                let Some((metric_bytes, label_count, label_text_bytes)) =
+                    registry.decoded_series_key_shape(series_id)
+                else {
+                    continue;
+                };
+                resolved_bytes =
+                    resolved_bytes.saturating_add(modeled_metric_series_shape_retained_bytes(
+                        metric_bytes,
+                        label_count,
+                        label_text_bytes,
+                    ));
+            }
+        }
+        let mut resolved_reservation = execution.reserve_memory(resolved_bytes)?;
+        let mut resolved = Vec::new();
+        resolved.try_reserve(candidate_len).map_err(|error| {
+            TsinkError::Other(format!(
+                "failed to reserve matcher-aware metric row identities: {error}"
+            ))
+        })?;
+        {
+            let registry = self.catalog.registry.read();
+            for series_id in candidate_series_ids.iter() {
+                execution.checkpoint()?;
+                let Some(series_key) = registry.decode_series_key(series_id) else {
+                    continue;
+                };
+                resolved.push((
+                    MetricSeries {
+                        name: series_key.metric,
+                        labels: series_key.labels,
+                    },
+                    Some(series_id),
+                ));
+            }
+        }
+        resolved_reservation.resize(modeled_resolved_metric_rows_retained_bytes(&resolved))?;
+        execution.checkpoint()?;
+        resolved.sort_unstable_by(|left, right| left.0.labels.cmp(&right.0.labels));
+        execution.checkpoint()?;
+
+        let plan = context.query_tier_plan(start, end);
+        let result = self.scan_resolved_series_rows_with_plan(
+            &resolved,
+            start,
+            end,
+            plan,
+            options,
+            excluded_output_label,
+            execution,
+        );
+        drop(resolved);
+        drop(resolved_reservation);
+        drop(candidate_series_ids);
+        drop(prepared);
+        drop(candidate_reservation);
+        drop(selection);
+        drop(selection_reservation);
         result
     }
 }

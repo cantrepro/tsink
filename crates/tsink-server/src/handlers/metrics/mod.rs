@@ -500,6 +500,7 @@ pub(super) fn render_metrics(
     rbac_registry: Option<&RbacRegistry>,
     security_manager: Option<&SecurityManager>,
     usage_accounting: Option<&UsageAccounting>,
+    tenant_registry: Option<&tenant::TenantRegistry>,
     local_disk_budget: Option<&tsink::LocalDiskBudget>,
     offline_restore_disk_budget: Option<&tsink::LocalDiskBudget>,
 ) -> HttpResponse {
@@ -672,6 +673,8 @@ pub(super) fn render_metrics(
     let write_admission_metrics = admission::write_admission_metrics_snapshot();
     let write_rejection_metrics = write_rejection_metrics_snapshot();
     let tenant_admission_metrics = tenant::tenant_admission_metrics_snapshot();
+    let tenant_runtime_cache_metrics =
+        tenant_registry.map(tenant::TenantRegistry::runtime_cache_metrics_snapshot);
     let metadata_store_metrics = match metadata_store.metrics_snapshot() {
         Ok(snapshot) => snapshot,
         Err(err) => {
@@ -1455,6 +1458,7 @@ pub(super) fn render_metrics(
         append_write_admission_metrics(body, write_admission_metrics);
         append_write_rejection_metrics(body, write_rejection_metrics);
         append_tenant_admission_metrics(body, tenant_admission_metrics);
+        append_tenant_runtime_cache_metrics(body, tenant_runtime_cache_metrics);
         append_security_metrics(body, &security_metrics, rbac_metrics.as_ref());
         append_usage_metrics(body, &usage_status);
         append_metrics_collection_errors(body, rendered_collection_errors);
@@ -3893,6 +3897,75 @@ fn append_tenant_admission_metrics(
     }
 }
 
+fn append_tenant_runtime_cache_metrics(
+    body: &mut dyn MetricsBodyWriter,
+    snapshot: Option<tenant::TenantRuntimeCacheMetricsSnapshot>,
+) {
+    let configured = u8::from(snapshot.is_some());
+    let initialized_runtimes = snapshot.map_or(0, |value| value.initialized_runtimes);
+    let initialized_reserved_runtimes =
+        snapshot.map_or(0, |value| value.initialized_reserved_runtimes);
+    let initialized_dynamic_runtimes =
+        snapshot.map_or(0, |value| value.initialized_dynamic_runtimes);
+    let max_runtimes = snapshot.map_or(0, |value| value.max_runtimes);
+    let reserved_runtimes = snapshot.map_or(0, |value| value.reserved_runtimes);
+    let limit_rejections_total = snapshot.map_or(0, |value| value.limit_rejections_total);
+
+    body.push_str(
+        "# HELP tsink_tenant_runtime_cache_configured Whether a tenant runtime registry is configured (1 configured, 0 absent)\n\
+         # TYPE tsink_tenant_runtime_cache_configured gauge\n",
+    );
+    metrics_write!(body, "tsink_tenant_runtime_cache_configured {configured}\n");
+    body.push_str(
+        "# HELP tsink_tenant_runtime_cache_initialized_runtimes Process-lifetime tenant runtime entries currently initialized\n\
+         # TYPE tsink_tenant_runtime_cache_initialized_runtimes gauge\n",
+    );
+    metrics_write!(
+        body,
+        "tsink_tenant_runtime_cache_initialized_runtimes {initialized_runtimes}\n"
+    );
+    body.push_str(
+        "# HELP tsink_tenant_runtime_cache_initialized_reserved_runtimes Initialized tenant runtimes using configured-or-default reserved slots\n\
+         # TYPE tsink_tenant_runtime_cache_initialized_reserved_runtimes gauge\n",
+    );
+    metrics_write!(
+        body,
+        "tsink_tenant_runtime_cache_initialized_reserved_runtimes {initialized_reserved_runtimes}\n"
+    );
+    body.push_str(
+        "# HELP tsink_tenant_runtime_cache_initialized_dynamic_runtimes Initialized unconfigured tenant runtimes using dynamic slots\n\
+         # TYPE tsink_tenant_runtime_cache_initialized_dynamic_runtimes gauge\n",
+    );
+    metrics_write!(
+        body,
+        "tsink_tenant_runtime_cache_initialized_dynamic_runtimes {initialized_dynamic_runtimes}\n"
+    );
+    body.push_str(
+        "# HELP tsink_tenant_runtime_cache_max_runtimes Configured process-lifetime tenant runtime entry limit\n\
+         # TYPE tsink_tenant_runtime_cache_max_runtimes gauge\n",
+    );
+    metrics_write!(
+        body,
+        "tsink_tenant_runtime_cache_max_runtimes {max_runtimes}\n"
+    );
+    body.push_str(
+        "# HELP tsink_tenant_runtime_cache_reserved_runtimes Runtime slots reserved for configured tenants and the default tenant\n\
+         # TYPE tsink_tenant_runtime_cache_reserved_runtimes gauge\n",
+    );
+    metrics_write!(
+        body,
+        "tsink_tenant_runtime_cache_reserved_runtimes {reserved_runtimes}\n"
+    );
+    body.push_str(
+        "# HELP tsink_tenant_runtime_cache_limit_rejections_total Tenant runtime initializations rejected at the process-lifetime cache limit\n\
+         # TYPE tsink_tenant_runtime_cache_limit_rejections_total counter\n",
+    );
+    metrics_write!(
+        body,
+        "tsink_tenant_runtime_cache_limit_rejections_total {limit_rejections_total}\n"
+    );
+}
+
 fn prometheus_escape_label_value(value: &str) -> PrometheusEscapedLabel<'_> {
     PrometheusEscapedLabel(value)
 }
@@ -4122,6 +4195,61 @@ mod tests {
         ] {
             assert!(body.contains(sample));
         }
+    }
+
+    #[test]
+    fn tenant_runtime_cache_metrics_are_fixed_cardinality_with_and_without_a_registry() {
+        let mut absent = String::new();
+        append_tenant_runtime_cache_metrics(&mut absent, None);
+        for sample in [
+            "tsink_tenant_runtime_cache_configured 0\n",
+            "tsink_tenant_runtime_cache_initialized_runtimes 0\n",
+            "tsink_tenant_runtime_cache_initialized_reserved_runtimes 0\n",
+            "tsink_tenant_runtime_cache_initialized_dynamic_runtimes 0\n",
+            "tsink_tenant_runtime_cache_max_runtimes 0\n",
+            "tsink_tenant_runtime_cache_reserved_runtimes 0\n",
+            "tsink_tenant_runtime_cache_limit_rejections_total 0\n",
+        ] {
+            assert!(absent.contains(sample));
+        }
+
+        let mut configured = String::new();
+        append_tenant_runtime_cache_metrics(
+            &mut configured,
+            Some(tenant::TenantRuntimeCacheMetricsSnapshot {
+                initialized_runtimes: 7,
+                initialized_reserved_runtimes: 2,
+                initialized_dynamic_runtimes: 5,
+                max_runtimes: 11,
+                reserved_runtimes: 3,
+                limit_rejections_total: 13,
+            }),
+        );
+        for sample in [
+            "tsink_tenant_runtime_cache_configured 1\n",
+            "tsink_tenant_runtime_cache_initialized_runtimes 7\n",
+            "tsink_tenant_runtime_cache_initialized_reserved_runtimes 2\n",
+            "tsink_tenant_runtime_cache_initialized_dynamic_runtimes 5\n",
+            "tsink_tenant_runtime_cache_max_runtimes 11\n",
+            "tsink_tenant_runtime_cache_reserved_runtimes 3\n",
+            "tsink_tenant_runtime_cache_limit_rejections_total 13\n",
+        ] {
+            assert!(configured.contains(sample));
+        }
+        assert_eq!(
+            absent
+                .lines()
+                .filter(|line| line.starts_with("tsink_tenant_runtime_cache_configured "))
+                .count(),
+            1
+        );
+        assert_eq!(
+            configured
+                .lines()
+                .filter(|line| line.starts_with("tsink_tenant_runtime_cache_configured "))
+                .count(),
+            1
+        );
     }
 
     #[test]

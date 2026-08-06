@@ -40,6 +40,10 @@ impl RecoveryNamespaceBudget {
         }
     }
 
+    pub(crate) fn observed_entries(&self) -> usize {
+        self.observed_entries
+    }
+
     pub(crate) fn collect_directory_entries(
         &mut self,
         directory: &Path,
@@ -97,6 +101,148 @@ impl RecoveryNamespaceBudget {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum OwnedBoundaryEntryKind {
+    File,
+    Directory,
+}
+
+/// Lexically normalizes an absolute boundary path without resolving filesystem aliases.
+pub(crate) fn absolute_path_lexically_normalized(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().map_err(TsinkError::Io)?.join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+/// Resolves the existing prefix of an intentionally aliased namespace boundary.
+pub(crate) fn resolve_trusted_namespace_root(path: &Path) -> Result<PathBuf> {
+    let absolute = absolute_path_lexically_normalized(path)?;
+    let mut resolved = PathBuf::new();
+    let mut encountered_missing = false;
+    for component in absolute.components() {
+        resolved.push(component.as_os_str());
+        if encountered_missing {
+            continue;
+        }
+        match std::fs::canonicalize(&resolved) {
+            Ok(canonical) => resolved = canonical,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                encountered_missing = true;
+            }
+            Err(source) => {
+                return Err(TsinkError::IoWithPath {
+                    path: resolved,
+                    source,
+                })
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+pub(crate) fn validate_boundary_directory(
+    root: &Path,
+    description: &str,
+    allow_root_alias: bool,
+) -> Result<()> {
+    let metadata = if allow_root_alias {
+        std::fs::metadata(root)
+    } else {
+        std::fs::symlink_metadata(root)
+    };
+    match metadata {
+        Ok(metadata)
+            if metadata.is_dir() && (allow_root_alias || !is_link_or_reparse_point(&metadata)) =>
+        {
+            Ok(())
+        }
+        Ok(_) => Err(TsinkError::InvalidConfiguration(format!(
+            "{description} must resolve to a directory: {}",
+            root.display()
+        ))),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(TsinkError::IoWithPath {
+            path: root.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+/// Rejects every link-like or wrong-type component below an already resolved boundary.
+pub(crate) fn validate_owned_entry_below_alias_boundary(
+    root: &Path,
+    target: &Path,
+    final_kind: OwnedBoundaryEntryKind,
+    path_description: &str,
+) -> Result<()> {
+    let relative = target.strip_prefix(root).map_err(|_| {
+        TsinkError::InvalidConfiguration(format!(
+            "{path_description} path {} escapes configured boundary {}",
+            target.display(),
+            root.display()
+        ))
+    })?;
+    if relative.as_os_str().is_empty() {
+        return Err(TsinkError::InvalidConfiguration(format!(
+            "{path_description} path may not replace its configured boundary: {}",
+            root.display()
+        )));
+    }
+    let mut components = relative.components().peekable();
+    let mut current = root.to_path_buf();
+    while let Some(component) = components.next() {
+        let Component::Normal(component) = component else {
+            return Err(TsinkError::InvalidConfiguration(format!(
+                "{path_description} path contains a non-normal component: {}",
+                target.display()
+            )));
+        };
+        current.push(component);
+        let metadata = match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => break,
+            Err(source) => {
+                return Err(TsinkError::IoWithPath {
+                    path: current,
+                    source,
+                })
+            }
+        };
+        let final_component = components.peek().is_none();
+        let valid = !is_link_or_reparse_point(&metadata)
+            && if final_component {
+                match final_kind {
+                    OwnedBoundaryEntryKind::File => metadata.file_type().is_file(),
+                    OwnedBoundaryEntryKind::Directory => metadata.file_type().is_dir(),
+                }
+            } else {
+                metadata.file_type().is_dir()
+            };
+        if !valid {
+            return Err(TsinkError::DataCorruption(format!(
+                "{path_description} path contains a link-like or wrong-type entry: {}",
+                current.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn collect_directory_entries_bounded(
     directory: &Path,
     max_entries: usize,
@@ -115,6 +261,7 @@ enum PlannedRemovalKind {
 struct PlannedRemovalEntry {
     path: PathBuf,
     kind: PlannedRemovalKind,
+    removed: bool,
 }
 
 /// An exact, bounded, no-follow deletion plan for recovery-owned directory trees.
@@ -129,6 +276,29 @@ pub(crate) struct RecursiveNamespaceRemovalPlan {
 }
 
 impl RecursiveNamespaceRemovalPlan {
+    pub(crate) fn root_count(&self) -> usize {
+        self.root_count
+    }
+
+    pub(crate) fn modeled_heap_bytes(&self) -> Result<usize> {
+        self.entries
+            .capacity()
+            .checked_mul(std::mem::size_of::<PlannedRemovalEntry>())
+            .and_then(|bytes| {
+                self.entries
+                    .iter()
+                    .try_fold(bytes, |total, entry| {
+                        total.checked_add(entry.path.capacity()).ok_or(())
+                    })
+                    .ok()
+            })
+            .ok_or_else(|| {
+                TsinkError::Other(
+                    "bounded recovery deletion-plan retained-memory overflow".to_string(),
+                )
+            })
+    }
+
     pub(crate) fn include_file_like_roots_with_admission<F>(
         mut self,
         roots: &[PathBuf],
@@ -170,7 +340,7 @@ impl RecursiveNamespaceRemovalPlan {
                 TsinkError::Other("bounded recovery deletion-plan memory overflow".to_string())
             })?;
         admit(prospective)?;
-        self.entries.try_reserve(roots.len()).map_err(|_| {
+        self.entries.try_reserve_exact(roots.len()).map_err(|_| {
             TsinkError::Other(
                 "unable to extend bounded recovery namespace deletion plan".to_string(),
             )
@@ -181,6 +351,13 @@ impl RecursiveNamespaceRemovalPlan {
                     path: root.clone(),
                     source,
                 })?;
+            #[cfg(windows)]
+            if is_link_or_reparse_point(&metadata) {
+                return Err(TsinkError::DataCorruption(format!(
+                    "planned recovery file-like root is an unsupported link-like Windows entry: {}",
+                    root.display()
+                )));
+            }
             if metadata.file_type().is_dir() && !is_link_or_reparse_point(&metadata) {
                 return Err(TsinkError::DataCorruption(format!(
                     "planned recovery file-like root changed into a directory: {}",
@@ -190,6 +367,7 @@ impl RecursiveNamespaceRemovalPlan {
             self.entries.push(PlannedRemovalEntry {
                 path: root.clone(),
                 kind: PlannedRemovalKind::FileLike,
+                removed: false,
             });
         }
         self.root_count = self.root_count.checked_add(roots.len()).ok_or_else(|| {
@@ -230,51 +408,104 @@ impl RecursiveNamespaceRemovalPlan {
                 .cmp(&left.path.components().count())
                 .then_with(|| right.path.cmp(&left.path))
         });
-        for entry in self.entries {
-            let metadata = match std::fs::symlink_metadata(&entry.path) {
-                Ok(metadata) => metadata,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(source) => {
-                    return Err(TsinkError::IoWithPath {
-                        path: entry.path,
+        for index in 0..self.entries.len() {
+            let removal_result = {
+                let entry = &self.entries[index];
+                match std::fs::symlink_metadata(&entry.path) {
+                    Ok(metadata) => {
+                        let is_plain_directory =
+                            metadata.file_type().is_dir() && !is_link_or_reparse_point(&metadata);
+                        match entry.kind {
+                            PlannedRemovalKind::Directory if !is_plain_directory => {
+                                Err(TsinkError::DataCorruption(format!(
+                                    "planned recovery directory changed type before removal: {}",
+                                    entry.path.display()
+                                )))
+                            }
+                            PlannedRemovalKind::FileLike if is_plain_directory => {
+                                Err(TsinkError::DataCorruption(format!(
+                                    "planned recovery file-like entry changed into a directory before removal: {}",
+                                    entry.path.display()
+                                )))
+                            }
+                            PlannedRemovalKind::Directory => {
+                                remove_empty_dir_if_exists(&entry.path).map_err(|source| {
+                                    TsinkError::IoWithPath {
+                                        path: entry.path.clone(),
+                                        source,
+                                    }
+                                })
+                            }
+                            PlannedRemovalKind::FileLike => {
+                                remove_file_if_exists(&entry.path).map_err(|source| {
+                                    TsinkError::IoWithPath {
+                                        path: entry.path.clone(),
+                                        source,
+                                    }
+                                })
+                            }
+                        }
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(source) => Err(TsinkError::IoWithPath {
+                        path: entry.path.clone(),
                         source,
-                    });
+                    }),
                 }
             };
-            let is_plain_directory =
-                metadata.file_type().is_dir() && !is_link_or_reparse_point(&metadata);
-            match entry.kind {
-                PlannedRemovalKind::Directory if !is_plain_directory => {
-                    return Err(TsinkError::DataCorruption(format!(
-                        "planned recovery directory changed type before removal: {}",
-                        entry.path.display()
-                    )));
-                }
-                PlannedRemovalKind::FileLike if is_plain_directory => {
-                    return Err(TsinkError::DataCorruption(format!(
-                        "planned recovery file-like entry changed into a directory before removal: {}",
-                        entry.path.display()
-                    )));
-                }
-                PlannedRemovalKind::Directory => {
-                    remove_empty_dir_if_exists(&entry.path).map_err(|source| {
-                        TsinkError::IoWithPath {
-                            path: entry.path,
-                            source,
-                        }
-                    })?;
-                }
-                PlannedRemovalKind::FileLike => {
-                    remove_file_if_exists(&entry.path).map_err(|source| {
-                        TsinkError::IoWithPath {
-                            path: entry.path,
-                            source,
-                        }
-                    })?;
-                }
+            match removal_result {
+                Ok(removed) => self.entries[index].removed = removed,
+                Err(primary) => return self.finish_failed_removal(primary),
             }
         }
         Ok(self.root_count)
+    }
+
+    fn finish_failed_removal(self, primary: TsinkError) -> Result<usize> {
+        match self.sync_surviving_modified_directories() {
+            Ok(()) => Err(primary),
+            Err(sync_err) => Err(TsinkError::Other(format!(
+                "recursive namespace removal failed: {primary}; surviving-directory synchronization failed: {sync_err}"
+            ))),
+        }
+    }
+
+    fn sync_surviving_modified_directories(&self) -> Result<()> {
+        let mut previous_parent = None;
+        let mut first_error = None;
+        for entry in self.entries.iter().filter(|entry| entry.removed) {
+            let Some(parent) = entry.path.parent() else {
+                continue;
+            };
+            if previous_parent == Some(parent) {
+                continue;
+            }
+            previous_parent = Some(parent);
+            let metadata = match std::fs::symlink_metadata(parent) {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(source) => {
+                    first_error.get_or_insert(TsinkError::IoWithPath {
+                        path: parent.to_path_buf(),
+                        source,
+                    });
+                    continue;
+                }
+            };
+            if is_link_or_reparse_point(&metadata) || !metadata.file_type().is_dir() {
+                first_error.get_or_insert_with(|| {
+                    TsinkError::DataCorruption(format!(
+                        "surviving modified recovery directory changed type before synchronization: {}",
+                        parent.display()
+                    ))
+                });
+                continue;
+            }
+            if let Err(err) = sync_dir(parent) {
+                first_error.get_or_insert(err);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 }
 
@@ -432,7 +663,11 @@ where
             .ok_or_else(|| {
                 TsinkError::Other(format!("{} retained path overflow", self.operation))
             })?;
-        self.entries.push(PlannedRemovalEntry { path, kind });
+        self.entries.push(PlannedRemovalEntry {
+            path,
+            kind,
+            removed: false,
+        });
         self.admit_current(traversal_bytes)
     }
 }
@@ -504,6 +739,17 @@ where
                 path: path.clone(),
                 source,
             })?;
+        #[cfg(windows)]
+        if is_link_or_reparse_point(&metadata) {
+            // Windows uses different unlink primitives for file and directory reparse points,
+            // and symlink_metadata does not give every reparse-point kind a portable removal
+            // classification. Reject the complete plan before mutation rather than partially
+            // deleting an owned recovery tree and then discovering an unsupported junction.
+            return Err(TsinkError::DataCorruption(format!(
+                "{operation} contains an unsupported link-like Windows entry: {}",
+                path.display()
+            )));
+        }
         let is_plain_directory =
             metadata.file_type().is_dir() && !is_link_or_reparse_point(&metadata);
         if is_plain_directory {
@@ -1147,20 +1393,36 @@ pub(crate) fn remove_path_if_exists(path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn remove_path_if_exists_and_sync_parent(path: &Path) -> Result<()> {
-    let existed = path_exists_no_follow(path)?;
-    remove_path_if_exists(path)?;
-    if existed {
+pub(crate) fn remove_path_if_exists_and_sync_parent_observed(path: &Path) -> Result<bool> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => {
+            return Err(TsinkError::IoWithPath {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    let removed = if metadata.is_dir() {
+        remove_dir_if_exists(path)?
+    } else {
+        remove_file_if_exists(path)?
+    };
+    if removed {
         sync_parent_dir(path)?;
     }
-    Ok(())
+    Ok(removed)
+}
+
+pub(crate) fn remove_path_if_exists_and_sync_parent(path: &Path) -> Result<()> {
+    remove_path_if_exists_and_sync_parent_observed(path).map(|_| ())
 }
 
 /// Captures the stable filesystem identity of one plain directory.
 ///
 /// Callers use this before a create/rename publication so later error cleanup can distinguish the
 /// owned directory from an unrelated entry installed at the same pathname.
-#[cfg(test)]
 pub(crate) fn capture_plain_directory_identity(
     path: &Path,
     operation: &str,
@@ -1189,7 +1451,6 @@ pub(crate) fn capture_plain_directory_identity(
 }
 
 /// Returns whether `path` is still the same plain directory as `expected`.
-#[cfg(test)]
 pub(crate) fn path_matches_plain_directory_identity(
     path: &Path,
     expected: &same_file::Handle,
@@ -1340,11 +1601,16 @@ pub(crate) fn remove_path_if_exists_and_sync_parent_budgeted_with_reconciliation
     }
 
     let reservation = budget.reserve(category, 0, crate::DiskReservationKind::Recovery)?;
-    let removal_result = remove_path_if_exists_and_sync_parent(path);
+    let removal_result = remove_path_if_exists_and_sync_parent_observed(path);
     let settlement_result = reservation.commit(0, 0);
-    let reconciliation_result = budget
-        .reconcile_when_idle_with_memory_limit(reconciliation_memory_limit)
-        .map(|_| ());
+    let reconciliation_result =
+        if removal_result.as_ref().is_ok_and(|removed| !*removed) && settlement_result.is_ok() {
+            Ok(())
+        } else {
+            budget
+                .reconcile_when_idle_with_memory_limit(reconciliation_memory_limit)
+                .map(|_| ())
+        };
 
     let mut errors = Vec::new();
     if let Err(err) = &removal_result {
@@ -2608,23 +2874,71 @@ mod tests {
         assert!(err.to_string().contains("1-level recursive depth bound"));
     }
 
+    #[cfg(windows)]
     #[test]
-    fn recursive_namespace_plan_never_enumerates_late_descendants() {
+    fn recovery_file_like_roots_reject_a_windows_directory_reparse_before_removal() {
+        use std::os::windows::fs::symlink_dir;
+
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let outside = temp_dir.path().join("outside");
+        let outside_sentinel = outside.join("sentinel");
+        let earlier_file = temp_dir.path().join("zz-earlier-file");
+        let reparse_root = temp_dir.path().join("aa-reparse-root");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(&outside_sentinel, b"outside").unwrap();
+        std::fs::write(&earlier_file, b"must-survive").unwrap();
+        if let Err(err) = symlink_dir(&outside, &reparse_root) {
+            if err.kind() == std::io::ErrorKind::PermissionDenied {
+                return;
+            }
+            panic!("unexpected file-like-root directory-symlink fixture error: {err}");
+        }
+
+        let plan = validate_recursive_namespace_bounded(&[], 0, 1, "file-root test")
+            .expect("an empty directory-root plan should build");
+        let error = plan
+            .include_file_like_roots_with_admission(
+                &[earlier_file.clone(), reparse_root.clone()],
+                0,
+                |_| Ok(()),
+            )
+            .expect_err("a Windows link-like exact root must reject the complete plan");
+
+        assert!(error
+            .to_string()
+            .contains("unsupported link-like Windows entry"));
+        assert_eq!(std::fs::read(&earlier_file).unwrap(), b"must-survive");
+        assert_eq!(std::fs::read(&outside_sentinel).unwrap(), b"outside");
+        assert!(std::fs::symlink_metadata(&reparse_root).is_ok());
+    }
+
+    #[test]
+    fn recursive_namespace_plan_syncs_a_surviving_modified_directory_after_late_child_failure() {
         let temp_dir = TempDir::new().expect("tempdir should build");
         let root = temp_dir.path().join("root");
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("planned"), b"planned").unwrap();
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("planned"), b"planned").unwrap();
         let plan =
-            validate_recursive_namespace_bounded(std::slice::from_ref(&root), 1, 4, "race test")
+            validate_recursive_namespace_bounded(std::slice::from_ref(&root), 2, 4, "race test")
                 .expect("the initial tree must fit its exact cap");
 
-        std::fs::write(root.join("late"), b"late").unwrap();
+        std::fs::write(nested.join("late"), b"late").unwrap();
+        let _sync_failure = fail_directory_sync_once(
+            nested.clone(),
+            "injected surviving nested-directory sync failure",
+        );
         let err = plan
             .remove()
             .expect_err("a late descendant must make non-recursive removal fail");
-        assert!(matches!(err, TsinkError::IoWithPath { .. }));
+        let message = err.to_string();
+        assert!(message.contains("recursive namespace removal failed"));
+        assert!(message.contains(&nested.display().to_string()));
+        assert!(message.contains("injected surviving nested-directory sync failure"));
         assert!(root.exists());
-        assert_eq!(std::fs::read(root.join("late")).unwrap(), b"late");
+        assert!(nested.exists());
+        assert_eq!(std::fs::read(nested.join("late")).unwrap(), b"late");
+        assert!(!nested.join("planned").exists());
     }
 
     #[test]
@@ -2920,6 +3234,65 @@ mod tests {
         assert_eq!(snapshot.maintenance_reserved_bytes, 0);
         assert_eq!(snapshot.reconciliations_total, 2);
         assert!(unknown_path.exists());
+    }
+
+    #[test]
+    fn budgeted_noop_removal_skips_full_tree_reconciliation() {
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let budget =
+            crate::LocalDiskBudget::open(temp_dir.path(), crate::LocalDiskLimits::default())
+                .expect("disk budget should open");
+        let before = budget.snapshot();
+
+        remove_path_if_exists_and_sync_parent_budgeted(
+            &temp_dir.path().join("missing-owned-entry"),
+            Some(&budget),
+            crate::DiskCategory::Temporary,
+        )
+        .expect("a definitely absent owned entry should be a no-op");
+
+        let after = budget.snapshot();
+        assert_eq!(after.accounted_bytes, before.accounted_bytes);
+        assert_eq!(after.reconciliations_total, before.reconciliations_total);
+        assert_eq!(after.active_reservations, 0);
+        assert_eq!(after.reserved_bytes, 0);
+        assert_eq!(after.maintenance_reserved_bytes, 0);
+    }
+
+    #[test]
+    fn budgeted_removal_reconciles_after_post_unlink_sync_failure() {
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let target = temp_dir.path().join("series_index.bin");
+        std::fs::write(&target, b"registry").expect("owned payload should write");
+        let budget =
+            crate::LocalDiskBudget::open(temp_dir.path(), crate::LocalDiskLimits::default())
+                .expect("disk budget should open");
+        let before = budget.snapshot();
+        let _sync_failure = fail_directory_sync_once(
+            temp_dir.path().to_path_buf(),
+            "injected removal directory sync failure",
+        );
+
+        let err = remove_path_if_exists_and_sync_parent_budgeted(
+            &target,
+            Some(&budget),
+            crate::DiskCategory::Registry,
+        )
+        .expect_err("the committed unlink must retain its synchronization error");
+
+        assert!(err
+            .to_string()
+            .contains("injected removal directory sync failure"));
+        assert!(!path_exists_no_follow(&target).unwrap());
+        let after = budget.snapshot();
+        assert_eq!(after.accounted_bytes, 0);
+        assert_eq!(
+            after.reconciliations_total,
+            before.reconciliations_total + 1
+        );
+        assert_eq!(after.active_reservations, 0);
+        assert_eq!(after.reserved_bytes, 0);
+        assert_eq!(after.maintenance_reserved_bytes, 0);
     }
 
     #[test]

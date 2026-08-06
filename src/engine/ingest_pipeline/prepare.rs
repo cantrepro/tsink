@@ -495,7 +495,7 @@ impl<'a> WriteAdmissionControlContext<'a> {
         estimated_wal_growth_bytes: u64,
     ) -> Result<()> {
         let deadline = Instant::now() + self.write_timeout;
-        let mut relief_requested = false;
+        let mut relief_was_requested = false;
         let mut memory_backpressure_recorded = false;
         let mut active_memory_backpressure = None;
 
@@ -534,8 +534,8 @@ impl<'a> WriteAdmissionControlContext<'a> {
                     increment_atomic_saturating(self.memory_backpressure_events_total);
                     memory_backpressure_recorded = true;
                 }
-                if !relief_requested {
-                    relief_requested = self.request_admission_pressure_relief();
+                if self.request_admission_pressure_relief() {
+                    relief_was_requested = true;
                 }
                 self.delay_for_admission_backpressure(deadline);
                 continue;
@@ -552,15 +552,15 @@ impl<'a> WriteAdmissionControlContext<'a> {
                             required: post_required,
                         });
                     }
-                    if !relief_requested {
-                        relief_requested = self.request_admission_pressure_relief();
+                    if self.request_admission_pressure_relief() {
+                        relief_was_requested = true;
                     }
                     self.delay_for_admission_backpressure(deadline);
                     continue;
                 }
             }
 
-            if relief_requested {
+            if relief_was_requested {
                 self.observability
                     .record_admission_pressure_relief_observed();
             }

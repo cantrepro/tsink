@@ -55,10 +55,24 @@ tsink-server --tenant-config /etc/tsink/tenants.json
 
 The file has a `defaults` block whose values are inherited by every tenant, and a `tenants` map of per-tenant overrides. Any tenant not listed in the file automatically gets the `defaults` policy on its first request.
 
+The process-lifetime runtime cache is finite and does not evict active or historical tenant state.
+Set the top-level `maxRuntimeTenants` field to its maximum cardinality; it defaults to `4096` and
+must be greater than zero. Slots are reserved for every tenant named in `tenants` plus the built-in
+`default` tenant, so arbitrary default-policy tenants cannot starve configured identities. Once the
+remaining dynamic slots are full, a new tenant returns `503` with
+`X-Tsink-Tenant-Error-Code: tenant_runtime_cache_limit_exceeded`; existing tenants continue to use
+their original semaphores, counters, and decision history. Missing or invalid credentials are
+checked before a public request can consume a slot. Trusted internal work and support-bundle
+prewarm intentionally bypass that authentication check but remain subject to the same cap.
+Operators can inspect the process-local count, reserved/dynamic split, limit, and rejection total
+through the fixed unlabeled `tsink_tenant_runtime_cache_*` Prometheus series and
+`data.admission.tenant.runtimeCache` in TSDB status; see [HTTP API](http-api.md#multi-tenancy).
+
 ### Full example
 
 ```jsonc
 {
+  "maxRuntimeTenants": 4096,
   "defaults": {
     "quotas": {
       "maxWriteRowsPerRequest": 50000,

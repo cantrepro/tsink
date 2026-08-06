@@ -187,11 +187,20 @@ fn finite_profile_first_materialization_publishes_managed_state_journal() {
         .apply_rollup_policies(vec![cpu_rollup_policy("finite-policy", 1_000)])
         .unwrap();
 
-    assert!(temp_dir
-        .path()
-        .join(".rollups")
-        .join("state-journal-active.bin")
-        .is_file());
+    let rollup_dir = temp_dir.path().join(".rollups");
+    let journal_batch = std::fs::read_dir(&rollup_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with("state-journal-batch-") && name.ends_with(".d")
+                })
+        })
+        .expect("first materialization should publish a batch journal generation");
+    assert!(journal_batch.is_dir());
+    assert!(std::fs::read_dir(journal_batch).unwrap().next().is_some());
     let status = storage.observability_snapshot().rollups.policies;
     assert_eq!(status.len(), 1);
     assert_eq!(status[0].materialized_series, 1);

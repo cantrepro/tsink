@@ -155,6 +155,7 @@ pub(super) async fn route_request(
             rbac_registry,
             security_manager,
             usage_accounting,
+            tenant_registry,
             local_disk_budget,
             offline_restore_disk_budget.map(Arc::as_ref),
         ),

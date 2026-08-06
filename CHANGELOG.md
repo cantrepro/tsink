@@ -94,13 +94,14 @@ compatibility and is not yet covered by a stable support promise.
   consensus/handoff, digest, hotspot/rebalance, tenant, audit, security/RBAC, usage,
   managed-control-plane, and edge-sync status producers, together with the allocation-free fixed
   planner projection. Each dynamic producer reserves before materialization, and its private guard
-  remains live while the response tree borrows the projection. Storage errors are propagated
-  instead of becoming a false zero-series success. A
-  fixed 1 MiB encoded response ceiling retains the measured JSON tree and exact body/header guards
-  through response construction without tightening `ExpertUnlimited` metric enumeration. The
-  adapter still constructs that JSON tree before its retained-tree reservation is established;
-  this construction peak and the process-global retained hotspot policy remain explicit
-  boundaries.
+  remains live while response encoding borrows the projection. Storage errors are propagated
+  instead of becoming a false zero-series success. A cancellation-aware counting pass enforces the
+  exact 1 MiB encoded ceiling, and the adapter reserves the measured body and conservative header
+  model before a second pass writes into exact admitted capacity. It no longer constructs a final
+  `serde_json::Value` tree or mapped `Vec<Value>` arrays. The semantic JSON schema is preserved,
+  but object-member order is explicitly not a wire contract and can differ from the former
+  recursively lexical `serde_json::Value` encoding. The process-global retained hotspot policy
+  remains an explicit boundary.
 - Admin rebalance status, pause, resume, and run now use one root query execution across complete
   metric enumeration, live control input, the shared hotspot tracker projection, scheduler status,
   and exact response serialization. The established successful response schema is unchanged.
@@ -130,11 +131,36 @@ compatibility and is not yet covered by a stable support promise.
   source operations still charge their canonical logical returned work. Valid child JSON is
   serialized without a duplicate parsed tree, non-JSON fallback text is bounded, and the fixed
   16 MiB final response has exact body/header admission. Structured query-pressure and oversize
-  responses replace uncontrolled composition. Legacy operational child snapshot/serialization
-  transients plus bounded tenant/actor and synthetic-request setup before the parent reservation
-  remain explicit adapter boundaries. Tenant override resolution now rejects decoded IDs above the
-  16 KiB label-value ceiling before decoding and no longer clones the potentially 64 MiB request
-  body.
+  responses replace uncontrolled composition. After allocation-free tenant validation and
+  stack-only persistent-runtime prewarm, root admission and a normalized-output setup reservation
+  precede the exact selected-tenant clone, exact-capacity actor construction, and synthetic-request
+  allocation. One reusable
+  request containing only verified-auth and tenant headers replaces three copies of the original
+  headers, so authorization, cookies, tracing headers, and the potentially 64 MiB request body are
+  not copied into child requests. All eleven children now use execution-aware source projections
+  and measured serializers instead of legacy owned JSON trees; rich rules status preserves its
+  self-observing fixed point while reserving the complete source plus exact body/header peak. The
+  rollup path fails closed when a backend lacks accounted status observability. Bounded TSDB and
+  rebalance compatibility errors use the root's input-derived 256 KiB scratch and transfer to
+  exact guards before retention. Persistent tenant runtime state initializes before root admission,
+  while ordinary decision history uses compact allocation-free ring records and reconstructs its
+  exact legacy strings only in an accounted status projection.
+- Tenant policy files now accept a top-level `maxRuntimeTenants` process-lifetime runtime-cache
+  limit, defaulting to 4,096. The registry reserves capacity for every configured tenant and for
+  `default`, rejects an undersized policy at startup, and atomically rejects further unconfigured
+  misses with `503` and `tenant_runtime_cache_limit_exceeded`. Existing runtimes are never evicted,
+  so permits, counters, and decision history are not silently reset. Public tenant authorization
+  occurs before cache insertion, preventing invalid credentials from consuming capacity; trusted
+  support prewarm uses the same cap. TSDB status exposes the scalar cache snapshot as
+  `data.admission.tenant.runtimeCache` (or `null` without a registry), and `/metrics` exports seven
+  fixed, unlabeled configured/count/limit/reservation/rejection series, with zero values when the
+  registry is absent.
+- Direct TSDB-status and admin-rebalance endpoints now reserve bounded compatibility-error scratch
+  immediately after their own query admission and keep it live until every legacy error body is
+  complete. TSDB status and rebalance status use a fixed 96 KiB envelope; effectful rebalance
+  operations add an input-derived node-ID allowance. Successful response serialization reuses the
+  reservation, partial success bodies are dropped before error mapping, and existing error status,
+  headers, and raw bytes remain unchanged.
 - Empty-policy background rollup passes no longer drain every writer permit. They retain the
   existing worker-success/cursor-cleanup behavior under the rollup transaction lock, still reject
   a fenced snapshot publication, and leave a pending checkpoint retry intact on that error.
@@ -142,14 +168,18 @@ compatibility and is not yet covered by a stable support promise.
   at most one namespace entry or one admitted marker per wake before planning. Marker decode has
   fixed 4 MiB/16K-record caps, conservative pre-decode memory admission, and same-file identity
   checks; startup, close, and standalone recovery remain exhaustive.
-- The separate post-flush fence before production background compaction now retains a
+- The separate post-flush fence before finite background segment work now retains a
   shared-memory-accounted `ReadDir` cursor and consumes one admitted raw marker-namespace entry per
   wake. Its path-scaled model covers both retained directory paths, the full recognized entry path,
-  file-name scratch, and 64 KiB of directory-stream/platform scratch. Compaction cannot plan or
-  mutate until a marker-publication-generation-stable terminal probe proves the namespace clean;
-  publication invalidates the cursor, and terminal, error, reset, close, or drop releases its
-  reservation before the data-path lease. Foreground, flush, catalog-refresh, and standalone
-  exhaustive fences are unchanged.
+  file-name scratch, and 64 KiB of directory-stream/platform scratch. Compaction, bounded flush,
+  and open-state finite catalog refresh cannot plan, stage, or mutate until a
+  marker-publication-generation-stable terminal probe proves the namespace clean under the shared
+  compaction gate. Publication invalidates the cursor, and terminal, error, reset, close, or drop
+  releases its reservation before the data-path lease. Foreground/lifecycle/manual operations and
+  both-limits-unlimited background calls retain exhaustive fences, now also completed before flush
+  stages any discoverable root. Catalog refresh reloads lifecycle under the compaction gate so it
+  cannot recreate a finite cursor after close resets one; post-stage registry-source errors enter
+  the flush root-rollback path.
 - Persistent opens now state and test their fail-closed WAL boundary explicitly: the complete
   published WAL prefix is validated strictly before logical replay, including every byte in a
   markerless legacy WAL before a current publication marker is adopted, even when
@@ -225,9 +255,57 @@ compatibility and is not yet covered by a stable support promise.
   permit and result-memory reservation until receipt or cancellation. A finite execution rejects
   an `Unaccounted` backend before invoking it; execution-less unlimited calls retain their explicit
   compatibility behavior. Non-default tenant series-row scans replace the scoped result guard
-  around the tenant-visible page. Default-tenant and distributed series-row scans, plus tenant and
-  distributed metric-name scans, remain truthfully `Unaccounted` until their compound pagination
-  work can be reconciled exactly.
+  around the tenant-visible page. Core also exposes a matcher-aware metric-name primitive that
+  charges one exact selected set and can project a non-empty exact-matched label before row
+  materialization and logical returned-byte charging. Non-default tenant metric-name scans use it
+  to inject and hide the tenant label, require inner `Complete` accounting, and transfer the
+  verified page guard without cloning. Default-tenant and distributed series-row and metric-name
+  scans remain truthfully `Unaccounted` until their compound pagination work can be reconciled
+  exactly.
+- Overlapping strict local-disk reconciliation barriers now share a terminal full-root scan when
+  their requests predate that scan and no later reservation was admitted. Scan-start tickets and
+  checked reservation generations prevent stale reuse; a successful scan records its modeled
+  memory peak, so an overlapping finite-memory waiter reuses it only when that waiter's limit
+  admits the same peak. Traversal-time requests and intervening mutations still force a later exact
+  scan. Definite no-op removals skip the scan after successful
+  settlement, and best-effort post-flush staged cleanup batches governed roots under one Recovery
+  reservation and one terminal scan without abandoning later paths after a malformed entry.
+  Tombstone recovery likewise batches every preflighted owned atomic temporary, and each lane's
+  orphan-shard sweep batches all preflighted candidates, under one lazy Recovery reservation and at
+  most one terminal scan. Unknown names remain untouched; a post-unlink parent-sync failure is
+  reconciled before its native error is returned.
+  Obsolete immutable segment-catalog generations also share one memory-limited terminal scan, and
+  one registry-catalog root delta shares one terminal scan across all governed removed entries.
+  Incremental series-registry checkpoint cleanup preserves its all-entry namespace preflight and
+  unknown/link retention and first cleanup-error ordering while sharing one terminal scan across
+  recognized governed generations.
+  Preparing-compaction rollback, rollback of a flush's newly published segment roots, and startup
+  cleanup of post-flush marker temporaries plus rewrite/copy staging trees each preflight their
+  complete owned batch and share one terminal scan. Startup blocker cleanup uses one global
+  namespace/depth/memory envelope across local and tier parents, while empty, lookalike-only, and
+  external-only plans perform no local scan. Its shared-coordinator mutation lock now spans
+  preflight through reconciliation, Windows link-like roots/descendants fail before deletion, and
+  external lane normalization pre-admits its fixed-cardinality canonicalization path peak. A
+  saturated reconciliation-waiter counter now releases the consumed reservation and retains its
+  complete admitted peak as conservative accounting instead of leaking a reservation.
+  Core startup's remaining exact owned-orphan classes now form one aggregate plan as well: fixed
+  atomic targets, registry deltas, the tombstone coordinator, each lane's manifest/shard
+  temporaries and unreferenced final shards, compaction markers, and segment staging trees share
+  one mutation lock, namespace counter, retained-memory envelope, lazy Recovery reservation, and
+  terminal reconciliation. Execution preserves source order, rechecks retained directory identity
+  and tombstone-manifest fingerprints, stops at the first cleanup error, and reserves bounded error
+  state alongside the final scan; empty and external-only plans do not pay for a local scan.
+  Canonical v3
+  pointer/generation files now reconcile under Registry rather than Unknown.
+- Registry-catalog delta publication now admits the checked sum of the intent, every added entry,
+  and the final manifest under one strict aggregate reservation and one terminal reconciliation.
+  Incremental series-registry namespaces resume from their own highest durable nonce without
+  advancing the process-wide empty-namespace seed, so an exhausted or hostile directory cannot
+  disable independent database instances in the same process.
+- Memory and WAL admission backpressure reattempts one serialized, item/byte-bounded flush pass on
+  every positively delayed poll while pressure remains. A failed try-lock is not counted as a
+  relief request, multiple passes can reclaim multiple old heads, and the current writable head is
+  not sealed merely to make an admission succeed.
 - Modeled returned-byte accounting is now canonical logical work based on fixed result slots and
   content lengths, including byte strings, UTF-8 strings, labels, and native-histogram arrays. It is
   independent of allocator capacity and spare space; retained query memory continues to use
@@ -430,13 +508,23 @@ compatibility and is not yet covered by a stable support promise.
   pending/output/checkpoint publication; an exact-boundary retry completes atomically.
   `ExpertUnlimited` retains its explicit unbounded query/maintenance behavior.
 - Per-source rollup checkpoint and pending-dedup publication no longer clones and rewrites the
-  complete state JSON after each source/page. Checksummed source-state replacements compact in a
-  1,024-record/4 MiB active generation, roll into at most 1,024 files, and replay idempotently after
-  an ambiguous parent sync. Bounded adjacent-generation compaction reclaims superseded sources;
-  full state-first policy/delete snapshots advance a journal epoch, absorb and clean older
-  generations, and preflight a 65,536-item/64 MiB modeled envelope before cloning or JSON encoding.
-  Crossing either the full-snapshot or journal-namespace ceiling returns a structured maintenance
-  limit error without publishing partial state.
+  complete state JSON after each source/page. Each checksummed replacement is published as a
+  create-only event in a 1,024-event/4 MiB batch directory; at most 1,024 logical generations and
+  16,384 observed recovery entries are accepted. Namespace pressure packs a batch into an equal
+  same-generation shadow before durably detaching the replayed batch for exact cleanup, while
+  adjacent regular generations retain publish-newer-before-remove-older compaction. Full
+  state-first policy/delete snapshots advance the journal epoch and absorb older generations.
+  Policies, checkpoints, pending state, invalidations, and generations share one
+  65,536-item/64 MiB modeled envelope across base loading, replay, missing-generation repair, and
+  live replacement. Journal discovery, frame decode, encoding, publication, compaction, cleanup,
+  and reconciliation also carry the configured memory ceiling plus retained state. Definite
+  pre-publication rejection remains retryable; failure after the canonical no-replace rename fences
+  later in-process rollup mutation until reopen. A bounded source page now reads only each selected
+  source's checkpoint and pending marker instead of cloning the policy's complete state maps, then
+  computes page coverage from the installed results. Policy/state JSON loading streams a
+  schema-equivalent physical-record preflight, admits raw-buffer predecessor/successor growth and
+  typed DTO/map peaks, preserves magic/version and malformed-schema precedence, and moves decoded
+  maps and policies into the runtime without full install clones.
 - Server usage status, reports, support bundles, and raw exports no longer scan or clone an
   ever-growing in-memory ledger. Exact all-time per-tenant summaries have a finite tenant namespace;
   raw/time-bucket reads use a finite recent-record window and stable snapshot-pinned pages with
@@ -474,7 +562,9 @@ compatibility and is not yet covered by a stable support promise.
 - Rollup policy/state JSON remains schema v1, with `journal_epoch` optional and defaulting to zero
   when older snapshots are loaded. Older binaries ignore that field and the new journal files, so
   they conservatively observe the last full snapshot; startup now rejects policy/state JSON files
-  above 64 MiB, and administrative snapshots above 65,536 logical items or 64 MiB modeled size.
+  above 64 MiB, pre-admits their raw/serde/map materialization against the configured startup
+  memory limit, and rejects administrative snapshots above 65,536 logical items or 64 MiB modeled
+  size.
 - Existing compatibility write methods remain available and retain their all-or-error signatures.
   The canonical methods and result types are additive; third-party `Storage` implementations get an
   explicit unsupported default rather than fabricated indexed outcomes.

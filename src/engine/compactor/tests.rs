@@ -1931,6 +1931,125 @@ fn marker_name_collision_selects_unused_path_without_overwriting_stale_marker() 
 }
 
 #[test]
+fn preparing_recovery_batches_outputs_and_marker_into_one_reconciliation() {
+    let temp = TempDir::new().unwrap();
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("cpu", &[Label::new("host", "preparing-batch")])
+        .unwrap()
+        .series_id;
+    let source = write_numeric_segment(temp.path(), &registry, series_id, 0, 1, &[(1, 1.0)]);
+    let first_output = write_numeric_segment(temp.path(), &registry, series_id, 1, 2, &[(1, 2.0)]);
+    let second_output = write_numeric_segment(temp.path(), &registry, series_id, 1, 3, &[(1, 3.0)]);
+    let marker = write_raw_replacement_marker(
+        temp.path(),
+        "replace-0000000000000001-0000000000000001.json",
+        serde_json::json!({
+            "version": 2,
+            "phase": "preparing",
+            "source_segments": [segment_relative(temp.path(), &source)],
+            "output_segments": [
+                segment_relative(temp.path(), &first_output),
+                segment_relative(temp.path(), &second_output),
+            ],
+        }),
+    );
+    let budget =
+        crate::LocalDiskBudget::open(temp.path(), crate::LocalDiskLimits::default()).unwrap();
+    let before = budget.snapshot();
+    assert_eq!(before.reconciliations_total, 1);
+
+    let outcome = execution::finalize_pending_compaction_replacements_with_disk_budget(
+        temp.path(),
+        Some(&budget),
+    )
+    .unwrap();
+
+    assert!(!outcome.stats.compacted);
+    assert!(source.is_dir());
+    assert!(!first_output.exists());
+    assert!(!second_output.exists());
+    assert!(!marker.exists());
+    let after = budget.snapshot();
+    assert_eq!(
+        after.reconciliations_total,
+        before.reconciliations_total + 1
+    );
+    assert_eq!(
+        after.accounted_bytes,
+        crate::disk_budget::measured_path_bytes(temp.path()).unwrap()
+    );
+    assert_eq!(after.active_reservations, 0);
+    assert_eq!(after.reserved_bytes, 0);
+    assert_eq!(after.maintenance_reserved_bytes, 0);
+}
+
+#[test]
+fn preparing_recovery_reconciles_once_after_output_parent_sync_failure() {
+    let temp = TempDir::new().unwrap();
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("cpu", &[Label::new("host", "preparing-sync-failure")])
+        .unwrap()
+        .series_id;
+    let source = write_numeric_segment(temp.path(), &registry, series_id, 0, 1, &[(1, 1.0)]);
+    let first_output = write_numeric_segment(temp.path(), &registry, series_id, 1, 2, &[(1, 2.0)]);
+    let second_output = write_numeric_segment(temp.path(), &registry, series_id, 1, 3, &[(1, 3.0)]);
+    let marker = write_raw_replacement_marker(
+        temp.path(),
+        "replace-0000000000000001-0000000000000001.json",
+        serde_json::json!({
+            "version": 2,
+            "phase": "preparing",
+            "source_segments": [segment_relative(temp.path(), &source)],
+            "output_segments": [
+                segment_relative(temp.path(), &first_output),
+                segment_relative(temp.path(), &second_output),
+            ],
+        }),
+    );
+    let budget =
+        crate::LocalDiskBudget::open(temp.path(), crate::LocalDiskLimits::default()).unwrap();
+    let before = budget.snapshot();
+    let output_parent = second_output
+        .parent()
+        .expect("compaction output has a parent")
+        .to_path_buf();
+    let _sync_failure = crate::engine::fs_utils::fail_directory_sync_once(
+        output_parent,
+        "injected Preparing rollback parent sync failure",
+    );
+
+    let error = execution::finalize_pending_compaction_replacements_with_disk_budget(
+        temp.path(),
+        Some(&budget),
+    )
+    .expect_err("a committed output removal must retain its parent-sync error");
+
+    assert!(matches!(
+        error,
+        TsinkError::Other(ref message)
+            if message == "injected Preparing rollback parent sync failure"
+    ));
+    assert!(source.is_dir());
+    assert!(first_output.is_dir());
+    assert!(!second_output.exists());
+    assert!(marker.is_file());
+    let after = budget.snapshot();
+    assert_eq!(
+        after.reconciliations_total,
+        before.reconciliations_total + 1
+    );
+    assert_eq!(
+        after.accounted_bytes,
+        crate::disk_budget::measured_path_bytes(temp.path()).unwrap()
+    );
+    assert_eq!(after.active_reservations, 0);
+    assert_eq!(after.reserved_bytes, 0);
+    assert_eq!(after.maintenance_reserved_bytes, 0);
+}
+
+#[test]
 fn background_recovery_cursor_continues_across_compactor_clones_and_stops_the_wake() {
     let temp = TempDir::new().unwrap();
     let registry = SeriesRegistry::new();

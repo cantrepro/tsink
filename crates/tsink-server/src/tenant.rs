@@ -48,6 +48,8 @@ static TENANT_ADMISSION_RETENTION_ACTIVE_REQUESTS: AtomicU64 = AtomicU64::new(0)
 static TENANT_ADMISSION_RETENTION_ACTIVE_UNITS: AtomicU64 = AtomicU64::new(0);
 
 const TENANT_DECISION_HISTORY_LIMIT: usize = 16;
+pub(crate) const DEFAULT_TENANT_RUNTIME_MAX_TENANTS: usize = 4_096;
+const TENANT_RUNTIME_CACHE_LIMIT_ERROR_CODE: &str = "tenant_runtime_cache_limit_exceeded";
 const UNLABELED_TENANT_FALLBACK_REGEX: &str = ".+";
 const TENANT_QUERY_COLLECTION_ALLOCATION_ALLOWANCE_BYTES: u64 = 64;
 const TENANT_STATUS_ALLOCATION_ALLOWANCE_BYTES: u64 = 64;
@@ -291,6 +293,16 @@ pub struct TenantAdmissionMetricsSnapshot {
     pub retention_active_units: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TenantRuntimeCacheMetricsSnapshot {
+    pub(crate) initialized_runtimes: usize,
+    pub(crate) initialized_reserved_runtimes: usize,
+    pub(crate) initialized_dynamic_runtimes: usize,
+    pub(crate) max_runtimes: usize,
+    pub(crate) reserved_runtimes: usize,
+    pub(crate) limit_rejections_total: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TenantDecisionSnapshot {
     pub unix_ms: u64,
@@ -382,10 +394,14 @@ fn modeled_tenant_status_vec_bytes<T>(capacity: usize) -> u64 {
 }
 
 fn modeled_tenant_status_str_bytes(value: &str) -> u64 {
-    if value.is_empty() {
+    modeled_tenant_status_str_len_bytes(value.len())
+}
+
+fn modeled_tenant_status_str_len_bytes(len: usize) -> u64 {
+    if len == 0 {
         return 0;
     }
-    u64::try_from(value.len())
+    u64::try_from(len)
         .unwrap_or(u64::MAX)
         .saturating_add(TENANT_STATUS_ALLOCATION_ALLOWANCE_BYTES)
 }
@@ -397,13 +413,6 @@ fn modeled_tenant_status_string_bytes(value: &String) -> u64 {
     u64::try_from(value.capacity())
         .unwrap_or(u64::MAX)
         .saturating_add(TENANT_STATUS_ALLOCATION_ALLOWANCE_BYTES)
-}
-
-fn modeled_tenant_status_decision_str_bytes(decision: &TenantDecisionSnapshot) -> u64 {
-    modeled_tenant_status_str_bytes(&decision.access)
-        .saturating_add(modeled_tenant_status_str_bytes(&decision.surface))
-        .saturating_add(modeled_tenant_status_str_bytes(&decision.outcome))
-        .saturating_add(modeled_tenant_status_str_bytes(&decision.reason))
 }
 
 fn modeled_tenant_status_decision_string_bytes(decision: &TenantDecisionSnapshot) -> u64 {
@@ -468,6 +477,8 @@ impl TenantRequestError {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct TenantPolicyFile {
+    #[serde(default)]
+    max_runtime_tenants: Option<usize>,
     #[serde(default)]
     defaults: TenantPolicyDefinition,
     #[serde(default)]
@@ -544,16 +555,16 @@ struct TenantClusterDefinition {
 
 #[derive(Debug, Clone, Default)]
 struct TenantPolicyTemplate {
-    auth_tokens: Vec<TenantTokenPolicy>,
+    auth_tokens: BTreeMap<String, BTreeSet<TenantAccessScope>>,
     policy: TenantRequestPolicy,
     max_inflight_reads: Option<usize>,
     max_inflight_writes: Option<usize>,
 }
 
-#[derive(Debug, Clone)]
-struct TenantTokenPolicy {
-    token: String,
-    scopes: BTreeSet<TenantAccessScope>,
+#[derive(Debug, Default)]
+struct TenantRuntimeCache {
+    entries: BTreeMap<String, Arc<TenantPolicyRuntime>>,
+    initialized_reserved: usize,
 }
 
 #[derive(Debug)]
@@ -570,16 +581,19 @@ struct TenantPolicyRuntime {
     query: TenantSurfaceRuntime,
     metadata: TenantSurfaceRuntime,
     retention: TenantSurfaceRuntime,
-    recent_decisions: Mutex<VecDeque<TenantDecisionSnapshot>>,
+    recent_decisions: Mutex<VecDeque<TenantDecisionRecord>>,
     #[cfg(test)]
     status_snapshot_string_clones: AtomicU64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct TenantRegistry {
     default_template: TenantPolicyTemplate,
     tenant_templates: BTreeMap<String, TenantPolicyTemplate>,
-    runtimes: Mutex<BTreeMap<String, Arc<TenantPolicyRuntime>>>,
+    max_runtime_tenants: usize,
+    reserved_runtime_tenants: usize,
+    runtimes: Mutex<TenantRuntimeCache>,
+    runtime_limit_rejections_total: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -609,6 +623,44 @@ enum TenantDecisionOutcome {
     Admitted,
     Throttled,
     Rejected,
+}
+
+#[derive(Debug)]
+struct TenantDecisionRecord {
+    unix_ms: u64,
+    access: TenantAccessScope,
+    surface: TenantAdmissionSurface,
+    outcome: TenantDecisionOutcome,
+    requested_units: u64,
+    reason: TenantDecisionReason,
+}
+
+#[derive(Debug)]
+enum TenantDecisionReason {
+    Admitted,
+    MaxInflightRequests {
+        limit: usize,
+    },
+    RequestedUnitsExceeded {
+        requested_units: usize,
+        limit: usize,
+    },
+    MaxInflightUnits {
+        limit: usize,
+    },
+    Owned(String),
+}
+
+struct TenantDecisionReasonDisplay<'a> {
+    tenant_id: &'a str,
+    access: TenantAccessScope,
+    surface: TenantAdmissionSurface,
+    reason: &'a TenantDecisionReason,
+}
+
+#[derive(Default)]
+struct TenantDecisionReasonLength {
+    bytes: usize,
 }
 
 impl Drop for TenantAdmissionPermit {
@@ -706,6 +758,170 @@ impl TenantDecisionOutcome {
     }
 }
 
+impl std::fmt::Write for TenantDecisionReasonLength {
+    fn write_str(&mut self, value: &str) -> std::fmt::Result {
+        self.bytes = self.bytes.saturating_add(value.len());
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for TenantDecisionReasonDisplay<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.reason {
+            TenantDecisionReason::Admitted => write!(
+                formatter,
+                "tenant request admitted for {} via {} scope",
+                self.surface.as_str(),
+                self.access.as_str()
+            ),
+            TenantDecisionReason::MaxInflightRequests { limit } => write!(
+                formatter,
+                "tenant '{}' exceeded max inflight {} requests ({limit})",
+                self.tenant_id,
+                self.surface.as_str()
+            ),
+            TenantDecisionReason::RequestedUnitsExceeded {
+                requested_units,
+                limit,
+            } => write!(
+                formatter,
+                "tenant '{}' exceeded max inflight {} units: {requested_units} > {limit}",
+                self.tenant_id,
+                self.surface.as_str()
+            ),
+            TenantDecisionReason::MaxInflightUnits { limit } => write!(
+                formatter,
+                "tenant '{}' exceeded max inflight {} units ({limit})",
+                self.tenant_id,
+                self.surface.as_str()
+            ),
+            TenantDecisionReason::Owned(reason) => formatter.write_str(reason),
+        }
+    }
+}
+
+impl TenantDecisionReason {
+    fn display<'a>(
+        &'a self,
+        tenant_id: &'a str,
+        access: TenantAccessScope,
+        surface: TenantAdmissionSurface,
+    ) -> TenantDecisionReasonDisplay<'a> {
+        TenantDecisionReasonDisplay {
+            tenant_id,
+            access,
+            surface,
+            reason: self,
+        }
+    }
+
+    fn status_text_len(
+        &self,
+        tenant_id: &str,
+        access: TenantAccessScope,
+        surface: TenantAdmissionSurface,
+    ) -> usize {
+        let display = self.display(tenant_id, access, surface);
+        let mut length = TenantDecisionReasonLength::default();
+        std::fmt::write(&mut length, format_args!("{display}"))
+            .expect("tenant decision reason length accounting is infallible");
+        length.bytes
+    }
+
+    fn status_text(
+        &self,
+        tenant_id: &str,
+        access: TenantAccessScope,
+        surface: TenantAdmissionSurface,
+    ) -> String {
+        let display = self.display(tenant_id, access, surface);
+        let mut rendered = String::with_capacity(self.status_text_len(tenant_id, access, surface));
+        std::fmt::write(&mut rendered, format_args!("{display}"))
+            .expect("writing a tenant decision reason into String is infallible");
+        rendered
+    }
+
+    #[cfg(test)]
+    fn modeled_retained_heap_bytes(&self) -> u64 {
+        match self {
+            Self::Owned(reason) => modeled_tenant_status_string_bytes(reason),
+            Self::Admitted
+            | Self::MaxInflightRequests { .. }
+            | Self::RequestedUnitsExceeded { .. }
+            | Self::MaxInflightUnits { .. } => 0,
+        }
+    }
+}
+
+impl From<String> for TenantDecisionReason {
+    fn from(reason: String) -> Self {
+        Self::Owned(reason)
+    }
+}
+
+impl TenantDecisionRecord {
+    fn status_snapshot(&self, tenant_id: &str) -> TenantDecisionSnapshot {
+        TenantDecisionSnapshot {
+            unix_ms: self.unix_ms,
+            access: self.access.as_str().to_string(),
+            surface: self.surface.as_str().to_string(),
+            outcome: self.outcome.as_str().to_string(),
+            requested_units: self.requested_units,
+            reason: self
+                .reason
+                .status_text(tenant_id, self.access, self.surface),
+        }
+    }
+
+    fn modeled_status_output_bytes(&self, tenant_id: &str) -> u64 {
+        modeled_tenant_status_str_bytes(self.access.as_str())
+            .saturating_add(modeled_tenant_status_str_bytes(self.surface.as_str()))
+            .saturating_add(modeled_tenant_status_str_bytes(self.outcome.as_str()))
+            .saturating_add(modeled_tenant_status_str_len_bytes(
+                self.reason
+                    .status_text_len(tenant_id, self.access, self.surface),
+            ))
+    }
+}
+
+fn authorize_tenant_policy(
+    auth_tokens: &BTreeMap<String, BTreeSet<TenantAccessScope>>,
+    request: &HttpRequest,
+    access: TenantAccessScope,
+) -> Result<(), TenantRequestError> {
+    if request.header(RBAC_AUTH_VERIFIED_HEADER).is_some() {
+        return Ok(());
+    }
+    if !auth_tokens.is_empty() {
+        let Some(token) = bearer_token(request) else {
+            return Err(TenantRequestError::Unauthorized(
+                "tenant_auth_token_missing",
+            ));
+        };
+        let Some(scopes) = auth_tokens.get(token) else {
+            return Err(TenantRequestError::Unauthorized(
+                "tenant_auth_token_invalid",
+            ));
+        };
+        if !scopes.contains(&access) {
+            return Err(TenantRequestError::Forbidden("tenant_auth_scope_denied"));
+        }
+        return Ok(());
+    }
+
+    if request.header(PUBLIC_AUTH_REQUIRED_HEADER).is_some() {
+        if request.header(PUBLIC_AUTH_VERIFIED_HEADER).is_some() {
+            return Ok(());
+        }
+        if bearer_token(request).is_some() {
+            return Err(TenantRequestError::Unauthorized("auth_token_invalid"));
+        }
+        return Err(TenantRequestError::Unauthorized("auth_token_missing"));
+    }
+
+    Ok(())
+}
+
 impl TenantPolicyTemplate {
     fn from_definition(definition: &TenantPolicyDefinition) -> Result<Self, String> {
         Self::default().merged(definition)
@@ -800,6 +1016,14 @@ impl TenantPolicyTemplate {
             max_inflight_writes,
         })
     }
+
+    fn authorize(
+        &self,
+        request: &HttpRequest,
+        access: TenantAccessScope,
+    ) -> Result<(), TenantRequestError> {
+        authorize_tenant_policy(&self.auth_tokens, request, access)
+    }
 }
 
 impl TenantPolicyRuntime {
@@ -809,16 +1033,9 @@ impl TenantPolicyRuntime {
         let query_budget = policy.admission.query;
         let metadata_budget = policy.admission.metadata;
         let retention_budget = policy.admission.retention;
-        let mut auth_tokens = BTreeMap::<String, BTreeSet<TenantAccessScope>>::new();
-        for token in template.auth_tokens {
-            auth_tokens
-                .entry(token.token)
-                .or_default()
-                .extend(token.scopes);
-        }
         Self {
             policy,
-            auth_tokens,
+            auth_tokens: template.auth_tokens,
             max_inflight_reads: template.max_inflight_reads,
             max_inflight_writes: template.max_inflight_writes,
             inflight_reads: template
@@ -844,37 +1061,7 @@ impl TenantPolicyRuntime {
         request: &HttpRequest,
         access: TenantAccessScope,
     ) -> Result<(), TenantRequestError> {
-        if request.header(RBAC_AUTH_VERIFIED_HEADER).is_some() {
-            return Ok(());
-        }
-        if !self.auth_tokens.is_empty() {
-            let Some(token) = bearer_token(request) else {
-                return Err(TenantRequestError::Unauthorized(
-                    "tenant_auth_token_missing",
-                ));
-            };
-            let Some(scopes) = self.auth_tokens.get(token) else {
-                return Err(TenantRequestError::Unauthorized(
-                    "tenant_auth_token_invalid",
-                ));
-            };
-            if !scopes.contains(&access) {
-                return Err(TenantRequestError::Forbidden("tenant_auth_scope_denied"));
-            }
-            return Ok(());
-        }
-
-        if request.header(PUBLIC_AUTH_REQUIRED_HEADER).is_some() {
-            if request.header(PUBLIC_AUTH_VERIFIED_HEADER).is_some() {
-                return Ok(());
-            }
-            if bearer_token(request).is_some() {
-                return Err(TenantRequestError::Unauthorized("auth_token_invalid"));
-            }
-            return Err(TenantRequestError::Unauthorized("auth_token_missing"));
-        }
-
-        Ok(())
+        authorize_tenant_policy(&self.auth_tokens, request, access)
     }
 
     fn shared_permit(
@@ -934,7 +1121,7 @@ impl TenantPolicyRuntime {
         surface: TenantAdmissionSurface,
         outcome: TenantDecisionOutcome,
         requested_units: usize,
-        reason: String,
+        reason: impl Into<TenantDecisionReason>,
     ) {
         let mut recent = self
             .recent_decisions
@@ -943,13 +1130,13 @@ impl TenantPolicyRuntime {
         if recent.len() >= TENANT_DECISION_HISTORY_LIMIT {
             recent.pop_front();
         }
-        recent.push_back(TenantDecisionSnapshot {
+        recent.push_back(TenantDecisionRecord {
             unix_ms: unix_timestamp_millis(),
-            access: access.as_str().to_string(),
-            surface: surface.as_str().to_string(),
-            outcome: outcome.as_str().to_string(),
+            access,
+            surface,
+            outcome,
             requested_units: u64::try_from(requested_units).unwrap_or(u64::MAX),
-            reason,
+            reason: reason.into(),
         });
     }
 
@@ -993,7 +1180,7 @@ impl TenantPolicyRuntime {
                         surface,
                         TenantDecisionOutcome::Throttled,
                         requested_units,
-                        reason.clone(),
+                        TenantDecisionReason::MaxInflightRequests { limit },
                     );
                     return Err(TenantRequestError::TooManyRequests(reason));
                 }
@@ -1015,7 +1202,10 @@ impl TenantPolicyRuntime {
                     surface,
                     TenantDecisionOutcome::Rejected,
                     requested_units,
-                    reason.clone(),
+                    TenantDecisionReason::RequestedUnitsExceeded {
+                        requested_units,
+                        limit,
+                    },
                 );
                 return Err(TenantRequestError::TooManyRequests(reason));
             }
@@ -1050,7 +1240,7 @@ impl TenantPolicyRuntime {
                             surface,
                             TenantDecisionOutcome::Throttled,
                             requested_units,
-                            reason.clone(),
+                            TenantDecisionReason::MaxInflightUnits { limit },
                         );
                         return Err(TenantRequestError::TooManyRequests(reason));
                     }
@@ -1063,11 +1253,7 @@ impl TenantPolicyRuntime {
             surface,
             TenantDecisionOutcome::Admitted,
             requested_units,
-            format!(
-                "tenant request admitted for {} via {} scope",
-                surface.as_str(),
-                access.as_str()
-            ),
+            TenantDecisionReason::Admitted,
         );
         Ok(TenantRequestGuard {
             policy: self.policy.clone(),
@@ -1097,7 +1283,7 @@ impl TenantPolicyRuntime {
             .lock()
             .expect("tenant decision log mutex should not be poisoned")
             .iter()
-            .cloned()
+            .map(|decision| decision.status_snapshot(tenant_id))
             .collect();
         TenantRuntimeStatusSnapshot {
             tenant_id: tenant_id.to_string(),
@@ -1153,8 +1339,7 @@ impl TenantPolicyRuntime {
         );
         for decision in recent.iter() {
             execution.checkpoint()?;
-            peak_bytes =
-                peak_bytes.saturating_add(modeled_tenant_status_decision_str_bytes(decision));
+            peak_bytes = peak_bytes.saturating_add(decision.modeled_status_output_bytes(tenant_id));
         }
         let mut reservation = execution.reserve_memory(peak_bytes)?;
         execution.checkpoint()?;
@@ -1165,11 +1350,11 @@ impl TenantPolicyRuntime {
             execution.checkpoint()?;
             recent_decisions.push(TenantDecisionSnapshot {
                 unix_ms: decision.unix_ms,
-                access: self.clone_status_snapshot_string(&decision.access),
-                surface: self.clone_status_snapshot_string(&decision.surface),
-                outcome: self.clone_status_snapshot_string(&decision.outcome),
+                access: self.clone_status_snapshot_string(decision.access.as_str()),
+                surface: self.clone_status_snapshot_string(decision.surface.as_str()),
+                outcome: self.clone_status_snapshot_string(decision.outcome.as_str()),
                 requested_units: decision.requested_units,
-                reason: self.clone_status_snapshot_string(&decision.reason),
+                reason: self.clone_status_snapshot_reason(decision, &tenant_id),
             });
         }
         execution.checkpoint()?;
@@ -1211,6 +1396,19 @@ impl TenantPolicyRuntime {
         cloned
     }
 
+    fn clone_status_snapshot_reason(
+        &self,
+        decision: &TenantDecisionRecord,
+        tenant_id: &str,
+    ) -> String {
+        #[cfg(test)]
+        self.status_snapshot_string_clones
+            .fetch_add(1, Ordering::Relaxed);
+        decision
+            .reason
+            .status_text(tenant_id, decision.access, decision.surface)
+    }
+
     #[cfg(test)]
     fn reset_status_snapshot_string_clones(&self) {
         self.status_snapshot_string_clones
@@ -1220,6 +1418,41 @@ impl TenantPolicyRuntime {
     #[cfg(test)]
     fn status_snapshot_string_clones(&self) -> u64 {
         self.status_snapshot_string_clones.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn decision_log_retained_state(&self) -> (usize, usize, u64) {
+        let recent = self
+            .recent_decisions
+            .lock()
+            .expect("tenant decision log mutex should not be poisoned");
+        let retained_bytes =
+            modeled_tenant_status_vec_bytes::<TenantDecisionRecord>(recent.capacity())
+                .saturating_add(recent.iter().fold(0u64, |bytes, decision| {
+                    bytes.saturating_add(decision.reason.modeled_retained_heap_bytes())
+                }));
+        (recent.len(), recent.capacity(), retained_bytes)
+    }
+}
+
+impl Default for TenantRegistry {
+    fn default() -> Self {
+        Self {
+            default_template: TenantPolicyTemplate::default(),
+            tenant_templates: BTreeMap::new(),
+            max_runtime_tenants: DEFAULT_TENANT_RUNTIME_MAX_TENANTS,
+            reserved_runtime_tenants: 1,
+            runtimes: Mutex::new(TenantRuntimeCache::default()),
+            runtime_limit_rejections_total: AtomicU64::new(0),
+        }
+    }
+}
+
+fn tenant_runtime_cache_limit_error(limit: usize) -> TenantRequestError {
+    TenantRequestError::Rejected {
+        status: 503,
+        code: TENANT_RUNTIME_CACHE_LIMIT_ERROR_CODE,
+        message: format!("tenant runtime cache limit of {limit} tenants would be exceeded"),
     }
 }
 
@@ -1237,36 +1470,142 @@ impl TenantRegistry {
     }
 
     fn from_file(file: TenantPolicyFile) -> Result<Self, String> {
-        let default_template = TenantPolicyTemplate::from_definition(&file.defaults)?;
+        let TenantPolicyFile {
+            max_runtime_tenants,
+            defaults,
+            tenants,
+        } = file;
+        // Preserve the established configuration-error precedence: validate and merge the policy
+        // definitions before applying the new cache-capacity relationship.
+        let default_template = TenantPolicyTemplate::from_definition(&defaults)?;
         let mut tenant_templates = BTreeMap::new();
-        for (tenant_id, definition) in file.tenants {
+        for (tenant_id, definition) in tenants {
             validate_tenant_id(&tenant_id)?;
             tenant_templates.insert(tenant_id, default_template.merged(&definition)?);
         }
+
+        let max_runtime_tenants = max_runtime_tenants.unwrap_or(DEFAULT_TENANT_RUNTIME_MAX_TENANTS);
+        if max_runtime_tenants == 0 {
+            return Err("maxRuntimeTenants must be greater than zero".to_string());
+        }
+        let reserved_runtime_tenants = tenant_templates
+            .len()
+            .checked_add(usize::from(
+                !tenant_templates.contains_key(DEFAULT_TENANT_ID),
+            ))
+            .ok_or_else(|| "tenant runtime reservation count overflowed usize".to_string())?;
+        if reserved_runtime_tenants > max_runtime_tenants {
+            return Err(format!(
+                "maxRuntimeTenants must be at least {reserved_runtime_tenants} to reserve every configured tenant and the default tenant"
+            ));
+        }
+
         Ok(Self {
             default_template,
             tenant_templates,
-            runtimes: Mutex::new(BTreeMap::new()),
+            max_runtime_tenants,
+            reserved_runtime_tenants,
+            runtimes: Mutex::new(TenantRuntimeCache::default()),
+            runtime_limit_rejections_total: AtomicU64::new(0),
         })
+    }
+
+    fn is_reserved_runtime_tenant(&self, tenant_id: &str) -> bool {
+        tenant_id == DEFAULT_TENANT_ID || self.tenant_templates.contains_key(tenant_id)
+    }
+
+    fn template_for(&self, tenant_id: &str) -> &TenantPolicyTemplate {
+        self.tenant_templates
+            .get(tenant_id)
+            .unwrap_or(&self.default_template)
+    }
+
+    fn authorize(
+        &self,
+        tenant_id: &str,
+        request: &HttpRequest,
+        access: TenantAccessScope,
+    ) -> Result<(), TenantRequestError> {
+        validate_tenant_id(tenant_id).map_err(TenantRequestError::BadRequest)?;
+        self.template_for(tenant_id).authorize(request, access)
     }
 
     fn runtime_for(&self, tenant_id: &str) -> Result<Arc<TenantPolicyRuntime>, TenantRequestError> {
         validate_tenant_id(tenant_id).map_err(TenantRequestError::BadRequest)?;
-        let mut runtimes = self
+        let mut cache = self
             .runtimes
             .lock()
             .expect("tenant runtime cache mutex should not be poisoned");
-        if let Some(runtime) = runtimes.get(tenant_id) {
+        if let Some(runtime) = cache.entries.get(tenant_id) {
             return Ok(Arc::clone(runtime));
         }
-        let template = self
-            .tenant_templates
-            .get(tenant_id)
-            .cloned()
-            .unwrap_or_else(|| self.default_template.clone());
+
+        let reserved = self.is_reserved_runtime_tenant(tenant_id);
+        if !reserved {
+            let initialized_dynamic = cache
+                .entries
+                .len()
+                .checked_sub(cache.initialized_reserved)
+                .expect("initialized reserved tenant count must not exceed cache entries");
+            let max_dynamic = self
+                .max_runtime_tenants
+                .checked_sub(self.reserved_runtime_tenants)
+                .expect("reserved tenant count must fit the validated runtime limit");
+            if initialized_dynamic >= max_dynamic {
+                self.runtime_limit_rejections_total
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(tenant_runtime_cache_limit_error(self.max_runtime_tenants));
+            }
+        }
+
+        debug_assert!(cache.entries.len() < self.max_runtime_tenants);
+        let template = self.template_for(tenant_id).clone();
         let runtime = Arc::new(TenantPolicyRuntime::from_template(template));
-        runtimes.insert(tenant_id.to_string(), Arc::clone(&runtime));
+        let previous = cache
+            .entries
+            .insert(tenant_id.to_string(), Arc::clone(&runtime));
+        debug_assert!(previous.is_none());
+        if reserved {
+            cache.initialized_reserved = cache.initialized_reserved.saturating_add(1);
+            debug_assert!(cache.initialized_reserved <= self.reserved_runtime_tenants);
+        }
         Ok(runtime)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn initialize_tenant_runtime(
+        &self,
+        tenant_id: &str,
+    ) -> Result<(), TenantRequestError> {
+        drop(self.runtime_for(tenant_id)?);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn initialized_runtime_count(&self) -> usize {
+        self.runtimes
+            .lock()
+            .expect("tenant runtime cache mutex should not be poisoned")
+            .entries
+            .len()
+    }
+
+    pub(crate) fn runtime_cache_metrics_snapshot(&self) -> TenantRuntimeCacheMetricsSnapshot {
+        let cache = self
+            .runtimes
+            .lock()
+            .expect("tenant runtime cache mutex should not be poisoned");
+        TenantRuntimeCacheMetricsSnapshot {
+            initialized_runtimes: cache.entries.len(),
+            initialized_reserved_runtimes: cache.initialized_reserved,
+            initialized_dynamic_runtimes: cache
+                .entries
+                .len()
+                .saturating_sub(cache.initialized_reserved),
+            max_runtimes: self.max_runtime_tenants,
+            reserved_runtimes: self.reserved_runtime_tenants,
+            limit_rejections_total: self.runtime_limit_rejections_total.load(Ordering::Relaxed),
+        }
     }
 
     #[allow(dead_code)]
@@ -1501,11 +1840,16 @@ pub fn prepare_request_plan(
             managed_policy,
         });
     };
-    let runtime = registry.runtime_for(tenant_id)?;
-    runtime.authorize(request, access)?;
+    // Authorize against the immutable template before a cache insertion. Invalid credentials must
+    // retain their established 401/403 result and must not consume the finite runtime cardinality.
+    registry.authorize(tenant_id, request, access)?;
     if let Some(managed_policy) = managed_policy.as_ref() {
         managed_policy.authorize()?;
     }
+    let runtime = registry.runtime_for(tenant_id)?;
+    // The materialized runtime owns the same normalized token map. Keep the compatibility check
+    // here so future template/runtime changes cannot silently drift authorization behavior.
+    runtime.authorize(request, access)?;
     Ok(TenantRequestPlan {
         tenant_id: tenant_id.to_string(),
         access,
@@ -1605,8 +1949,10 @@ pub fn enforce_range_points_quota(
     Ok(())
 }
 
-fn parse_auth_tokens(auth: &TenantAuthDefinition) -> Result<Vec<TenantTokenPolicy>, String> {
-    let mut tokens = Vec::with_capacity(auth.tokens.len());
+fn parse_auth_tokens(
+    auth: &TenantAuthDefinition,
+) -> Result<BTreeMap<String, BTreeSet<TenantAccessScope>>, String> {
+    let mut tokens = BTreeMap::<String, BTreeSet<TenantAccessScope>>::new();
     for (index, token) in auth.tokens.iter().enumerate() {
         let raw_token = token.token.trim();
         if raw_token.is_empty() {
@@ -1619,10 +1965,10 @@ fn parse_auth_tokens(auth: &TenantAuthDefinition) -> Result<Vec<TenantTokenPolic
         } else {
             token.scopes.iter().copied().collect()
         };
-        tokens.push(TenantTokenPolicy {
-            token: raw_token.to_string(),
-            scopes,
-        });
+        tokens
+            .entry(raw_token.to_string())
+            .or_default()
+            .extend(scopes);
     }
     Ok(tokens)
 }
@@ -2763,6 +3109,115 @@ impl Storage for TenantScopedStorage {
         }
     }
 
+    fn scan_metric_rows_with_execution(
+        &self,
+        metric: &str,
+        start: i64,
+        end: i64,
+        options: QueryRowsScanOptions,
+        execution: &QueryExecution,
+    ) -> TsinkResult<QueryRowsPage> {
+        self.scan_metric_rows_with_execution_result(metric, start, end, options, execution)
+            .map(QueryRowsExecutionResult::into_page)
+    }
+
+    fn scan_metric_rows_with_execution_result(
+        &self,
+        metric: &str,
+        start: i64,
+        end: i64,
+        options: QueryRowsScanOptions,
+        execution: &QueryExecution,
+    ) -> TsinkResult<QueryRowsExecutionResult> {
+        let inner_accounting = self
+            .inner
+            .scan_metric_rows_with_matchers_execution_accounting();
+        if self.is_default_tenant() || inner_accounting != QueryExecutionAccounting::Complete {
+            return self
+                .scan_metric_rows(metric, start, end, options)
+                .map(QueryRowsExecutionResult::unaccounted);
+        }
+
+        options.validate_metric_row_request(metric, start, end)?;
+        execution.checkpoint().map_err(TsinkError::from)?;
+        let matcher_retained_bytes = tenant_query_string_capacity_bytes(TENANT_LABEL.len())
+            .saturating_add(tenant_query_string_capacity_bytes(self.tenant_id.len()));
+        let matcher_reservation = execution
+            .reserve_memory(matcher_retained_bytes)
+            .map_err(TsinkError::from)?;
+        let tenant_matcher = SeriesMatcher::equal(TENANT_LABEL, self.tenant_id.clone());
+        let mut inner_result = self
+            .inner
+            .scan_metric_rows_with_matchers_with_execution_result(
+                metric,
+                std::slice::from_ref(&tenant_matcher),
+                Some(TENANT_LABEL),
+                start,
+                end,
+                options,
+                execution,
+            )?;
+        execution.checkpoint().map_err(TsinkError::from)?;
+        drop(tenant_matcher);
+        drop(matcher_reservation);
+
+        let visible_bytes = tsink::modeled_query_rows_retained_bytes(&inner_result.page.rows);
+        let Some(mut inner_reservation) = inner_result.take_memory_reservation() else {
+            // This faulty result has no guard to preserve. Destroy its rows before allocating the
+            // diagnostic so the wrapper never performs additional work around an unguarded page.
+            drop(inner_result);
+            return Err(TsinkError::Other(
+                "completely accounted tenant metric-row scan omitted its result reservation"
+                    .to_string(),
+            ));
+        };
+        // `inner_result` no longer owns its guard. Every error below must destroy the page before
+        // releasing `inner_reservation`; reverse-order implicit cleanup would do the opposite.
+        if inner_reservation.bytes() < visible_bytes {
+            let error = TsinkError::Other(format!(
+                "completely accounted tenant metric-row scan retained {} bytes for a {}-byte result",
+                inner_reservation.bytes(),
+                visible_bytes
+            ));
+            drop(inner_result);
+            drop(inner_reservation);
+            return Err(error);
+        }
+        let projection_validation = (|| -> TsinkResult<()> {
+            for row in &inner_result.page.rows {
+                execution.checkpoint().map_err(TsinkError::from)?;
+                if row.labels().iter().any(|label| label.name == TENANT_LABEL) {
+                    return Err(TsinkError::Other(
+                        "tenant metric-row scan failed to project the tenant label".to_string(),
+                    ));
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = projection_validation {
+            drop(inner_result);
+            drop(inner_reservation);
+            return Err(error);
+        }
+        let page = inner_result.into_page();
+        if let Err(error) = inner_reservation.resize(visible_bytes) {
+            let error = TsinkError::from(error);
+            drop(page);
+            drop(inner_reservation);
+            return Err(error);
+        }
+        Ok(QueryRowsExecutionResult::accounted(page, inner_reservation))
+    }
+
+    fn scan_metric_rows_execution_accounting(&self) -> QueryExecutionAccounting {
+        if self.is_default_tenant() {
+            QueryExecutionAccounting::Unaccounted
+        } else {
+            self.inner
+                .scan_metric_rows_with_matchers_execution_accounting()
+        }
+    }
+
     fn select_with_options(&self, metric: &str, opts: QueryOptions) -> TsinkResult<Vec<DataPoint>> {
         let scoped = self.scoped_query_options(opts.clone())?;
         match self.inner.select_with_options(metric, scoped) {
@@ -3081,9 +3536,12 @@ mod tests {
     };
     use crate::usage::{UsageAccounting, UsageCategory, UsageRecordInput};
     use std::collections::HashMap;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Barrier, Condvar};
     use tsink::{
-        QueryBudgetError, QueryBudgetLimits, QueryCancellationToken, QueryLimitReason,
-        QueryWorkLimits, StorageBuilder, TimestampPrecision, WriteAcknowledgement,
+        AsyncRuntimeOptions, AsyncStorage, QueryBudgetError, QueryBudgetLimits,
+        QueryCancellationToken, QueryLimitReason, QueryWorkLimits, StorageBuilder,
+        TimestampPrecision, WriteAcknowledgement,
     };
 
     fn make_storage() -> Arc<dyn Storage> {
@@ -3091,6 +3549,36 @@ mod tests {
             .with_timestamp_precision(TimestampPrecision::Milliseconds)
             .build()
             .expect("storage should build")
+    }
+
+    async fn wait_for_tenant_query_resources_to_release(storage: &Arc<dyn Storage>) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let snapshot = storage.query_budget_snapshot();
+                if snapshot.active_queries == 0 && snapshot.shared_reserved_memory_bytes == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("tenant query slots and result reservations must release");
+    }
+
+    fn modeled_numeric_query_rows_returned_bytes(rows: &[Row]) -> u64 {
+        rows.iter().fold(0u64, |bytes, row| {
+            bytes
+                .saturating_add(u64::try_from(std::mem::size_of::<Row>()).unwrap_or(u64::MAX))
+                .saturating_add(u64::try_from(row.metric().len()).unwrap_or(u64::MAX))
+                .saturating_add(row.labels().iter().fold(0u64, |label_bytes, label| {
+                    label_bytes
+                        .saturating_add(
+                            u64::try_from(std::mem::size_of::<Label>()).unwrap_or(u64::MAX),
+                        )
+                        .saturating_add(u64::try_from(label.name.len()).unwrap_or(u64::MAX))
+                        .saturating_add(u64::try_from(label.value.len()).unwrap_or(u64::MAX))
+                }))
+        })
     }
 
     fn tenant_status_projection_registry() -> TenantRegistry {
@@ -3282,6 +3770,268 @@ mod tests {
 
     fn fixed_batch_storage(result: BatchWriteResult) -> Arc<dyn Storage> {
         Arc::new(FixedBatchResultStorage { result })
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum MetricRowGuardFault {
+        Missing,
+        Undersized,
+        UnprojectedLabel,
+    }
+
+    struct FalseCompleteMetricRowStorage {
+        inner: Arc<dyn Storage>,
+        fault: MetricRowGuardFault,
+        matcher_scan_calls: AtomicU64,
+    }
+
+    impl Storage for FalseCompleteMetricRowStorage {
+        fn query_budget(&self) -> Option<QueryBudget> {
+            self.inner.query_budget()
+        }
+
+        fn insert_rows(&self, rows: &[Row]) -> TsinkResult<()> {
+            self.inner.insert_rows(rows)
+        }
+
+        fn select(
+            &self,
+            metric: &str,
+            labels: &[Label],
+            start: i64,
+            end: i64,
+        ) -> TsinkResult<Vec<DataPoint>> {
+            self.inner.select(metric, labels, start, end)
+        }
+
+        fn select_with_options(
+            &self,
+            metric: &str,
+            options: QueryOptions,
+        ) -> TsinkResult<Vec<DataPoint>> {
+            self.inner.select_with_options(metric, options)
+        }
+
+        fn select_all(
+            &self,
+            metric: &str,
+            start: i64,
+            end: i64,
+        ) -> TsinkResult<Vec<(Vec<Label>, Vec<DataPoint>)>> {
+            self.inner.select_all(metric, start, end)
+        }
+
+        fn scan_metric_rows_with_matchers_with_execution_result(
+            &self,
+            metric: &str,
+            matchers: &[SeriesMatcher],
+            excluded_output_label: Option<&str>,
+            start: i64,
+            end: i64,
+            options: QueryRowsScanOptions,
+            execution: &QueryExecution,
+        ) -> TsinkResult<QueryRowsExecutionResult> {
+            self.matcher_scan_calls.fetch_add(1, Ordering::SeqCst);
+            let forwarded_exclusion = match self.fault {
+                MetricRowGuardFault::UnprojectedLabel => None,
+                MetricRowGuardFault::Missing | MetricRowGuardFault::Undersized => {
+                    excluded_output_label
+                }
+            };
+            let mut result = self
+                .inner
+                .scan_metric_rows_with_matchers_with_execution_result(
+                    metric,
+                    matchers,
+                    forwarded_exclusion,
+                    start,
+                    end,
+                    options,
+                    execution,
+                )?;
+            let reservation = result
+                .take_memory_reservation()
+                .expect("built-in matcher scan should return a reservation");
+            match self.fault {
+                MetricRowGuardFault::Missing => {
+                    drop(reservation);
+                    Ok(QueryRowsExecutionResult::unaccounted(result.into_page()))
+                }
+                MetricRowGuardFault::Undersized => {
+                    let required = tsink::modeled_query_rows_retained_bytes(&result.page.rows);
+                    let mut reservation = reservation;
+                    reservation
+                        .resize(required.saturating_sub(1))
+                        .expect("shrinking a test reservation should succeed");
+                    Ok(QueryRowsExecutionResult::accounted(
+                        result.into_page(),
+                        reservation,
+                    ))
+                }
+                MetricRowGuardFault::UnprojectedLabel => Ok(QueryRowsExecutionResult::accounted(
+                    result.into_page(),
+                    reservation,
+                )),
+            }
+        }
+
+        fn scan_metric_rows_with_matchers_execution_accounting(&self) -> QueryExecutionAccounting {
+            QueryExecutionAccounting::Complete
+        }
+
+        fn close(&self) -> TsinkResult<()> {
+            self.inner.close()
+        }
+    }
+
+    struct BlockingTenantMetricScanStorage {
+        inner: Arc<dyn Storage>,
+        block_detailed_scan: AtomicBool,
+        detailed_scan_started: tokio::sync::Notify,
+        release_detailed_scan: Condvar,
+        released: Mutex<bool>,
+        compatibility_scan_calls: AtomicU64,
+        detailed_scan_calls: AtomicU64,
+    }
+
+    impl BlockingTenantMetricScanStorage {
+        fn new(inner: Arc<dyn Storage>) -> Self {
+            Self {
+                inner,
+                block_detailed_scan: AtomicBool::new(false),
+                detailed_scan_started: tokio::sync::Notify::new(),
+                release_detailed_scan: Condvar::new(),
+                released: Mutex::new(true),
+                compatibility_scan_calls: AtomicU64::new(0),
+                detailed_scan_calls: AtomicU64::new(0),
+            }
+        }
+
+        fn arm_block(&self) {
+            *self
+                .released
+                .lock()
+                .expect("scan release state should lock") = false;
+            self.block_detailed_scan.store(true, Ordering::SeqCst);
+        }
+
+        fn release(&self) {
+            *self
+                .released
+                .lock()
+                .expect("scan release state should lock") = true;
+            self.block_detailed_scan.store(false, Ordering::SeqCst);
+            self.release_detailed_scan.notify_all();
+        }
+    }
+
+    struct TenantMetricScanReleaseGuard {
+        storage: Arc<BlockingTenantMetricScanStorage>,
+        armed: bool,
+    }
+
+    impl TenantMetricScanReleaseGuard {
+        fn new(storage: Arc<BlockingTenantMetricScanStorage>) -> Self {
+            Self {
+                storage,
+                armed: true,
+            }
+        }
+
+        fn release(&mut self) {
+            if self.armed {
+                self.storage.release();
+                self.armed = false;
+            }
+        }
+    }
+
+    impl Drop for TenantMetricScanReleaseGuard {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    impl Storage for BlockingTenantMetricScanStorage {
+        fn query_budget(&self) -> Option<QueryBudget> {
+            self.inner.query_budget()
+        }
+
+        fn insert_rows(&self, rows: &[Row]) -> TsinkResult<()> {
+            self.inner.insert_rows(rows)
+        }
+
+        fn select(
+            &self,
+            metric: &str,
+            labels: &[Label],
+            start: i64,
+            end: i64,
+        ) -> TsinkResult<Vec<DataPoint>> {
+            self.inner.select(metric, labels, start, end)
+        }
+
+        fn select_with_options(
+            &self,
+            metric: &str,
+            options: QueryOptions,
+        ) -> TsinkResult<Vec<DataPoint>> {
+            self.inner.select_with_options(metric, options)
+        }
+
+        fn select_all(
+            &self,
+            metric: &str,
+            start: i64,
+            end: i64,
+        ) -> TsinkResult<Vec<(Vec<Label>, Vec<DataPoint>)>> {
+            self.inner.select_all(metric, start, end)
+        }
+
+        fn scan_metric_rows(
+            &self,
+            metric: &str,
+            start: i64,
+            end: i64,
+            options: QueryRowsScanOptions,
+        ) -> TsinkResult<QueryRowsPage> {
+            self.compatibility_scan_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.scan_metric_rows(metric, start, end, options)
+        }
+
+        fn scan_metric_rows_with_execution_result(
+            &self,
+            metric: &str,
+            start: i64,
+            end: i64,
+            options: QueryRowsScanOptions,
+            execution: &QueryExecution,
+        ) -> TsinkResult<QueryRowsExecutionResult> {
+            self.detailed_scan_calls.fetch_add(1, Ordering::SeqCst);
+            if self.block_detailed_scan.load(Ordering::SeqCst) {
+                self.detailed_scan_started.notify_one();
+                let mut released = self
+                    .released
+                    .lock()
+                    .expect("scan release state should lock");
+                while !*released {
+                    released = self
+                        .release_detailed_scan
+                        .wait(released)
+                        .expect("scan release wait should preserve the lock");
+                }
+            }
+            self.inner
+                .scan_metric_rows_with_execution_result(metric, start, end, options, execution)
+        }
+
+        fn scan_metric_rows_execution_accounting(&self) -> QueryExecutionAccounting {
+            self.inner.scan_metric_rows_execution_accounting()
+        }
+
+        fn close(&self) -> TsinkResult<()> {
+            self.inner.close()
+        }
     }
 
     fn accepted_batch_result(rows: usize) -> BatchWriteResult {
@@ -3536,19 +4286,983 @@ mod tests {
     }
 
     #[test]
-    fn tenant_metric_row_scan_accounting_remains_unaccounted() {
+    fn tenant_metric_row_scan_capability_requires_non_default_and_matcher_aware_inner() {
         let storage = make_storage();
         assert_eq!(
-            storage.scan_metric_rows_execution_accounting(),
+            storage.scan_metric_rows_with_matchers_execution_accounting(),
             QueryExecutionAccounting::Complete,
-            "the built-in inner storage fixture should expose complete metric-row accounting",
+            "the built-in inner storage fixture should expose complete matcher-aware accounting",
         );
-        let tenant = scoped_storage(storage, "tenant-a");
+        let tenant = scoped_storage(Arc::clone(&storage), "tenant-a");
         assert_eq!(
             tenant.scan_metric_rows_execution_accounting(),
-            QueryExecutionAccounting::Unaccounted,
-            "tenant metric-row scans must fail closed until the wrapper has a bounded complete implementation",
+            QueryExecutionAccounting::Complete,
+            "a non-default tenant may expose the complete inner matcher-aware primitive",
         );
+
+        let default_tenant = scoped_storage(storage, DEFAULT_TENANT_ID);
+        assert_eq!(
+            default_tenant.scan_metric_rows_execution_accounting(),
+            QueryExecutionAccounting::Unaccounted,
+            "default-tenant legacy fallback cannot preserve one matcher-aware scan envelope",
+        );
+
+        let compatibility_inner = fixed_batch_storage(accepted_batch_result(0));
+        assert_eq!(
+            compatibility_inner.scan_metric_rows_with_matchers_execution_accounting(),
+            QueryExecutionAccounting::Unaccounted,
+            "third-party compatibility storage must remain conservative by default",
+        );
+        let compatibility_tenant = scoped_storage(compatibility_inner, "tenant-a");
+        assert_eq!(
+            compatibility_tenant.scan_metric_rows_execution_accounting(),
+            QueryExecutionAccounting::Unaccounted,
+            "the tenant adapter must not promote an unaccounted matcher-aware inner",
+        );
+    }
+
+    #[test]
+    fn tenant_metric_row_scan_empty_page_retains_zero_byte_guard_lease() {
+        let storage = make_storage();
+        let tenant = scoped_storage(Arc::clone(&storage), "tenant-a");
+        let execution = tenant
+            .begin_query_execution(QueryWorkLimits::default(), QueryCancellationToken::new())
+            .expect("empty tenant query should admit")
+            .expect("built-in storage should expose a query budget");
+        let result = tenant
+            .scan_metric_rows_with_execution_result(
+                "tenant_metric_empty",
+                0,
+                20,
+                QueryRowsScanOptions {
+                    max_rows: Some(1),
+                    row_offset: None,
+                },
+                &execution,
+            )
+            .expect("empty tenant metric scan should succeed");
+        assert!(result.page.rows.is_empty());
+        assert_eq!(result.page.rows_scanned, 0);
+        assert!(!result.page.truncated);
+        assert_eq!(result.page.next_row_offset, None);
+        assert_eq!(result.reserved_memory_bytes(), 0);
+        drop(execution);
+        let held = storage.query_budget_snapshot();
+        assert_eq!(held.active_queries, 1);
+        assert_eq!(held.shared_reserved_memory_bytes, 0);
+        assert_eq!(held.queries_completed_total, 0);
+        drop(result);
+        let released = storage.query_budget_snapshot();
+        assert_eq!(released.active_queries, 0);
+        assert_eq!(released.shared_reserved_memory_bytes, 0);
+        assert_eq!(released.queries_completed_total, 1);
+        assert_eq!(released.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn tenant_metric_row_scan_offset_beyond_visible_end_is_terminal_empty() {
+        let storage = make_storage();
+        let metric = "tenant_metric_offset_end";
+        storage
+            .insert_rows(
+                &scope_rows_for_tenant(
+                    vec![
+                        Row::with_labels(
+                            metric,
+                            vec![Label::new("host", "a")],
+                            DataPoint::new(10, 1.0),
+                        ),
+                        Row::with_labels(
+                            metric,
+                            vec![Label::new("host", "a")],
+                            DataPoint::new(20, 2.0),
+                        ),
+                    ],
+                    "tenant-a",
+                )
+                .expect("tenant A rows should scope"),
+            )
+            .expect("tenant A rows should insert");
+        storage
+            .insert_rows(
+                &scope_rows_for_tenant(
+                    vec![Row::with_labels(
+                        metric,
+                        vec![Label::new("host", "b")],
+                        DataPoint::new(15, 3.0),
+                    )],
+                    "tenant-b",
+                )
+                .expect("tenant B row should scope"),
+            )
+            .expect("tenant B row should insert");
+
+        let tenant = scoped_storage(Arc::clone(&storage), "tenant-a");
+        let execution = tenant
+            .begin_query_execution(QueryWorkLimits::default(), QueryCancellationToken::new())
+            .expect("offset query should admit")
+            .expect("built-in storage should expose a query budget");
+        let result = tenant
+            .scan_metric_rows_with_execution_result(
+                metric,
+                0,
+                30,
+                QueryRowsScanOptions {
+                    max_rows: Some(1),
+                    row_offset: Some(99),
+                },
+                &execution,
+            )
+            .expect("beyond-end tenant metric scan should succeed");
+        assert!(result.page.rows.is_empty());
+        assert_eq!(result.page.rows_scanned, 0);
+        assert!(!result.page.truncated);
+        assert_eq!(result.page.next_row_offset, None);
+        assert_eq!(execution.snapshot().series_matched, 1);
+        drop(result);
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        drop(execution);
+        let released = storage.query_budget_snapshot();
+        assert_eq!(released.active_queries, 0);
+        assert_eq!(released.shared_reserved_memory_bytes, 0);
+        assert_eq!(released.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn tenant_metric_row_scan_filters_before_pagination_and_preserves_continuation() {
+        let storage = make_storage();
+        let metric = "tenant_metric_page";
+        let tenant_a_rows = scope_rows_for_tenant(
+            vec![
+                Row::with_labels(
+                    metric,
+                    vec![Label::new("host", "a")],
+                    DataPoint::new(10, 1.0),
+                ),
+                Row::with_labels(
+                    metric,
+                    vec![Label::new("host", "a")],
+                    DataPoint::new(30, 2.0),
+                ),
+            ],
+            "tenant-a",
+        )
+        .expect("tenant A rows should scope");
+        let tenant_b_rows = scope_rows_for_tenant(
+            vec![
+                Row::with_labels(
+                    metric,
+                    vec![Label::new("host", "b")],
+                    DataPoint::new(5, 10.0),
+                ),
+                Row::with_labels(
+                    metric,
+                    vec![Label::new("host", "b")],
+                    DataPoint::new(20, 20.0),
+                ),
+            ],
+            "tenant-b",
+        )
+        .expect("tenant B rows should scope");
+        storage
+            .insert_rows(
+                &tenant_a_rows
+                    .into_iter()
+                    .chain(tenant_b_rows)
+                    .collect::<Vec<_>>(),
+            )
+            .expect("mixed tenant rows should insert");
+
+        let tenant = scoped_storage(Arc::clone(&storage), "tenant-a");
+        let execution = tenant
+            .begin_query_execution(QueryWorkLimits::default(), QueryCancellationToken::new())
+            .expect("query admission should succeed")
+            .expect("built-in storage should expose a query budget");
+        let first = tenant
+            .scan_metric_rows_with_execution_result(
+                metric,
+                0,
+                40,
+                QueryRowsScanOptions {
+                    max_rows: Some(1),
+                    row_offset: None,
+                },
+                &execution,
+            )
+            .expect("first tenant page should succeed");
+        assert_eq!(first.page.rows.len(), 1);
+        assert!(first.page.truncated);
+        assert_eq!(first.page.next_row_offset, Some(1));
+        assert_eq!(first.page.rows[0].data_point().value_as_f64(), Some(1.0));
+        assert_eq!(first.page.rows[0].labels(), &[Label::new("host", "a")]);
+        assert_eq!(
+            first.reserved_memory_bytes(),
+            tsink::modeled_query_rows_retained_bytes(&first.page.rows)
+        );
+        let continuation = first
+            .page
+            .next_row_offset
+            .expect("a truncated page should expose a continuation");
+        drop(first);
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+
+        let second = tenant
+            .scan_metric_rows_with_execution_result(
+                metric,
+                0,
+                40,
+                QueryRowsScanOptions {
+                    max_rows: Some(1),
+                    row_offset: Some(continuation),
+                },
+                &execution,
+            )
+            .expect("continued tenant page should succeed");
+        assert_eq!(second.page.rows.len(), 1);
+        assert!(!second.page.truncated);
+        assert_eq!(second.page.next_row_offset, None);
+        assert_eq!(second.page.rows[0].data_point().value_as_f64(), Some(2.0));
+        assert_eq!(second.page.rows[0].labels(), &[Label::new("host", "a")]);
+        assert!(second.page.rows[0]
+            .labels()
+            .iter()
+            .all(|label| label.name != TENANT_LABEL));
+        drop(second);
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        drop(execution);
+        assert_eq!(
+            storage.query_budget_snapshot().shared_reserved_memory_bytes,
+            0
+        );
+    }
+
+    #[test]
+    fn tenant_metric_row_scan_charges_only_visible_series_amid_other_tenants() {
+        let storage = make_storage();
+        let metric = "tenant_metric_series_charge";
+        let tenant_a_rows = (0..2)
+            .map(|index| {
+                Row::with_labels(
+                    metric,
+                    vec![Label::new("host", format!("a-{index}"))],
+                    DataPoint::new(10, index as f64),
+                )
+            })
+            .collect::<Vec<_>>();
+        storage
+            .insert_rows(
+                &scope_rows_for_tenant(tenant_a_rows, "tenant-a")
+                    .expect("tenant A rows should scope"),
+            )
+            .expect("tenant A rows should insert");
+        let tenant_b_rows = (0..64)
+            .map(|index| {
+                Row::with_labels(
+                    metric,
+                    vec![Label::new("host", format!("b-{index}"))],
+                    DataPoint::new(10, index as f64),
+                )
+            })
+            .collect::<Vec<_>>();
+        storage
+            .insert_rows(
+                &scope_rows_for_tenant(tenant_b_rows, "tenant-b")
+                    .expect("tenant B rows should scope"),
+            )
+            .expect("tenant B rows should insert");
+
+        let tenant = scoped_storage(storage, "tenant-a");
+        let budget = QueryBudget::new(QueryBudgetLimits {
+            per_query: QueryWorkLimits {
+                max_series_matched: Some(2),
+                ..QueryWorkLimits::default()
+            },
+            ..QueryBudgetLimits::default()
+        })
+        .expect("series-limited query budget should build");
+        let execution = budget.begin_query().expect("query should admit");
+        let result = tenant
+            .scan_metric_rows_with_execution_result(
+                metric,
+                0,
+                20,
+                QueryRowsScanOptions {
+                    max_rows: Some(2),
+                    row_offset: None,
+                },
+                &execution,
+            )
+            .expect("the exact two visible series should fit");
+        assert_eq!(result.page.rows.len(), 2);
+        assert_eq!(execution.snapshot().series_matched, 2);
+        assert!(result
+            .page
+            .rows
+            .iter()
+            .all(|row| row.labels().iter().all(|label| label.name != TENANT_LABEL)));
+        drop(result);
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        drop(execution);
+        let released = budget.snapshot();
+        assert_eq!(released.shared_reserved_memory_bytes, 0);
+        assert_eq!(released.accounting_invariant_violations_total, 0);
+
+        let one_under_budget = QueryBudget::new(QueryBudgetLimits {
+            per_query: QueryWorkLimits {
+                max_series_matched: Some(1),
+                ..QueryWorkLimits::default()
+            },
+            ..QueryBudgetLimits::default()
+        })
+        .expect("one-under series budget should build");
+        let one_under = one_under_budget
+            .begin_query()
+            .expect("one-under series query should admit");
+        let error = tenant
+            .scan_metric_rows_with_execution_result(
+                metric,
+                0,
+                20,
+                QueryRowsScanOptions {
+                    max_rows: Some(2),
+                    row_offset: None,
+                },
+                &one_under,
+            )
+            .expect_err("one visible-series slot below the exact count must reject");
+        assert!(matches!(
+            error,
+            TsinkError::QueryBudget(QueryBudgetError::LimitExceeded(exceeded))
+                if exceeded.reason == QueryLimitReason::SeriesMatched
+                    && exceeded.current == 0
+                    && exceeded.requested == 2
+        ));
+        let rejected = one_under.snapshot();
+        assert_eq!(rejected.series_matched, 0);
+        assert_eq!(rejected.samples_returned, 0);
+        assert_eq!(rejected.returned_bytes, 0);
+        assert_eq!(rejected.memory_reserved_bytes, 0);
+        drop(one_under);
+        let one_under_released = one_under_budget.snapshot();
+        assert_eq!(one_under_released.shared_reserved_memory_bytes, 0);
+        assert_eq!(one_under_released.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn tenant_metric_row_scan_charges_exact_visible_returned_bytes() {
+        let storage = make_storage();
+        let metric = "tenant_metric_returned_bytes";
+        storage
+            .insert_rows(
+                &scope_rows_for_tenant(
+                    vec![Row::with_labels(
+                        metric,
+                        vec![Label::new("host", "visible-a")],
+                        DataPoint::new(10, 1.0),
+                    )],
+                    "tenant-a",
+                )
+                .expect("tenant A row should scope"),
+            )
+            .expect("tenant A row should insert");
+        storage
+            .insert_rows(
+                &scope_rows_for_tenant(
+                    vec![Row::with_labels(
+                        metric,
+                        vec![Label::new("host", "hidden-b")],
+                        DataPoint::new(10, 2.0),
+                    )],
+                    "tenant-b",
+                )
+                .expect("tenant B row should scope"),
+            )
+            .expect("tenant B row should insert");
+        let tenant = scoped_storage(storage, "tenant-a");
+        let options = QueryRowsScanOptions {
+            max_rows: Some(1),
+            row_offset: None,
+        };
+
+        let calibration_budget = QueryBudget::new(QueryBudgetLimits::default())
+            .expect("returned-byte calibration budget should build");
+        let calibration = calibration_budget
+            .begin_query()
+            .expect("returned-byte calibration query should admit");
+        let calibrated = tenant
+            .scan_metric_rows_with_execution_result(metric, 0, 20, options, &calibration)
+            .expect("returned-byte calibration scan should succeed");
+        assert_eq!(calibrated.page.rows.len(), 1);
+        assert!(calibrated.page.rows[0]
+            .labels()
+            .iter()
+            .all(|label| label.name != TENANT_LABEL));
+        let required = modeled_numeric_query_rows_returned_bytes(&calibrated.page.rows);
+        assert!(required > 0);
+        let hidden_tenant_label_bytes = u64::try_from(std::mem::size_of::<Label>())
+            .unwrap_or(u64::MAX)
+            .saturating_add(u64::try_from(TENANT_LABEL.len()).unwrap_or(u64::MAX))
+            .saturating_add(u64::try_from("tenant-a".len()).unwrap_or(u64::MAX));
+        let physical_required = required.saturating_add(hidden_tenant_label_bytes);
+        assert!(
+            physical_required > required,
+            "the physical row model must include the hidden tenant-label slot and text"
+        );
+        assert_eq!(
+            calibration.snapshot().returned_bytes,
+            required,
+            "returned-byte accounting must model the projected tenant-visible row"
+        );
+        drop(calibrated);
+        assert_eq!(calibration.snapshot().memory_reserved_bytes, 0);
+        drop(calibration);
+        assert_eq!(
+            calibration_budget.snapshot().shared_reserved_memory_bytes,
+            0
+        );
+
+        let exact_budget = QueryBudget::new(QueryBudgetLimits {
+            per_query: QueryWorkLimits {
+                max_returned_bytes: Some(required),
+                ..QueryWorkLimits::default()
+            },
+            ..QueryBudgetLimits::default()
+        })
+        .expect("exact returned-byte budget should build");
+        let exact = exact_budget
+            .begin_query()
+            .expect("exact returned-byte query should admit");
+        let exact_result = tenant
+            .scan_metric_rows_with_execution_result(metric, 0, 20, options, &exact)
+            .expect("the exact visible returned-byte budget should pass");
+        assert_eq!(exact.snapshot().returned_bytes, required);
+        drop(exact_result);
+        assert_eq!(exact.snapshot().memory_reserved_bytes, 0);
+        drop(exact);
+        assert_eq!(exact_budget.snapshot().shared_reserved_memory_bytes, 0);
+
+        let one_under_budget = QueryBudget::new(QueryBudgetLimits {
+            per_query: QueryWorkLimits {
+                max_returned_bytes: Some(required.saturating_sub(1)),
+                ..QueryWorkLimits::default()
+            },
+            ..QueryBudgetLimits::default()
+        })
+        .expect("one-under returned-byte budget should build");
+        let one_under = one_under_budget
+            .begin_query()
+            .expect("one-under returned-byte query should admit");
+        let error = tenant
+            .scan_metric_rows_with_execution_result(metric, 0, 20, options, &one_under)
+            .expect_err("one byte below the visible returned-byte model must reject");
+        assert!(matches!(
+            error,
+            TsinkError::QueryBudget(QueryBudgetError::LimitExceeded(exceeded))
+                if exceeded.reason == QueryLimitReason::ReturnedBytes
+                    && exceeded.current == 0
+                    && exceeded.requested == required
+        ));
+        assert_eq!(one_under.snapshot().memory_reserved_bytes, 0);
+        drop(one_under);
+        let one_under_released = one_under_budget.snapshot();
+        assert_eq!(one_under_released.shared_reserved_memory_bytes, 0);
+        assert_eq!(one_under_released.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn tenant_metric_row_scan_enforces_exact_memory_peak_and_guard_lifetime() {
+        let storage = make_storage();
+        let metric = "tenant_metric_memory";
+        storage
+            .insert_rows(
+                &scope_rows_for_tenant(
+                    vec![Row::with_labels(
+                        metric,
+                        vec![Label::new("host", "a-long-visible-label-value")],
+                        DataPoint::new(10, 1.0),
+                    )],
+                    "tenant-a",
+                )
+                .expect("tenant row should scope"),
+            )
+            .expect("tenant row should insert");
+        let tenant = scoped_storage(storage, "tenant-a");
+        let options = QueryRowsScanOptions {
+            max_rows: Some(1),
+            row_offset: None,
+        };
+
+        let calibration_budget = QueryBudget::new(QueryBudgetLimits::default())
+            .expect("calibration budget should build");
+        let calibration = calibration_budget
+            .begin_query()
+            .expect("calibration query should admit");
+        let calibrated = tenant
+            .scan_metric_rows_with_execution_result(metric, 0, 20, options, &calibration)
+            .expect("calibration scan should succeed");
+        let retained = tsink::modeled_query_rows_retained_bytes(&calibrated.page.rows);
+        assert_eq!(calibrated.reserved_memory_bytes(), retained);
+        assert_eq!(calibration.snapshot().memory_reserved_bytes, retained);
+        let required_peak = calibration_budget
+            .snapshot()
+            .peak_shared_reserved_memory_bytes;
+        assert!(required_peak >= retained);
+        assert!(required_peak > 0);
+        drop(calibrated);
+        assert_eq!(calibration.snapshot().memory_reserved_bytes, 0);
+        drop(calibration);
+        assert_eq!(
+            calibration_budget.snapshot().shared_reserved_memory_bytes,
+            0
+        );
+
+        let exact_budget = QueryBudget::new(QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(required_peak),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(required_peak),
+                ..QueryWorkLimits::default()
+            },
+        })
+        .expect("exact budget should build");
+        let exact = exact_budget
+            .begin_query()
+            .expect("exact query should admit");
+        let exact_result = tenant
+            .scan_metric_rows_with_execution_result(metric, 0, 20, options, &exact)
+            .expect("the exact modeled peak should pass");
+        assert_eq!(exact_result.reserved_memory_bytes(), retained);
+        assert_eq!(exact.snapshot().memory_reserved_bytes, retained);
+        drop(exact_result);
+        assert_eq!(exact.snapshot().memory_reserved_bytes, 0);
+        drop(exact);
+        let exact_released = exact_budget.snapshot();
+        assert_eq!(exact_released.shared_reserved_memory_bytes, 0);
+        assert_eq!(exact_released.accounting_invariant_violations_total, 0);
+
+        let one_under_budget = QueryBudget::new(QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(required_peak),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(required_peak.saturating_sub(1)),
+                ..QueryWorkLimits::default()
+            },
+        })
+        .expect("one-under budget should build");
+        let one_under = one_under_budget
+            .begin_query()
+            .expect("one-under query should admit");
+        let error = tenant
+            .scan_metric_rows_with_execution_result(metric, 0, 20, options, &one_under)
+            .expect_err("one byte below the modeled peak must reject");
+        assert!(matches!(
+            error,
+            TsinkError::QueryBudget(QueryBudgetError::LimitExceeded(exceeded))
+                if exceeded.reason == QueryLimitReason::PerQueryMemoryBytes
+        ));
+        assert_eq!(one_under.snapshot().memory_reserved_bytes, 0);
+        drop(one_under);
+        let one_under_released = one_under_budget.snapshot();
+        assert_eq!(one_under_released.shared_reserved_memory_bytes, 0);
+        assert_eq!(one_under_released.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn tenant_metric_row_scan_rejects_false_complete_result_guards() {
+        let storage = make_storage();
+        let metric = "tenant_metric_false_guard";
+        storage
+            .insert_rows(
+                &scope_rows_for_tenant(
+                    vec![Row::with_labels(
+                        metric,
+                        vec![Label::new("host", "a")],
+                        DataPoint::new(10, 1.0),
+                    )],
+                    "tenant-a",
+                )
+                .expect("tenant row should scope"),
+            )
+            .expect("tenant row should insert");
+
+        for (fault, expected) in [
+            (
+                MetricRowGuardFault::Missing,
+                "omitted its result reservation",
+            ),
+            (MetricRowGuardFault::Undersized, "retained"),
+            (
+                MetricRowGuardFault::UnprojectedLabel,
+                "failed to project the tenant label",
+            ),
+        ] {
+            let lying: Arc<dyn Storage> = Arc::new(FalseCompleteMetricRowStorage {
+                inner: Arc::clone(&storage),
+                fault,
+                matcher_scan_calls: AtomicU64::new(0),
+            });
+            let tenant = scoped_storage(lying, "tenant-a");
+            assert_eq!(
+                tenant.scan_metric_rows_execution_accounting(),
+                QueryExecutionAccounting::Complete,
+                "the fixture must exercise a falsely advertised Complete result",
+            );
+            let budget = QueryBudget::new(QueryBudgetLimits::default())
+                .expect("guard test budget should build");
+            let execution = budget.begin_query().expect("guard test query should admit");
+            let error = tenant
+                .scan_metric_rows_with_execution_result(
+                    metric,
+                    0,
+                    20,
+                    QueryRowsScanOptions {
+                        max_rows: Some(1),
+                        row_offset: None,
+                    },
+                    &execution,
+                )
+                .expect_err("a false Complete guard must be rejected");
+            assert!(
+                matches!(&error, TsinkError::Other(message) if message.contains(expected)),
+                "unexpected false-Complete error: {error}"
+            );
+            assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+            drop(execution);
+            let released = budget.snapshot();
+            assert_eq!(released.shared_reserved_memory_bytes, 0);
+            assert_eq!(released.accounting_invariant_violations_total, 0);
+        }
+    }
+
+    #[test]
+    fn tenant_metric_row_scan_honors_precancellation_without_allocating() {
+        let storage = make_storage();
+        let tenant = scoped_storage(storage, "tenant-a");
+        let budget = QueryBudget::new(QueryBudgetLimits::default())
+            .expect("cancellation budget should build");
+        let cancellation = QueryCancellationToken::new();
+        let execution = budget
+            .begin_query_with(QueryWorkLimits::default(), cancellation.clone())
+            .expect("cancellation query should admit");
+        cancellation.cancel();
+
+        let error = tenant
+            .scan_metric_rows_with_execution_result(
+                "tenant_metric_cancelled",
+                0,
+                20,
+                QueryRowsScanOptions {
+                    max_rows: Some(1),
+                    row_offset: None,
+                },
+                &execution,
+            )
+            .expect_err("a pre-cancelled tenant metric scan must stop");
+        assert!(matches!(
+            error,
+            TsinkError::QueryBudget(QueryBudgetError::Cancelled)
+        ));
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        assert_eq!(execution.snapshot().series_matched, 0);
+        assert_eq!(budget.snapshot().peak_shared_reserved_memory_bytes, 0);
+        drop(execution);
+        let released = budget.snapshot();
+        assert_eq!(released.active_queries, 0);
+        assert_eq!(released.shared_reserved_memory_bytes, 0);
+        assert_eq!(released.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn tenant_metric_row_scan_validates_inputs_before_cancellation_or_matcher_memory() {
+        let inner = make_storage();
+        let observed = Arc::new(FalseCompleteMetricRowStorage {
+            inner,
+            fault: MetricRowGuardFault::Missing,
+            matcher_scan_calls: AtomicU64::new(0),
+        });
+        let tenant = scoped_storage(Arc::clone(&observed) as Arc<dyn Storage>, "tenant-a");
+        let budget = QueryBudget::new(QueryBudgetLimits {
+            max_concurrent_queries: Some(1),
+            max_shared_memory_bytes: Some(1),
+            per_query: QueryWorkLimits {
+                max_memory_bytes: Some(1),
+                ..QueryWorkLimits::default()
+            },
+        })
+        .expect("tiny validation budget should build");
+        let cancellation = QueryCancellationToken::new();
+        let execution = budget
+            .begin_query_with(QueryWorkLimits::default(), cancellation.clone())
+            .expect("tiny validation query should admit");
+        let held = execution
+            .reserve_memory(1)
+            .expect("the only modeled byte should reserve");
+        cancellation.cancel();
+
+        let error = tenant
+            .scan_metric_rows_with_execution_result(
+                "",
+                10,
+                10,
+                QueryRowsScanOptions {
+                    max_rows: Some(0),
+                    row_offset: None,
+                },
+                &execution,
+            )
+            .expect_err("metric validation must win over later invalid inputs and cancellation");
+        assert!(matches!(error, TsinkError::MetricRequired));
+
+        let error = tenant
+            .scan_metric_rows_with_execution_result(
+                "tenant_metric_invalid_request",
+                10,
+                10,
+                QueryRowsScanOptions {
+                    max_rows: Some(0),
+                    row_offset: None,
+                },
+                &execution,
+            )
+            .expect_err("range validation must win over options and cancellation");
+        assert!(matches!(
+            error,
+            TsinkError::InvalidTimeRange { start: 10, end: 10 }
+        ));
+
+        let error = tenant
+            .scan_metric_rows_with_execution_result(
+                "tenant_metric_invalid_request",
+                0,
+                10,
+                QueryRowsScanOptions {
+                    max_rows: Some(0),
+                    row_offset: None,
+                },
+                &execution,
+            )
+            .expect_err("scan-option validation must win over cancellation and matcher memory");
+        assert!(matches!(
+            error,
+            TsinkError::InvalidConfiguration(message)
+                if message == "max_rows must be greater than zero when set"
+        ));
+
+        assert_eq!(observed.matcher_scan_calls.load(Ordering::SeqCst), 0);
+        let validation_snapshot = execution.snapshot();
+        assert_eq!(validation_snapshot.memory_reserved_bytes, 1);
+        assert_eq!(validation_snapshot.series_matched, 0);
+        assert_eq!(validation_snapshot.samples_returned, 0);
+        assert_eq!(validation_snapshot.returned_bytes, 0);
+        assert_eq!(budget.snapshot().peak_shared_reserved_memory_bytes, 1);
+        drop(held);
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        drop(execution);
+        let released = budget.snapshot();
+        assert_eq!(released.active_queries, 0);
+        assert_eq!(released.shared_reserved_memory_bytes, 0);
+        assert_eq!(released.accounting_invariant_violations_total, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn async_non_default_tenant_metric_scan_projects_pages_and_cleans_up_on_drop(
+    ) -> TsinkResult<()> {
+        let storage = StorageBuilder::new()
+            .with_timestamp_precision(TimestampPrecision::Milliseconds)
+            .with_query_budget_limits(QueryBudgetLimits {
+                max_concurrent_queries: Some(1),
+                max_shared_memory_bytes: Some(8 * 1024 * 1024),
+                per_query: QueryWorkLimits {
+                    max_series_matched: Some(1),
+                    max_returned_bytes: Some(1024 * 1024),
+                    max_intermediate_vector_size: Some(2),
+                    max_memory_bytes: Some(4 * 1024 * 1024),
+                    ..QueryWorkLimits::default()
+                },
+            })
+            .build()
+            .expect("finite async tenant storage should build");
+        let metric = "tenant_metric_async";
+        storage.insert_rows(
+            &scope_rows_for_tenant(
+                vec![
+                    Row::with_labels(
+                        metric,
+                        vec![Label::new("host", "a")],
+                        DataPoint::new(10, 1.0),
+                    ),
+                    Row::with_labels(
+                        metric,
+                        vec![Label::new("host", "a")],
+                        DataPoint::new(20, 2.0),
+                    ),
+                ],
+                "tenant-a",
+            )
+            .expect("async tenant A rows should scope"),
+        )?;
+        storage.insert_rows(
+            &scope_rows_for_tenant(
+                vec![Row::with_labels(
+                    metric,
+                    vec![Label::new("host", "b")],
+                    DataPoint::new(15, 3.0),
+                )],
+                "tenant-b",
+            )
+            .expect("async tenant B row should scope"),
+        )?;
+
+        let tenant = scoped_storage(Arc::clone(&storage), "tenant-a");
+        assert_eq!(
+            tenant.scan_metric_rows_execution_accounting(),
+            QueryExecutionAccounting::Complete
+        );
+        let observed = Arc::new(BlockingTenantMetricScanStorage::new(tenant));
+        let async_storage = AsyncStorage::from_storage_with_options(
+            Arc::clone(&observed) as Arc<dyn Storage>,
+            AsyncRuntimeOptions {
+                read_workers: 1,
+                ..AsyncRuntimeOptions::default()
+            },
+        )?;
+
+        let first = async_storage
+            .scan_metric_rows(
+                metric,
+                0,
+                30,
+                QueryRowsScanOptions {
+                    max_rows: Some(1),
+                    row_offset: None,
+                },
+            )
+            .await?;
+        assert_eq!(first.rows.len(), 1);
+        assert!(first.truncated);
+        assert_eq!(first.next_row_offset, Some(1));
+        assert_eq!(first.rows[0].data_point().value_as_f64(), Some(1.0));
+        assert_eq!(first.rows[0].labels(), &[Label::new("host", "a")]);
+        wait_for_tenant_query_resources_to_release(&storage).await;
+
+        let second = async_storage
+            .scan_metric_rows(
+                metric,
+                0,
+                30,
+                QueryRowsScanOptions {
+                    max_rows: Some(1),
+                    row_offset: first.next_row_offset,
+                },
+            )
+            .await?;
+        assert_eq!(second.rows.len(), 1);
+        assert!(!second.truncated);
+        assert_eq!(second.next_row_offset, None);
+        assert_eq!(second.rows[0].data_point().value_as_f64(), Some(2.0));
+        assert_eq!(second.rows[0].labels(), &[Label::new("host", "a")]);
+        wait_for_tenant_query_resources_to_release(&storage).await;
+        assert_eq!(observed.detailed_scan_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(observed.compatibility_scan_calls.load(Ordering::SeqCst), 0);
+
+        observed.arm_block();
+        let mut release_guard = TenantMetricScanReleaseGuard::new(Arc::clone(&observed));
+        let cancelled_storage = async_storage.clone();
+        let cancelled = tokio::spawn(async move {
+            cancelled_storage
+                .scan_metric_rows(
+                    metric,
+                    0,
+                    30,
+                    QueryRowsScanOptions {
+                        max_rows: Some(1),
+                        row_offset: None,
+                    },
+                )
+                .await
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            observed.detailed_scan_started.notified(),
+        )
+        .await
+        .expect("cancelled tenant scan should reach the detailed backend");
+        assert_eq!(storage.query_budget_snapshot().active_queries, 1);
+        cancelled.abort();
+        let cancelled_error = tokio::time::timeout(std::time::Duration::from_secs(2), cancelled)
+            .await
+            .expect("aborted async tenant scan task should stop promptly")
+            .expect_err("aborted async tenant scan task should be cancelled");
+        assert!(cancelled_error.is_cancelled());
+        release_guard.release();
+        wait_for_tenant_query_resources_to_release(&storage).await;
+        let released = storage.query_budget_snapshot();
+        assert_eq!(released.active_queries, 0);
+        assert_eq!(released.shared_reserved_memory_bytes, 0);
+        assert_eq!(released.queries_started_total, 3);
+        assert_eq!(released.queries_completed_total, 3);
+        assert_eq!(released.accounting_invariant_violations_total, 0);
+        assert_eq!(observed.detailed_scan_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(observed.compatibility_scan_calls.load(Ordering::SeqCst), 0);
+
+        async_storage.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn async_default_tenant_metric_scan_fails_closed_before_compatibility_read(
+    ) -> TsinkResult<()> {
+        let storage = StorageBuilder::new()
+            .with_timestamp_precision(TimestampPrecision::Milliseconds)
+            .with_query_budget_limits(QueryBudgetLimits {
+                max_concurrent_queries: Some(1),
+                max_shared_memory_bytes: Some(1024 * 1024),
+                per_query: QueryWorkLimits {
+                    max_memory_bytes: Some(512 * 1024),
+                    ..QueryWorkLimits::default()
+                },
+            })
+            .build()
+            .expect("finite default-tenant async storage should build");
+        let default_tenant = scoped_storage(Arc::clone(&storage), DEFAULT_TENANT_ID);
+        assert_eq!(
+            default_tenant.scan_metric_rows_execution_accounting(),
+            QueryExecutionAccounting::Unaccounted
+        );
+        let observed = Arc::new(BlockingTenantMetricScanStorage::new(default_tenant));
+        let async_storage = AsyncStorage::from_storage(Arc::clone(&observed) as Arc<dyn Storage>)?;
+
+        let error = async_storage
+            .scan_metric_rows(
+                "tenant_metric_default_async",
+                0,
+                20,
+                QueryRowsScanOptions {
+                    max_rows: Some(1),
+                    row_offset: None,
+                },
+            )
+            .await
+            .expect_err("budgeted async default-tenant metric scan must fail closed");
+        assert!(matches!(
+            error,
+            TsinkError::UnsupportedOperation {
+                operation: "async_scan_metric_rows",
+                reason,
+            } if reason == "bounded async row scans require complete execution accounting"
+        ));
+        assert_eq!(observed.detailed_scan_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(observed.compatibility_scan_calls.load(Ordering::SeqCst), 0);
+        wait_for_tenant_query_resources_to_release(&storage).await;
+        let released = storage.query_budget_snapshot();
+        assert_eq!(released.active_queries, 0);
+        assert_eq!(released.shared_reserved_memory_bytes, 0);
+        assert_eq!(released.queries_started_total, 1);
+        assert_eq!(released.queries_completed_total, 1);
+        assert_eq!(released.accounting_invariant_violations_total, 0);
+
+        async_storage.close().await?;
+        Ok(())
     }
 
     #[test]
@@ -4681,6 +6395,256 @@ mod tests {
     }
 
     #[test]
+    fn tenant_runtime_cache_limit_defaults_and_validates_reserved_capacity() {
+        let registry = TenantRegistry::from_json_str("{}")
+            .expect("empty tenant policy should use a finite runtime limit");
+        assert_eq!(
+            registry.runtime_cache_metrics_snapshot(),
+            TenantRuntimeCacheMetricsSnapshot {
+                initialized_runtimes: 0,
+                initialized_reserved_runtimes: 0,
+                initialized_dynamic_runtimes: 0,
+                max_runtimes: DEFAULT_TENANT_RUNTIME_MAX_TENANTS,
+                reserved_runtimes: 1,
+                limit_rejections_total: 0,
+            }
+        );
+
+        assert_eq!(
+            TenantRegistry::from_json_str(r#"{"maxRuntimeTenants":0}"#)
+                .expect_err("a zero runtime limit must fail"),
+            "maxRuntimeTenants must be greater than zero"
+        );
+        assert_eq!(
+            TenantRegistry::from_json_str(
+                r#"{
+                    "maxRuntimeTenants": 1,
+                    "tenants": { "team-a": {} }
+                }"#,
+            )
+            .expect_err("the limit must reserve the configured and default tenants"),
+            "maxRuntimeTenants must be at least 2 to reserve every configured tenant and the default tenant"
+        );
+        assert_eq!(
+            TenantRegistry::from_json_str(
+                r#"{
+                    "maxRuntimeTenants": 1,
+                    "tenants": { "": {} }
+                }"#,
+            )
+            .expect_err("legacy tenant validation must precede the new capacity relationship"),
+            format!("{TENANT_HEADER} must not be empty")
+        );
+    }
+
+    #[test]
+    fn tenant_runtime_cache_reserves_configured_and_default_slots_without_eviction() {
+        let registry = TenantRegistry::from_json_str(
+            r#"{
+                "maxRuntimeTenants": 4,
+                "tenants": { "team-a": {} }
+            }"#,
+        )
+        .expect("bounded tenant registry should parse");
+
+        registry
+            .initialize_tenant_runtime("dynamic-a")
+            .expect("first dynamic tenant should use an unreserved slot");
+        registry
+            .initialize_tenant_runtime("dynamic-b")
+            .expect("second dynamic tenant should use the last unreserved slot");
+        let limit_error = registry
+            .initialize_tenant_runtime("dynamic-c")
+            .expect_err("a third dynamic tenant must not consume a reserved slot");
+        assert_eq!(limit_error, tenant_runtime_cache_limit_error(4));
+        let response = limit_error.to_http_response();
+        assert_eq!(response.status, 503);
+        assert_eq!(
+            response
+                .headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("X-Tsink-Tenant-Error-Code"))
+                .map(|(_, value)| value.as_str()),
+            Some(TENANT_RUNTIME_CACHE_LIMIT_ERROR_CODE)
+        );
+        assert!(!response
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("Retry-After")));
+        assert_eq!(
+            std::str::from_utf8(&response.body).expect("limit response should be UTF-8"),
+            "tenant runtime cache limit of 4 tenants would be exceeded"
+        );
+
+        registry
+            .initialize_tenant_runtime("team-a")
+            .expect("configured tenant must retain its reserved slot");
+        registry
+            .initialize_tenant_runtime(DEFAULT_TENANT_ID)
+            .expect("default tenant must retain its reserved slot");
+        registry
+            .initialize_tenant_runtime("dynamic-a")
+            .expect("an existing tenant must remain available at the limit");
+        assert_eq!(
+            registry.runtime_cache_metrics_snapshot(),
+            TenantRuntimeCacheMetricsSnapshot {
+                initialized_runtimes: 4,
+                initialized_reserved_runtimes: 2,
+                initialized_dynamic_runtimes: 2,
+                max_runtimes: 4,
+                reserved_runtimes: 2,
+                limit_rejections_total: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn tenant_runtime_cache_authorizes_before_consuming_capacity() {
+        let registry = TenantRegistry::from_json_str(
+            r#"{
+                "maxRuntimeTenants": 2,
+                "defaults": {
+                    "auth": {
+                        "tokens": [{ "token": "default-read", "scopes": ["read"] }]
+                    }
+                },
+                "tenants": {
+                    "secure": {
+                        "auth": {
+                            "tokens": [
+                                { "token": "shared", "scopes": ["read"] },
+                                { "token": "shared", "scopes": ["write"] }
+                            ]
+                        }
+                    }
+                }
+            }"#,
+        )
+        .expect("bounded authenticated registry should parse");
+        let request = HttpRequest {
+            method: "GET".to_string(),
+            path: "/api/v1/query".to_string(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+
+        assert_eq!(
+            prepare_request_plan(
+                Some(&registry),
+                None,
+                &request,
+                "unknown",
+                TenantAccessScope::Read,
+            )
+            .expect_err("missing credentials should retain their authorization error"),
+            TenantRequestError::Unauthorized("tenant_auth_token_missing")
+        );
+        assert_eq!(registry.initialized_runtime_count(), 0);
+        assert_eq!(
+            registry
+                .runtime_cache_metrics_snapshot()
+                .limit_rejections_total,
+            0
+        );
+
+        let default_token_request = HttpRequest {
+            headers: HashMap::from([(
+                "authorization".to_string(),
+                "Bearer default-read".to_string(),
+            )]),
+            ..request.clone()
+        };
+        assert_eq!(
+            prepare_request_plan(
+                Some(&registry),
+                None,
+                &default_token_request,
+                "unknown",
+                TenantAccessScope::Read,
+            )
+            .expect_err("an authorized unconfigured tenant should reach the capacity policy"),
+            tenant_runtime_cache_limit_error(2)
+        );
+        assert_eq!(registry.initialized_runtime_count(), 0);
+
+        let shared_token_request = HttpRequest {
+            headers: HashMap::from([("authorization".to_string(), "Bearer shared".to_string())]),
+            ..request
+        };
+        prepare_request_plan(
+            Some(&registry),
+            None,
+            &shared_token_request,
+            "secure",
+            TenantAccessScope::Read,
+        )
+        .expect("duplicate token read scope should authorize");
+        prepare_request_plan(
+            Some(&registry),
+            None,
+            &shared_token_request,
+            "secure",
+            TenantAccessScope::Write,
+        )
+        .expect("duplicate token write scope should remain merged");
+        assert_eq!(registry.initialized_runtime_count(), 1);
+    }
+
+    #[test]
+    fn tenant_runtime_cache_concurrent_misses_cannot_exceed_the_limit() {
+        const WORKERS: usize = 32;
+        const LIMIT: usize = 10;
+        let registry = Arc::new(
+            TenantRegistry::from_json_str(r#"{"maxRuntimeTenants":10}"#)
+                .expect("bounded tenant registry should parse"),
+        );
+        let barrier = Arc::new(Barrier::new(WORKERS + 1));
+        let mut workers = Vec::with_capacity(WORKERS);
+        for index in 0..WORKERS {
+            let registry = Arc::clone(&registry);
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                registry.initialize_tenant_runtime(&format!("dynamic-{index}"))
+            }));
+        }
+        barrier.wait();
+
+        let mut admitted = 0usize;
+        let mut rejected = 0usize;
+        for worker in workers {
+            match worker
+                .join()
+                .expect("tenant initialization worker should join")
+            {
+                Ok(()) => admitted = admitted.saturating_add(1),
+                Err(error) if error == tenant_runtime_cache_limit_error(LIMIT) => {
+                    rejected = rejected.saturating_add(1);
+                }
+                Err(error) => panic!("unexpected tenant initialization error: {error:?}"),
+            }
+        }
+
+        assert_eq!(
+            admitted,
+            LIMIT - 1,
+            "the default tenant owns one reserved slot"
+        );
+        assert_eq!(rejected, WORKERS - admitted);
+        assert_eq!(registry.initialized_runtime_count(), admitted);
+        registry
+            .initialize_tenant_runtime(DEFAULT_TENANT_ID)
+            .expect("the reserved default slot should remain available");
+        assert_eq!(registry.initialized_runtime_count(), LIMIT);
+        assert_eq!(
+            registry
+                .runtime_cache_metrics_snapshot()
+                .limit_rejections_total,
+            u64::try_from(rejected).expect("rejection count should fit u64")
+        );
+    }
+
+    #[test]
     fn tenant_registry_enforces_scoped_tokens_and_merges_policies() {
         let registry = TenantRegistry::from_json_str(
             r#"{
@@ -4920,6 +6884,211 @@ mod tests {
             .iter()
             .any(|decision| decision.surface == "metadata" && decision.outcome == "rejected"));
         drop(held);
+    }
+
+    #[test]
+    fn prewarmed_admission_keeps_decision_log_heap_stable_and_status_exact() {
+        let registry = TenantRegistry::from_json_str(
+            r#"{
+                "tenants": {
+                    "team-a": {}
+                }
+            }"#,
+        )
+        .expect("tenant registry should parse");
+        assert_eq!(registry.initialized_runtime_count(), 0);
+        assert!(matches!(
+            registry.initialize_tenant_runtime(""),
+            Err(TenantRequestError::BadRequest(_))
+        ));
+        assert_eq!(registry.initialized_runtime_count(), 0);
+        registry
+            .initialize_tenant_runtime("team-a")
+            .expect("tenant runtime should prewarm without admission");
+        assert_eq!(registry.initialized_runtime_count(), 1);
+        registry
+            .initialize_tenant_runtime("team-a")
+            .expect("prewarming an initialized tenant should be idempotent");
+        assert_eq!(registry.initialized_runtime_count(), 1);
+        let runtime = registry
+            .runtime_for("team-a")
+            .expect("prewarmed tenant runtime should resolve");
+        let (before_len, before_capacity, before_bytes) = runtime.decision_log_retained_state();
+        assert_eq!(before_len, 0);
+        assert!(before_capacity >= TENANT_DECISION_HISTORY_LIMIT);
+
+        let plan =
+            prepare_trusted_request_plan(Some(&registry), None, "team-a", TenantAccessScope::Read)
+                .expect("prewarmed tenant request plan should prepare");
+        let guard = plan
+            .admit(TenantAdmissionSurface::Query, 7)
+            .expect("prewarmed tenant request should admit");
+        let (after_len, after_capacity, after_bytes) = runtime.decision_log_retained_state();
+        assert_eq!(after_len, 1);
+        assert_eq!(after_capacity, before_capacity);
+        assert_eq!(after_bytes, before_bytes);
+
+        let expected = registry
+            .status_snapshot_for("team-a")
+            .expect("legacy tenant status should build");
+        assert_eq!(expected.recent_decisions.len(), 1);
+        assert_eq!(expected.recent_decisions[0].access, "read");
+        assert_eq!(expected.recent_decisions[0].surface, "query");
+        assert_eq!(expected.recent_decisions[0].outcome, "admitted");
+        assert_eq!(expected.recent_decisions[0].requested_units, 7);
+        assert_eq!(
+            expected.recent_decisions[0].reason,
+            "tenant request admitted for query via read scope"
+        );
+
+        runtime.reset_status_snapshot_string_clones();
+        let budget = QueryBudget::new(QueryBudgetLimits::default())
+            .expect("tenant status projection budget should build");
+        let execution = budget
+            .begin_query()
+            .expect("tenant status projection query should admit");
+        let projected = registry
+            .status_snapshot_for_with_execution("team-a", &execution)
+            .expect("accounted tenant status should build");
+        assert_eq!(&*projected, &expected);
+        assert_eq!(runtime.status_snapshot_string_clones(), 5);
+        drop(projected);
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        drop(execution);
+        assert_eq!(budget.snapshot().shared_reserved_memory_bytes, 0);
+        drop(guard);
+    }
+
+    #[test]
+    fn ordinary_decision_reasons_are_compact_and_status_exact() {
+        let registry = TenantRegistry::from_json_str(
+            r#"{
+                "tenants": {
+                    "team-a": {
+                        "admission": {
+                            "query": {
+                                "maxInflightRequests": 1
+                            },
+                            "metadata": {
+                                "maxInflightUnits": 2
+                            },
+                            "retention": {
+                                "maxInflightUnits": 2
+                            }
+                        }
+                    }
+                }
+            }"#,
+        )
+        .expect("tenant registry should parse");
+        registry
+            .initialize_tenant_runtime("team-a")
+            .expect("tenant runtime should prewarm without admission");
+        let runtime = registry
+            .runtime_for("team-a")
+            .expect("prewarmed tenant runtime should resolve");
+        let (before_len, before_capacity, before_bytes) = runtime.decision_log_retained_state();
+        assert_eq!(before_len, 0);
+
+        let plan =
+            prepare_trusted_request_plan(Some(&registry), None, "team-a", TenantAccessScope::Read)
+                .expect("tenant request plan should prepare");
+        let held_query = plan
+            .admit(TenantAdmissionSurface::Query, 1)
+            .expect("first query request should admit");
+        assert_eq!(
+            plan.admit(TenantAdmissionSurface::Query, 1)
+                .expect_err("second query request should throttle"),
+            TenantRequestError::TooManyRequests(
+                "tenant 'team-a' exceeded max inflight query requests (1)".to_string()
+            )
+        );
+        assert_eq!(
+            plan.admit(TenantAdmissionSurface::Metadata, 3)
+                .expect_err("oversized metadata request should reject"),
+            TenantRequestError::TooManyRequests(
+                "tenant 'team-a' exceeded max inflight metadata units: 3 > 2".to_string()
+            )
+        );
+        let held_retention = plan
+            .admit(TenantAdmissionSurface::Retention, 2)
+            .expect("first retention request should admit");
+        assert_eq!(
+            plan.admit(TenantAdmissionSurface::Retention, 1)
+                .expect_err("second retention request should throttle"),
+            TenantRequestError::TooManyRequests(
+                "tenant 'team-a' exceeded max inflight retention units (2)".to_string()
+            )
+        );
+
+        let (after_len, after_capacity, after_bytes) = runtime.decision_log_retained_state();
+        assert_eq!(after_len, 5);
+        assert_eq!(after_capacity, before_capacity);
+        assert_eq!(after_bytes, before_bytes);
+
+        let status = registry
+            .status_snapshot_for("team-a")
+            .expect("legacy tenant status should build");
+        assert_eq!(
+            status
+                .recent_decisions
+                .iter()
+                .map(|decision| (
+                    decision.surface.as_str(),
+                    decision.outcome.as_str(),
+                    decision.requested_units,
+                    decision.reason.as_str(),
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "query",
+                    "admitted",
+                    1,
+                    "tenant request admitted for query via read scope",
+                ),
+                (
+                    "query",
+                    "throttled",
+                    1,
+                    "tenant 'team-a' exceeded max inflight query requests (1)",
+                ),
+                (
+                    "metadata",
+                    "rejected",
+                    3,
+                    "tenant 'team-a' exceeded max inflight metadata units: 3 > 2",
+                ),
+                (
+                    "retention",
+                    "admitted",
+                    2,
+                    "tenant request admitted for retention via read scope",
+                ),
+                (
+                    "retention",
+                    "throttled",
+                    1,
+                    "tenant 'team-a' exceeded max inflight retention units (2)",
+                ),
+            ]
+        );
+
+        let budget = QueryBudget::new(QueryBudgetLimits::default())
+            .expect("tenant status projection budget should build");
+        let execution = budget
+            .begin_query()
+            .expect("tenant status projection query should admit");
+        let projected = registry
+            .status_snapshot_for_with_execution("team-a", &execution)
+            .expect("accounted tenant status should build");
+        assert_eq!(&*projected, &status);
+        drop(projected);
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        drop(execution);
+        assert_eq!(budget.snapshot().shared_reserved_memory_bytes, 0);
+        drop(held_retention);
+        drop(held_query);
     }
 
     #[test]

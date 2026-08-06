@@ -21,6 +21,7 @@ pub(super) struct PersistTestHooks {
     pub(super) crash_after_samples_persisted: AtomicBool,
     pub(super) crash_before_publish_persisted: AtomicBool,
     pub(super) full_inventory_scan_hook: RwLock<Option<Arc<IngestCommitHook>>>,
+    pub(super) catalog_refresh_pre_compaction_gate_hook: RwLock<Option<Arc<IngestCommitHook>>>,
     pub(super) post_flush_maintenance_stage_hook: RwLock<Option<Arc<IngestCommitHook>>>,
     pub(super) background_retention_inspect_hook: RwLock<Option<Arc<IngestCommitHook>>>,
     pub(super) metadata_all_series_seed_hook: RwLock<Option<Arc<IngestCommitHook>>>,

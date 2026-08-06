@@ -17,7 +17,7 @@ use crate::engine::binio::{
 };
 use crate::engine::fs_utils::{
     path_exists_no_follow, remove_empty_dir_if_exists,
-    remove_path_if_exists_and_sync_parent_budgeted, rename_and_sync_parents, sync_parent_dir,
+    remove_path_if_exists_and_sync_parent_observed, rename_and_sync_parents, sync_parent_dir,
     write_file_atomically_and_sync_parent_budgeted,
 };
 use crate::{Result, TsinkError};
@@ -472,30 +472,92 @@ impl SeriesRegistry {
             crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES,
             "incremental series registry checkpoint cleanup",
         )?;
-        for entry in entries {
-            let file_type = entry.file_type()?;
-            if !file_type.is_file() {
-                continue;
+        let mut reservation = None;
+        let mut governed_deletion_or_ambiguous_error = false;
+        let cleanup_result = (|| -> Result<()> {
+            for entry in entries {
+                let file_type = entry.file_type()?;
+                if !file_type.is_file() {
+                    continue;
+                }
+                let file_name = entry.file_name();
+                let Some(name) = file_name.to_str() else {
+                    continue;
+                };
+                if !Self::is_incremental_source_name(name) {
+                    continue;
+                }
+                let path = entry.path();
+                let governed = match local_disk_budget {
+                    Some(budget) => budget.governs_entry(&path)?,
+                    None => false,
+                };
+                if governed && reservation.is_none() {
+                    reservation = Some(
+                        local_disk_budget
+                            .expect("governed incremental registry cleanup requires a disk budget")
+                            .reserve(
+                                crate::DiskCategory::Registry,
+                                0,
+                                crate::DiskReservationKind::Recovery,
+                            )?,
+                    );
+                }
+                match remove_path_if_exists_and_sync_parent_observed(&path) {
+                    Ok(removed) => {
+                        governed_deletion_or_ambiguous_error |= governed && removed;
+                    }
+                    Err(err) => {
+                        governed_deletion_or_ambiguous_error |= governed;
+                        return Err(err);
+                    }
+                }
             }
-            let file_name = entry.file_name();
-            let Some(name) = file_name.to_str() else {
-                continue;
-            };
-            if !Self::is_incremental_source_name(name) {
-                continue;
-            }
-            remove_path_if_exists_and_sync_parent_budgeted(
-                &entry.path(),
-                local_disk_budget,
-                crate::DiskCategory::Registry,
-            )?;
-        }
 
-        match remove_empty_dir_if_exists(dir_path) {
-            Ok(true) => sync_parent_dir(dir_path),
-            Ok(false) => Ok(()),
-            Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => Ok(()),
-            Err(err) => Err(err.into()),
+            match remove_empty_dir_if_exists(dir_path) {
+                Ok(true) => sync_parent_dir(dir_path),
+                Ok(false) => Ok(()),
+                Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => Ok(()),
+                Err(err) => Err(err.into()),
+            }
+        })();
+
+        let settlement_result = reservation.map_or(Ok(()), |reservation| reservation.commit(0, 0));
+        if settlement_result.is_err() {
+            governed_deletion_or_ambiguous_error = true;
+        }
+        let reconciliation_result = if governed_deletion_or_ambiguous_error {
+            local_disk_budget
+                .expect("governed incremental registry cleanup requires a disk budget")
+                .reconcile_when_idle()
+                .map(|_| ())
+        } else {
+            Ok(())
+        };
+
+        let mut errors = Vec::new();
+        if let Err(err) = &cleanup_result {
+            errors.push(format!("cleanup failed: {err}"));
+        }
+        if let Err(err) = &settlement_result {
+            errors.push(format!("disk settlement failed: {err}"));
+        }
+        if let Err(err) = &reconciliation_result {
+            errors.push(format!("disk reconciliation failed: {err}"));
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else if errors.len() == 1 {
+            match (cleanup_result, settlement_result, reconciliation_result) {
+                (Err(err), _, _) | (_, Err(err), _) | (_, _, Err(err)) => Err(err),
+                _ => unreachable!("one recorded cleanup error must have a matching failed result"),
+            }
+        } else {
+            Err(TsinkError::Other(format!(
+                "incremental registry checkpoint cleanup in {} failed: {}",
+                dir_path.display(),
+                errors.join("; ")
+            )))
         }
     }
 
@@ -692,8 +754,9 @@ impl SeriesRegistry {
                 &dir_path,
                 max_namespace_entries,
             )?;
-            return Self::write_incremental_journal(
+            return Self::replace_incremental_journal(
                 &active_path,
+                None,
                 self.series_count(),
                 &incoming_payload,
                 local_disk_budget,
@@ -737,8 +800,9 @@ impl SeriesRegistry {
                     &dir_path,
                     max_namespace_entries,
                 )?;
-                return Self::write_incremental_journal(
+                return Self::replace_incremental_journal(
                     &active_path,
+                    None,
                     merged.series_count(),
                     &merged_payload,
                     local_disk_budget,
@@ -747,11 +811,13 @@ impl SeriesRegistry {
             }
         }
 
-        Self::ensure_incremental_namespace_capacity_with_limit(&dir_path, max_namespace_entries)?;
-        let sealed_path = Self::allocate_incremental_journal_segment_path(&dir_path)?;
-        rename_and_sync_parents(&active_path, &sealed_path)?;
-        Self::write_incremental_journal(
+        let sealed_path = Self::allocate_incremental_journal_segment_path_with_namespace_limit(
+            &dir_path,
+            max_namespace_entries,
+        )?;
+        Self::replace_incremental_journal(
             &active_path,
+            Some(&sealed_path),
             self.series_count(),
             &incoming_payload,
             local_disk_budget,
@@ -772,6 +838,34 @@ impl SeriesRegistry {
             &bytes,
             local_disk_budget,
             crate::DiskCategory::Registry,
+            reservation_kind,
+        )
+    }
+
+    /// Performs one logical active-journal update while preserving its two distinct accounting
+    /// cases. Replacing an existing active file uses the budgeted atomic helper's single exact
+    /// reconciliation. Rollover first seals the old active generation, so publishing its
+    /// replacement is an exactly-accounted creation and deliberately stays on the no-scan path.
+    ///
+    /// Keeping the rename before wrapper encoding and atomic publication also preserves the
+    /// restart order: an interrupted rollover exposes the complete sealed generation, never a
+    /// replacement active generation without its predecessor.
+    fn replace_incremental_journal(
+        active_path: &Path,
+        sealed_path: Option<&Path>,
+        series_count: usize,
+        registry_payload: &[u8],
+        local_disk_budget: Option<&Arc<crate::LocalDiskBudget>>,
+        reservation_kind: crate::DiskReservationKind,
+    ) -> Result<()> {
+        if let Some(sealed_path) = sealed_path {
+            rename_and_sync_parents(active_path, sealed_path)?;
+        }
+        Self::write_incremental_journal(
+            active_path,
+            series_count,
+            registry_payload,
+            local_disk_budget,
             reservation_kind,
         )
     }
@@ -1214,20 +1308,24 @@ impl SeriesRegistry {
     }
 
     fn is_incremental_source_name(name: &str) -> bool {
-        fn has_exact_nonce(name: &str, prefix: &str) -> bool {
-            name.strip_prefix(prefix)
-                .and_then(|value| value.strip_suffix(REGISTRY_INCREMENTAL_SEGMENT_SUFFIX))
-                .is_some_and(|nonce| {
-                    nonce.len() == 16
-                        && nonce
-                            .bytes()
-                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-                })
-        }
-
         name == REGISTRY_INCREMENTAL_JOURNAL_ACTIVE_FILE_NAME
-            || has_exact_nonce(name, REGISTRY_INCREMENTAL_SEGMENT_PREFIX)
-            || has_exact_nonce(name, REGISTRY_INCREMENTAL_JOURNAL_SEGMENT_PREFIX)
+            || Self::incremental_segment_nonce(name, REGISTRY_INCREMENTAL_SEGMENT_PREFIX).is_some()
+            || Self::incremental_segment_nonce(name, REGISTRY_INCREMENTAL_JOURNAL_SEGMENT_PREFIX)
+                .is_some()
+    }
+
+    fn incremental_segment_nonce(name: &str, prefix: &str) -> Option<u64> {
+        let nonce = name
+            .strip_prefix(prefix)?
+            .strip_suffix(REGISTRY_INCREMENTAL_SEGMENT_SUFFIX)?;
+        if nonce.len() != 16
+            || !nonce
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return None;
+        }
+        u64::from_str_radix(nonce, 16).ok()
     }
 
     fn load_incremental_journal_from_path_with_decoded_limit(
@@ -1548,11 +1646,15 @@ impl SeriesRegistry {
         Ok(paths)
     }
 
-    fn allocate_incremental_journal_segment_path(dir_path: &Path) -> Result<PathBuf> {
-        Self::allocate_incremental_segment_path_with_prefix_and_counter(
+    fn allocate_incremental_journal_segment_path_with_namespace_limit(
+        dir_path: &Path,
+        max_entries: usize,
+    ) -> Result<PathBuf> {
+        Self::allocate_incremental_segment_path_with_prefix_counter_and_namespace_limit(
             dir_path,
             REGISTRY_INCREMENTAL_JOURNAL_SEGMENT_PREFIX,
             &REGISTRY_INCREMENTAL_SEGMENT_COUNTER,
+            max_entries,
         )
     }
 
@@ -1560,6 +1662,14 @@ impl SeriesRegistry {
         dir_path: &Path,
         max_entries: usize,
     ) -> Result<()> {
+        Self::inspect_incremental_namespace_with_limit(dir_path, max_entries, None).map(|_| ())
+    }
+
+    fn inspect_incremental_namespace_with_limit(
+        dir_path: &Path,
+        max_entries: usize,
+        durable_prefix: Option<&str>,
+    ) -> Result<Option<u64>> {
         if max_entries == 0 {
             return Err(TsinkError::MaintenanceNamespaceLimitExceeded {
                 operation: "incremental series registry",
@@ -1568,11 +1678,12 @@ impl SeriesRegistry {
             });
         }
         let mut observed_entries = 0usize;
+        let mut highest_durable_nonce = None;
         for entry in fs::read_dir(dir_path).map_err(|source| TsinkError::IoWithPath {
             path: dir_path.to_path_buf(),
             source,
         })? {
-            entry.map_err(|source| TsinkError::IoWithPath {
+            let entry = entry.map_err(|source| TsinkError::IoWithPath {
                 path: dir_path.to_path_buf(),
                 source,
             })?;
@@ -1589,20 +1700,91 @@ impl SeriesRegistry {
                     required: observed_entries.saturating_add(1),
                 });
             }
+            if let Some(prefix) = durable_prefix {
+                let file_name = entry.file_name();
+                if let Some(nonce) = file_name
+                    .to_str()
+                    .and_then(|name| Self::incremental_segment_nonce(name, prefix))
+                {
+                    highest_durable_nonce = Some(
+                        highest_durable_nonce.map_or(nonce, |current: u64| current.max(nonce)),
+                    );
+                }
+            }
         }
-        Ok(())
+        Ok(highest_durable_nonce)
+    }
+
+    fn incremental_segment_nonce_exhausted(dir_path: &Path) -> TsinkError {
+        TsinkError::UnsupportedOperation {
+            operation: "incremental registry segment allocation",
+            reason: format!(
+                "the durable segment nonce space is exhausted in {}",
+                dir_path.display()
+            ),
+        }
     }
 
     #[cfg(test)]
-    fn allocate_incremental_segment_path_with_counter(
+    fn allocate_incremental_segment_path_with_counter_and_namespace_limit(
         dir_path: &Path,
         counter: &AtomicU64,
+        max_entries: usize,
     ) -> Result<PathBuf> {
-        Self::allocate_incremental_segment_path_with_prefix_and_counter(
+        Self::allocate_incremental_segment_path_with_prefix_counter_and_namespace_limit(
             dir_path,
             REGISTRY_INCREMENTAL_SEGMENT_PREFIX,
             counter,
+            max_entries,
         )
+    }
+
+    fn allocate_incremental_segment_path_with_prefix_counter_and_namespace_limit(
+        dir_path: &Path,
+        prefix: &str,
+        counter: &AtomicU64,
+        max_entries: usize,
+    ) -> Result<PathBuf> {
+        // One bounded scan both enforces the restart namespace cap (including unknown entries)
+        // and resumes this directory beyond its own durable segments. Never publish a durable
+        // nonce into the process-global allocator: one near-exhausted data directory must not
+        // poison otherwise independent storage instances in the same process.
+        if let Some(highest_durable_nonce) =
+            Self::inspect_incremental_namespace_with_limit(dir_path, max_entries, Some(prefix))?
+        {
+            let first_candidate = highest_durable_nonce
+                .checked_add(1)
+                .ok_or_else(|| Self::incremental_segment_nonce_exhausted(dir_path))?;
+            return Self::allocate_incremental_segment_path_with_prefix_from_nonce(
+                dir_path,
+                prefix,
+                first_candidate,
+            );
+        }
+        Self::allocate_incremental_segment_path_with_prefix_and_counter(dir_path, prefix, counter)
+    }
+
+    fn allocate_incremental_segment_path_with_prefix_from_nonce(
+        dir_path: &Path,
+        prefix: &str,
+        mut nonce: u64,
+    ) -> Result<PathBuf> {
+        for _ in 0..crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES {
+            let candidate = dir_path.join(format!(
+                "{prefix}{nonce:016x}{REGISTRY_INCREMENTAL_SEGMENT_SUFFIX}"
+            ));
+            if !path_exists_no_follow(&candidate)? {
+                return Ok(candidate);
+            }
+            nonce = nonce
+                .checked_add(1)
+                .ok_or_else(|| Self::incremental_segment_nonce_exhausted(dir_path))?;
+        }
+
+        Err(TsinkError::Other(format!(
+            "failed to allocate incremental registry segment in {}",
+            dir_path.display()
+        )))
     }
 
     fn allocate_incremental_segment_path_with_prefix_and_counter(
@@ -1611,11 +1793,15 @@ impl SeriesRegistry {
         counter: &AtomicU64,
     ) -> Result<PathBuf> {
         // The process-local counter restarts from one, while durable incremental files survive a
-        // process restart. Search the complete bounded registry namespace rather than failing
-        // after an arbitrary 256 collisions; once a free path is found the counter naturally
-        // resumes beyond the durable prefix for later appends in this process.
+        // process restart. Probe the complete supported candidate bound rather than failing after
+        // an arbitrary 256 collisions; namespace-aware callers first advance the counter beyond
+        // the durable prefix, while the final existence check also covers concurrent collisions.
         for _ in 0..crate::engine::fs_utils::MAX_RECOVERY_NAMESPACE_ENTRIES {
-            let nonce = counter.fetch_add(1, Ordering::Relaxed);
+            let nonce = counter
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |nonce| {
+                    nonce.checked_add(1)
+                })
+                .map_err(|_| Self::incremental_segment_nonce_exhausted(dir_path))?;
             let candidate = dir_path.join(format!(
                 "{prefix}{nonce:016x}{REGISTRY_INCREMENTAL_SEGMENT_SUFFIX}"
             ));
@@ -1762,6 +1948,88 @@ mod namespace_bound_tests {
     }
 
     #[test]
+    fn incremental_registry_merge_reconciles_once_and_rollover_keeps_creation_fast_path() {
+        let temp_dir = TempDir::new().unwrap();
+        let snapshot_path = temp_dir.path().join("series_index.bin");
+        let incremental_dir = SeriesRegistry::incremental_dir(&snapshot_path);
+        let budget =
+            crate::LocalDiskBudget::open(temp_dir.path(), crate::LocalDiskLimits::default())
+                .unwrap();
+        let initial_reconciliations = budget.snapshot().reconciliations_total;
+
+        one_series_registry(1)
+            .persist_incremental_to_snapshot_path_with_limits(
+                &snapshot_path,
+                Some(&budget),
+                crate::DiskReservationKind::Maintenance,
+                2,
+                MAX_DECODED_FRAMED_FILE_BYTES,
+                8,
+            )
+            .unwrap();
+        assert_eq!(
+            budget.snapshot().reconciliations_total,
+            initial_reconciliations,
+            "initial active-journal creation should retain the no-scan accounting fast path"
+        );
+
+        let unknown = incremental_dir.join("host-owned");
+        fs::write(&unknown, b"opaque").unwrap();
+        one_series_registry(2)
+            .persist_incremental_to_snapshot_path_with_limits(
+                &snapshot_path,
+                Some(&budget),
+                crate::DiskReservationKind::Maintenance,
+                2,
+                MAX_DECODED_FRAMED_FILE_BYTES,
+                8,
+            )
+            .unwrap();
+        let after_merge = budget.snapshot();
+        assert_eq!(
+            after_merge.reconciliations_total,
+            initial_reconciliations + 1,
+            "the complete active-journal merge must install one exact accounting scan"
+        );
+        assert_eq!(
+            after_merge.accounted_bytes,
+            crate::disk_budget::measured_path_bytes(temp_dir.path()).unwrap()
+        );
+        assert_eq!(after_merge.active_reservations, 0);
+        assert_eq!(after_merge.reserved_bytes, 0);
+
+        one_series_registry(3)
+            .persist_incremental_to_snapshot_path_with_limits(
+                &snapshot_path,
+                Some(&budget),
+                crate::DiskReservationKind::Maintenance,
+                2,
+                MAX_DECODED_FRAMED_FILE_BYTES,
+                8,
+            )
+            .unwrap();
+        let after_rollover = budget.snapshot();
+        assert_eq!(
+            after_rollover.reconciliations_total, after_merge.reconciliations_total,
+            "sealing preserves byte ownership and replacement-active creation must not scan"
+        );
+        assert_eq!(
+            after_rollover.accounted_bytes,
+            crate::disk_budget::measured_path_bytes(temp_dir.path()).unwrap()
+        );
+        assert_eq!(after_rollover.active_reservations, 0);
+        assert_eq!(after_rollover.reserved_bytes, 0);
+        assert_eq!(after_rollover.maintenance_reserved_bytes, 0);
+        assert!(unknown.is_file());
+
+        let loaded = SeriesRegistry::load_persisted_state(&snapshot_path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.registry.all_series_ids(), vec![1, 2, 3]);
+        assert_eq!(loaded.delta_series_count, 3);
+    }
+
+    #[test]
     fn incremental_registry_oversized_publication_retry_is_idempotent() {
         let temp_dir = TempDir::new().unwrap();
         let snapshot_path = temp_dir.path().join("series_index.bin");
@@ -1865,6 +2133,97 @@ mod namespace_bound_tests {
     }
 
     #[test]
+    fn governed_incremental_registry_rollover_sync_failure_stays_exact_and_restarts() {
+        let temp_dir = TempDir::new().unwrap();
+        let snapshot_path = temp_dir.path().join("series_index.bin");
+        let incremental_dir = SeriesRegistry::incremental_dir(&snapshot_path);
+        fs::create_dir_all(&incremental_dir).unwrap();
+        let unknown = incremental_dir.join("host-owned");
+        fs::write(&unknown, b"opaque").unwrap();
+        let budget =
+            crate::LocalDiskBudget::open(temp_dir.path(), crate::LocalDiskLimits::default())
+                .unwrap();
+
+        for series_id in 1..=2 {
+            one_series_registry(series_id)
+                .persist_incremental_to_snapshot_path_with_limits(
+                    &snapshot_path,
+                    Some(&budget),
+                    crate::DiskReservationKind::Maintenance,
+                    2,
+                    MAX_DECODED_FRAMED_FILE_BYTES,
+                    16,
+                )
+                .unwrap();
+        }
+        let before = budget.snapshot();
+
+        let sync_failure = crate::engine::fs_utils::fail_directory_sync_once(
+            incremental_dir.clone(),
+            "injected governed journal rollover directory sync failure",
+        );
+        let err = one_series_registry(3)
+            .persist_incremental_to_snapshot_path_with_limits(
+                &snapshot_path,
+                Some(&budget),
+                crate::DiskReservationKind::Maintenance,
+                2,
+                MAX_DECODED_FRAMED_FILE_BYTES,
+                16,
+            )
+            .expect_err("rollover sync failure must be surfaced without changing accounting");
+        drop(sync_failure);
+        assert!(
+            err.to_string()
+                .contains("injected governed journal rollover directory sync failure"),
+            "unexpected rollover error: {err}"
+        );
+
+        let after_failure = budget.snapshot();
+        assert_eq!(
+            after_failure.reconciliations_total, before.reconciliations_total,
+            "the failed same-directory rename does not change governed bytes"
+        );
+        assert_eq!(
+            after_failure.accounted_bytes,
+            crate::disk_budget::measured_path_bytes(temp_dir.path()).unwrap()
+        );
+        assert_eq!(after_failure.active_reservations, 0);
+        assert_eq!(after_failure.reserved_bytes, 0);
+        assert_eq!(after_failure.maintenance_reserved_bytes, 0);
+        assert!(unknown.is_file());
+
+        let midpoint = SeriesRegistry::load_persisted_state(&snapshot_path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(midpoint.registry.all_series_ids(), vec![1, 2]);
+
+        one_series_registry(3)
+            .persist_incremental_to_snapshot_path_with_limits(
+                &snapshot_path,
+                Some(&budget),
+                crate::DiskReservationKind::Maintenance,
+                2,
+                MAX_DECODED_FRAMED_FILE_BYTES,
+                16,
+            )
+            .unwrap();
+        let restarted = SeriesRegistry::load_persisted_state(&snapshot_path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restarted.registry.all_series_ids(), vec![1, 2, 3]);
+        assert_eq!(restarted.delta_series_count, 3);
+        assert!(unknown.is_file());
+        let final_snapshot = budget.snapshot();
+        assert_eq!(
+            final_snapshot.accounted_bytes,
+            crate::disk_budget::measured_path_bytes(temp_dir.path()).unwrap()
+        );
+        assert_eq!(final_snapshot.active_reservations, 0);
+        assert_eq!(final_snapshot.reserved_bytes, 0);
+    }
+
+    #[test]
     fn incremental_registry_rejects_torn_or_checksum_corrupt_managed_journal() {
         let temp_dir = TempDir::new().unwrap();
         let snapshot_path = temp_dir.path().join("series_index.bin");
@@ -1936,6 +2295,63 @@ mod namespace_bound_tests {
     }
 
     #[test]
+    fn incremental_registry_nonce_exhaustion_stops_before_rollover_mutation() {
+        let temp_dir = TempDir::new().unwrap();
+        let snapshot_path = temp_dir.path().join("series_index.bin");
+        let incremental_dir = SeriesRegistry::incremental_dir(&snapshot_path);
+        persist_with_test_limits(
+            &one_series_registry(1),
+            &snapshot_path,
+            1,
+            MAX_DECODED_FRAMED_FILE_BYTES,
+            4,
+        )
+        .unwrap();
+
+        let active = incremental_dir.join(REGISTRY_INCREMENTAL_JOURNAL_ACTIVE_FILE_NAME);
+        let durable_max = incremental_dir.join(format!(
+            "{REGISTRY_INCREMENTAL_JOURNAL_SEGMENT_PREFIX}{:016x}{REGISTRY_INCREMENTAL_SEGMENT_SUFFIX}",
+            u64::MAX
+        ));
+        fs::copy(&active, &durable_max).unwrap();
+        let unknown = incremental_dir.join("host-owned");
+        fs::write(&unknown, b"opaque").unwrap();
+        let active_before = fs::read(&active).unwrap();
+        let durable_max_before = fs::read(&durable_max).unwrap();
+        let mut paths_before = fs::read_dir(&incremental_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        paths_before.sort();
+
+        let err = persist_with_test_limits(
+            &one_series_registry(2),
+            &snapshot_path,
+            1,
+            MAX_DECODED_FRAMED_FILE_BYTES,
+            4,
+        )
+        .expect_err("generation exhaustion must be detected before sealing the active journal");
+        assert!(matches!(
+            err,
+            TsinkError::UnsupportedOperation {
+                operation: "incremental registry segment allocation",
+                ..
+            }
+        ));
+
+        let mut paths_after = fs::read_dir(&incremental_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        paths_after.sort();
+        assert_eq!(paths_after, paths_before);
+        assert_eq!(fs::read(&active).unwrap(), active_before);
+        assert_eq!(fs::read(&durable_max).unwrap(), durable_max_before);
+        assert_eq!(fs::read(&unknown).unwrap(), b"opaque");
+    }
+
+    #[test]
     fn incremental_registry_checkpoint_cleanup_preserves_unknown_entries() {
         let temp_dir = TempDir::new().unwrap();
         let snapshot_path = temp_dir.path().join("series_index.bin");
@@ -1970,6 +2386,120 @@ mod namespace_bound_tests {
         assert!(SeriesRegistry::incremental_segment_paths(&snapshot_path)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn incremental_registry_checkpoint_cleanup_batches_one_reconciliation() {
+        let temp_dir = TempDir::new().unwrap();
+        let snapshot_path = temp_dir.path().join("series_index.bin");
+        let incremental_dir = SeriesRegistry::incremental_dir(&snapshot_path);
+        fs::create_dir_all(&incremental_dir).unwrap();
+        let managed = [
+            incremental_dir.join("delta-0000000000000001.bin"),
+            incremental_dir.join("journal-0000000000000002.bin"),
+            incremental_dir.join(REGISTRY_INCREMENTAL_JOURNAL_ACTIVE_FILE_NAME),
+        ];
+        for (path, bytes) in
+            managed
+                .iter()
+                .zip([b"one".as_slice(), b"two".as_slice(), b"three".as_slice()])
+        {
+            fs::write(path, bytes).unwrap();
+        }
+        let unknown = incremental_dir.join("host-owned");
+        fs::write(&unknown, b"opaque").unwrap();
+        let lookalike = incremental_dir.join("delta-0001.bin");
+        fs::write(&lookalike, b"lookalike").unwrap();
+        #[cfg(unix)]
+        let retained_link = {
+            let path = incremental_dir.join("delta-0000000000000004.bin");
+            std::os::unix::fs::symlink(&unknown, &path).unwrap();
+            path
+        };
+        let budget =
+            crate::LocalDiskBudget::open(temp_dir.path(), crate::LocalDiskLimits::default())
+                .unwrap();
+        let before = budget.snapshot();
+        assert_eq!(before.reconciliations_total, 1);
+
+        SeriesRegistry::remove_incremental_segments_preserving_unknown(
+            &incremental_dir,
+            Some(&budget),
+        )
+        .unwrap();
+
+        assert!(managed.iter().all(|path| !path.exists()));
+        assert!(unknown.is_file());
+        assert!(lookalike.is_file());
+        #[cfg(unix)]
+        assert!(retained_link
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let snapshot = budget.snapshot();
+        assert_eq!(
+            snapshot.reconciliations_total,
+            before.reconciliations_total + 1
+        );
+        assert_eq!(
+            snapshot.accounted_bytes,
+            crate::disk_budget::measured_path_bytes(temp_dir.path()).unwrap()
+        );
+        assert_eq!(snapshot.active_reservations, 0);
+        assert_eq!(snapshot.reserved_bytes, 0);
+        assert_eq!(snapshot.maintenance_reserved_bytes, 0);
+    }
+
+    #[test]
+    fn incremental_registry_checkpoint_cleanup_reconciles_post_unlink_sync_failure() {
+        let temp_dir = TempDir::new().unwrap();
+        let snapshot_path = temp_dir.path().join("series_index.bin");
+        let incremental_dir = SeriesRegistry::incremental_dir(&snapshot_path);
+        fs::create_dir_all(&incremental_dir).unwrap();
+        let managed = [
+            incremental_dir.join("delta-0000000000000001.bin"),
+            incremental_dir.join("journal-0000000000000002.bin"),
+        ];
+        for path in &managed {
+            fs::write(path, b"managed").unwrap();
+        }
+        let unknown = incremental_dir.join("host-owned");
+        fs::write(&unknown, b"opaque").unwrap();
+        let budget =
+            crate::LocalDiskBudget::open(temp_dir.path(), crate::LocalDiskLimits::default())
+                .unwrap();
+        let before = budget.snapshot();
+        let _sync_failure = crate::engine::fs_utils::fail_directory_sync_once(
+            incremental_dir.clone(),
+            "injected incremental registry cleanup sync failure",
+        );
+
+        let err = SeriesRegistry::remove_incremental_segments_preserving_unknown(
+            &incremental_dir,
+            Some(&budget),
+        )
+        .expect_err("the committed unlink must retain its synchronization error");
+
+        assert!(matches!(
+            err,
+            TsinkError::Other(ref message)
+                if message == "injected incremental registry cleanup sync failure"
+        ));
+        assert_eq!(managed.iter().filter(|path| path.exists()).count(), 1);
+        assert!(unknown.is_file());
+        let snapshot = budget.snapshot();
+        assert_eq!(
+            snapshot.reconciliations_total,
+            before.reconciliations_total + 1
+        );
+        assert_eq!(
+            snapshot.accounted_bytes,
+            crate::disk_budget::measured_path_bytes(temp_dir.path()).unwrap()
+        );
+        assert_eq!(snapshot.active_reservations, 0);
+        assert_eq!(snapshot.reserved_bytes, 0);
+        assert_eq!(snapshot.maintenance_reserved_bytes, 0);
     }
 
     #[test]
@@ -2070,11 +2600,13 @@ mod namespace_bound_tests {
             .unwrap();
         }
 
-        let allocated = SeriesRegistry::allocate_incremental_segment_path_with_counter(
-            temp_dir.path(),
-            &counter,
-        )
-        .unwrap();
+        let allocated =
+            SeriesRegistry::allocate_incremental_segment_path_with_counter_and_namespace_limit(
+                temp_dir.path(),
+                &counter,
+                301,
+            )
+            .unwrap();
         assert_eq!(
             allocated,
             temp_dir.path().join(format!(
@@ -2082,6 +2614,112 @@ mod namespace_bound_tests {
                 301u64
             ))
         );
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            1,
+            "durable restart state must remain local to its data directory"
+        );
+    }
+
+    #[test]
+    fn high_durable_nonce_does_not_poison_an_independent_registry_directory() {
+        let high_nonce_dir = TempDir::new().unwrap();
+        fs::write(
+            high_nonce_dir.path().join(format!(
+                "{REGISTRY_INCREMENTAL_SEGMENT_PREFIX}{:016x}{REGISTRY_INCREMENTAL_SEGMENT_SUFFIX}",
+                u64::MAX - 1
+            )),
+            b"durable-delta",
+        )
+        .unwrap();
+        let independent_dir = TempDir::new().unwrap();
+        let shared_process_counter = AtomicU64::new(1);
+
+        let final_high_nonce =
+            SeriesRegistry::allocate_incremental_segment_path_with_counter_and_namespace_limit(
+                high_nonce_dir.path(),
+                &shared_process_counter,
+                2,
+            )
+            .expect("the last directory-local nonce must remain usable");
+        assert_eq!(
+            final_high_nonce,
+            high_nonce_dir.path().join(format!(
+                "{REGISTRY_INCREMENTAL_SEGMENT_PREFIX}{:016x}{REGISTRY_INCREMENTAL_SEGMENT_SUFFIX}",
+                u64::MAX
+            ))
+        );
+        assert_eq!(shared_process_counter.load(Ordering::Relaxed), 1);
+
+        let independent =
+            SeriesRegistry::allocate_incremental_segment_path_with_counter_and_namespace_limit(
+                independent_dir.path(),
+                &shared_process_counter,
+                2,
+            )
+            .expect("one directory must not exhaust another directory's allocator");
+        assert_eq!(
+            independent,
+            independent_dir.path().join(format!(
+                "{REGISTRY_INCREMENTAL_SEGMENT_PREFIX}{:016x}{REGISTRY_INCREMENTAL_SEGMENT_SUFFIX}",
+                1u64
+            ))
+        );
+        assert_eq!(shared_process_counter.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn incremental_registry_path_allocation_rejects_nonce_wraparound() {
+        let exhausted_counter_dir = TempDir::new().unwrap();
+        let exhausted_counter = AtomicU64::new(u64::MAX);
+        let err =
+            SeriesRegistry::allocate_incremental_segment_path_with_counter_and_namespace_limit(
+                exhausted_counter_dir.path(),
+                &exhausted_counter,
+                2,
+            )
+            .expect_err("the process-local segment counter must not wrap to zero");
+        assert!(matches!(
+            err,
+            TsinkError::UnsupportedOperation {
+                operation: "incremental registry segment allocation",
+                ..
+            }
+        ));
+        assert_eq!(exhausted_counter.load(Ordering::Relaxed), u64::MAX);
+        assert!(!exhausted_counter_dir
+            .path()
+            .join(format!(
+                "{REGISTRY_INCREMENTAL_SEGMENT_PREFIX}{:016x}{REGISTRY_INCREMENTAL_SEGMENT_SUFFIX}",
+                0u64
+            ))
+            .exists());
+
+        let durable_max_dir = TempDir::new().unwrap();
+        fs::write(
+            durable_max_dir.path().join(format!(
+                "{REGISTRY_INCREMENTAL_SEGMENT_PREFIX}{:016x}{REGISTRY_INCREMENTAL_SEGMENT_SUFFIX}",
+                u64::MAX
+            )),
+            b"durable-delta",
+        )
+        .unwrap();
+        let restarted_counter = AtomicU64::new(1);
+        let err =
+            SeriesRegistry::allocate_incremental_segment_path_with_counter_and_namespace_limit(
+                durable_max_dir.path(),
+                &restarted_counter,
+                2,
+            )
+            .expect_err("a durable maximum nonce must exhaust monotonic restart allocation");
+        assert!(matches!(
+            err,
+            TsinkError::UnsupportedOperation {
+                operation: "incremental registry segment allocation",
+                ..
+            }
+        ));
+        assert_eq!(restarted_counter.load(Ordering::Relaxed), 1);
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use serde::ser::SerializeSeq;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::VecDeque;
@@ -6,7 +7,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tsink::{
     DiskCategory, LocalDiskBudget, QueryBudgetError, QueryExecution, QueryMemoryReservation,
@@ -109,6 +110,36 @@ pub struct ClusterAuditQuery {
     pub since_unix_ms: Option<u64>,
     pub until_unix_ms: Option<u64>,
     pub limit: Option<usize>,
+}
+
+/// Allocation-free newest-first audit view held on one coherent log generation.
+///
+/// This support-status projection intentionally retains the audit mutex while it is serialized.
+/// That lets callers stream arbitrary nested JSON targets without cloning a second dynamic tree.
+#[derive(Debug)]
+#[must_use = "dropping the borrowed audit snapshot releases the audit-log lock"]
+pub(crate) struct BorrowedClusterAuditSnapshot<'a> {
+    state: MutexGuard<'a, ClusterAuditState>,
+    count: usize,
+}
+
+impl BorrowedClusterAuditSnapshot<'_> {
+    pub(crate) fn record_count(&self) -> usize {
+        self.count
+    }
+}
+
+impl Serialize for BorrowedClusterAuditSnapshot<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.count))?;
+        for record in self.state.entries.iter().rev().take(self.count) {
+            sequence.serialize_element(record)?;
+        }
+        sequence.end()
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -769,6 +800,28 @@ impl ClusterAuditLog {
         entries
     }
 
+    /// Borrows the latest records without cloning their strings or nested JSON targets.
+    ///
+    /// The returned guard preserves the support endpoint's fixed, unfiltered newest-first query
+    /// as one generation across both serialization passes. The query execution is checked before
+    /// and after lock acquisition; serialization itself is cancellation-aware through the
+    /// caller's controlled writer.
+    pub(crate) fn latest_snapshot_with_execution(
+        &self,
+        limit: usize,
+        execution: &QueryExecution,
+    ) -> Result<BorrowedClusterAuditSnapshot<'_>, QueryBudgetError> {
+        execution.checkpoint()?;
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        execution.checkpoint()?;
+        let effective_limit = limit.max(1).min(self.config.max_query_limit);
+        let count = effective_limit.min(state.entries.len());
+        Ok(BorrowedClusterAuditSnapshot { state, count })
+    }
+
     pub fn export_jsonl(&self, query: &ClusterAuditQuery) -> Result<Vec<u8>, String> {
         let mut records = self.query(query);
         records.reverse();
@@ -1071,6 +1124,163 @@ mod tests {
             target: json!({"path": "/api/v1/admin/cluster/test"}),
             outcome: outcome("success", 200),
         }
+    }
+
+    #[test]
+    fn latest_borrowed_snapshot_preserves_legacy_order_limit_and_nested_json() {
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let log = ClusterAuditLog::open(
+            temp_dir.path().join("borrowed-audit.log"),
+            ClusterAuditConfig {
+                max_query_limit: 2,
+                ..ClusterAuditConfig::default()
+            },
+        )
+        .expect("audit log should open");
+        let now_ms = unix_timestamp_millis();
+        let timestamps = [
+            now_ms.saturating_add(300),
+            now_ms.saturating_add(100),
+            now_ms.saturating_add(200),
+        ];
+        for index in 0..3u64 {
+            log.append(ClusterAuditEntryInput {
+                timestamp_unix_ms: Some(timestamps[index as usize]),
+                operation: format!("operation-{index}"),
+                actor: ClusterAuditActor {
+                    id: format!("actor-{index}-α-\"-\n"),
+                    auth_scope: "admin".to_string(),
+                },
+                target: json!({
+                    "nested": {
+                        "index": index,
+                        "labels": ["alpha", {"escaped": "quote-\"-newline-\n"}]
+                    }
+                }),
+                outcome: ClusterAuditOutcome {
+                    status: "success".to_string(),
+                    http_status: 200,
+                    result: (index != 1).then(|| format!("result-{index}")),
+                    error_type: (index == 1).then(|| "fixture_error".to_string()),
+                },
+            })
+            .expect("audit fixture should append");
+        }
+        let budget = QueryBudget::new(QueryBudgetLimits::default()).expect("budget should build");
+        let execution = budget
+            .begin_query()
+            .expect("borrowed audit query should admit");
+
+        let snapshot = log
+            .latest_snapshot_with_execution(50, &execution)
+            .expect("borrowed audit snapshot should succeed");
+        assert_eq!(snapshot.record_count(), 2);
+        assert!(
+            log.state.try_lock().is_err(),
+            "the borrowed generation must retain the audit lock through serialization"
+        );
+        let current = serde_json::to_value(&snapshot)
+            .expect("borrowed audit snapshot should serialize nested targets");
+        assert_eq!(current[0]["operation"], "operation-2");
+        assert_eq!(current[1]["operation"], "operation-1");
+        assert_eq!(current[1]["timestampUnixMs"], timestamps[1]);
+        assert!(current[1]["outcome"].get("result").is_none());
+        assert_eq!(current[1]["outcome"]["errorType"], "fixture_error");
+        assert_eq!(
+            current[0]["target"]["nested"]["labels"][1]["escaped"],
+            "quote-\"-newline-\n"
+        );
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        drop(snapshot);
+        assert!(log.state.try_lock().is_ok());
+
+        let legacy = log.query(&ClusterAuditQuery {
+            limit: Some(50),
+            ..ClusterAuditQuery::default()
+        });
+        assert_eq!(
+            current,
+            serde_json::to_value(legacy).expect("legacy audit snapshot should serialize")
+        );
+        drop(execution);
+        let after = budget.snapshot();
+        assert_eq!(after.active_queries, 0);
+        assert_eq!(after.shared_reserved_memory_bytes, 0);
+        assert_eq!(after.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn latest_borrowed_snapshot_honors_precancellation_and_releases_the_lock() {
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let log = ClusterAuditLog::open(
+            temp_dir.path().join("cancelled-borrowed-audit.log"),
+            ClusterAuditConfig::default(),
+        )
+        .expect("audit log should open");
+        log.append(input(100, "cancelled"))
+            .expect("audit fixture should append");
+        let budget = QueryBudget::new(QueryBudgetLimits::default()).expect("budget should build");
+        let token = QueryCancellationToken::new();
+        let execution = budget
+            .begin_query_with_token(token.clone())
+            .expect("cancelled borrowed audit query should admit");
+        token.cancel();
+
+        let error = log
+            .latest_snapshot_with_execution(50, &execution)
+            .expect_err("pre-cancelled borrowed audit snapshot should stop before locking");
+        assert!(matches!(error, QueryBudgetError::Cancelled));
+        assert!(log.state.try_lock().is_ok());
+        assert_eq!(execution.snapshot().memory_reserved_bytes, 0);
+        drop(execution);
+        let after = budget.snapshot();
+        assert_eq!(after.active_queries, 0);
+        assert_eq!(after.shared_reserved_memory_bytes, 0);
+        assert_eq!(after.cancellations_total, 1);
+        assert_eq!(after.accounting_invariant_violations_total, 0);
+    }
+
+    #[test]
+    fn latest_borrowed_snapshot_recovers_a_poisoned_lock_like_the_legacy_query() {
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let log = ClusterAuditLog::open(
+            temp_dir.path().join("poisoned-borrowed-audit.log"),
+            ClusterAuditConfig::default(),
+        )
+        .expect("audit log should open");
+        log.append(input(unix_timestamp_millis(), "poison-recovery"))
+            .expect("audit fixture should append");
+        let poisoned_log = log.clone();
+        assert!(thread::spawn(move || {
+            let _guard = poisoned_log
+                .state
+                .lock()
+                .expect("audit state lock should initially be available");
+            panic!("poison the cluster audit state lock");
+        })
+        .join()
+        .is_err());
+
+        let budget = QueryBudget::new(QueryBudgetLimits::default()).expect("budget should build");
+        let execution = budget
+            .begin_query()
+            .expect("poison-recovery audit query should admit");
+        let snapshot = log
+            .latest_snapshot_with_execution(50, &execution)
+            .expect("borrowed audit snapshot should recover the poisoned state lock");
+        assert_eq!(snapshot.record_count(), 1);
+        assert_eq!(
+            serde_json::to_value(&snapshot).expect("recovered snapshot should serialize")[0]
+                ["operation"],
+            "poison-recovery"
+        );
+        drop(snapshot);
+        assert_eq!(log.query(&ClusterAuditQuery::default()).len(), 1);
+        drop(execution);
+        let after = budget.snapshot();
+        assert_eq!(after.active_queries, 0);
+        assert_eq!(after.shared_reserved_memory_bytes, 0);
+        assert_eq!(after.accounting_invariant_violations_total, 0);
     }
 
     fn category_bytes(snapshot: &tsink::LocalDiskBudgetSnapshot, category: DiskCategory) -> u64 {

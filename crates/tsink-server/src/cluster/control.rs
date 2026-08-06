@@ -1491,28 +1491,29 @@ pub(crate) fn modeled_control_metrics_projection_retained_bytes(
 pub(crate) fn modeled_control_status_projection_retained_bytes(
     projection: &ControlStatusProjection,
 ) -> u64 {
-    modeled_control_metrics_vec_bytes::<ShardHandoffSnapshot>(projection.handoff.shards.capacity())
-        .saturating_add(
-            projection
-                .handoff
-                .shards
-                .iter()
-                .fold(0u64, |retained_bytes, shard| {
-                    retained_bytes
-                        .saturating_add(modeled_control_metrics_string_bytes(&shard.from_node_id))
-                        .saturating_add(modeled_control_metrics_string_bytes(&shard.to_node_id))
-                        .saturating_add(
-                            shard
-                                .last_error
-                                .as_ref()
-                                .map(modeled_control_metrics_string_bytes)
-                                .unwrap_or(0),
-                        )
-                }),
-        )
-        .saturating_add(modeled_control_metrics_vec_bytes::<
-            ControlHotspotShardSnapshot,
-        >(projection.hotspot.handoff_shards.capacity()))
+    modeled_cluster_handoff_snapshot_retained_bytes(&projection.handoff).saturating_add(
+        modeled_control_metrics_vec_bytes::<ControlHotspotShardSnapshot>(
+            projection.hotspot.handoff_shards.capacity(),
+        ),
+    )
+}
+
+pub(crate) fn modeled_cluster_handoff_snapshot_retained_bytes(
+    handoff: &ClusterHandoffSnapshot,
+) -> u64 {
+    modeled_control_metrics_vec_bytes::<ShardHandoffSnapshot>(handoff.shards.capacity())
+        .saturating_add(handoff.shards.iter().fold(0u64, |retained_bytes, shard| {
+            retained_bytes
+                .saturating_add(modeled_control_metrics_string_bytes(&shard.from_node_id))
+                .saturating_add(modeled_control_metrics_string_bytes(&shard.to_node_id))
+                .saturating_add(
+                    shard
+                        .last_error
+                        .as_ref()
+                        .map(modeled_control_metrics_string_bytes)
+                        .unwrap_or(0),
+                )
+        }))
 }
 
 fn modeled_control_rebalance_projection_retained_bytes(

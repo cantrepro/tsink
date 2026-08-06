@@ -141,6 +141,25 @@ impl ChunkStorage {
             .reset();
     }
 
+    pub(in crate::engine::storage_engine) fn advance_finite_post_flush_clean_fence(
+        &self,
+        data_path: &Path,
+        max_items: usize,
+        max_bytes: u64,
+    ) -> Result<BackgroundPostFlushCleanFenceStep> {
+        advance_background_post_flush_clean_fence(
+            &mut self
+                .coordination
+                .background_post_flush_clean_fence_cursor
+                .lock(),
+            data_path,
+            self.coordination.post_flush_marker_generation.as_ref(),
+            max_items,
+            max_bytes,
+            |bytes| self.remote_catalog_memory_reservation(bytes),
+        )
+    }
+
     pub(in super::super) fn run_live_metadata_reconciliation_page(&self) -> Result<bool> {
         let max_items = self.runtime.maintenance_max_items_per_pass;
         let max_bytes = self.runtime.maintenance_max_bytes_per_pass;
