@@ -1437,6 +1437,7 @@ fn decode_value_codec(raw: u8) -> Result<ValueCodecId> {
         4 => Ok(ValueCodecId::ConstantRle),
         5 => Ok(ValueCodecId::BoolBitpack),
         6 => Ok(ValueCodecId::BytesDeltaBlock),
+        7 => Ok(ValueCodecId::AlpF64),
         _ => Err(TsinkError::DataCorruption(format!(
             "invalid value codec id {raw}"
         ))),
