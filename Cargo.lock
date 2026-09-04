@@ -657,10 +657,11 @@ dependencies = [
 
 [[package]]
 name = "fastalp"
-version = "0.1.39"
+version = "0.1.41"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a61c13d8faa473b468ad6a561476d22e94aeef17f0f68dd152e7ee270ed4f2e5"
+checksum = "e25e7bfb5407c30e0f22524009c76231286b47c96c23929843f67bda0ff7009e"
 dependencies = [
+ "fearless_simd",
  "thiserror",
 ]
 
@@ -669,6 +670,12 @@ name = "fastrand"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
+
+[[package]]
+name = "fearless_simd"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f4beca3cb2444e3304ac30843cc091f44ed58932353cd492ce740067bfce6b12"
 
 [[package]]
 name = "find-msvc-tools"
