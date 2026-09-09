@@ -31,7 +31,7 @@ impl SeriesValueFamily {
         payload: &[u8],
     ) -> Result<Self> {
         match value_codec {
-            ValueCodecId::GorillaXorF64 => {
+            ValueCodecId::GorillaXorF64 | ValueCodecId::AlpF64 => {
                 if lane != ValueLane::Numeric {
                     return Err(TsinkError::DataCorruption(
                         "f64 codec stored in blob lane".to_string(),

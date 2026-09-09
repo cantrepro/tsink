@@ -14,6 +14,9 @@ pub(super) fn choose_best_value_codec<P: EncodablePoint>(
     match family {
         ValueFamily::F64 => {
             candidates.push((ValueCodecId::GorillaXorF64, encode_values_f64_xor(points)?));
+            if let Ok(alp_payload) = encode_values_f64_alp(points) {
+                candidates.push((ValueCodecId::AlpF64, alp_payload));
+            }
         }
         ValueFamily::I64 => {
             candidates.push((
@@ -187,6 +190,22 @@ pub(super) fn encode_values_f64_xor<P: EncodablePoint>(points: &[P]) -> Result<V
     Ok(out)
 }
 
+pub(super) fn encode_values_f64_alp<P: EncodablePoint>(points: &[P]) -> Result<Vec<u8>> {
+    let mut values = Vec::with_capacity(points.len());
+    for point in points {
+        match point.value() {
+            Value::F64(v) => values.push(*v),
+            value => {
+                return Err(TsinkError::ValueTypeMismatch {
+                    expected: "f64".to_string(),
+                    actual: value.kind().to_string(),
+                });
+            }
+        }
+    }
+    Ok(fastalp::compress(&values))
+}
+
 fn encode_values_i64_delta<P: EncodablePoint>(points: &[P]) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     let first = match points.first() {
@@ -322,6 +341,7 @@ pub(super) fn decode_values(
     match codec {
         ValueCodecId::ConstantRle => decode_values_constant_rle(payload, point_count),
         ValueCodecId::GorillaXorF64 => decode_values_f64_xor(payload, point_count),
+        ValueCodecId::AlpF64 => decode_values_f64_alp(payload, point_count),
         ValueCodecId::ZigZagDeltaBitpackI64 => decode_values_i64_delta(payload, point_count),
         ValueCodecId::DeltaBitpackU64 => decode_values_u64_delta(payload, point_count),
         ValueCodecId::BoolBitpack => decode_values_bool_bitpack(payload, point_count),
@@ -350,6 +370,9 @@ pub(super) fn decode_values_in_index_range(
         ValueCodecId::ConstantRle => decode_values_constant_rle_range(payload, start_idx, end_idx),
         ValueCodecId::GorillaXorF64 => {
             decode_values_f64_xor_range(payload, point_count, start_idx, end_idx)
+        }
+        ValueCodecId::AlpF64 => {
+            decode_values_f64_alp_range(payload, point_count, start_idx, end_idx)
         }
         ValueCodecId::ZigZagDeltaBitpackI64 => {
             decode_values_i64_delta_range(payload, point_count, start_idx, end_idx)
@@ -484,6 +507,48 @@ fn decode_values_f64_xor_in_range(
     }
 
     Ok(out)
+}
+
+pub(super) fn decode_values_f64_alp(payload: &[u8], point_count: usize) -> Result<Vec<Value>> {
+    decode_values_f64_alp_in_range(payload, point_count, 0, point_count)
+}
+
+pub(super) fn decode_values_f64_alp_range(
+    payload: &[u8],
+    point_count: usize,
+    start_idx: usize,
+    end_idx: usize,
+) -> Result<Vec<Value>> {
+    decode_values_f64_alp_in_range(payload, point_count, start_idx, end_idx)
+}
+
+fn decode_values_f64_alp_in_range(
+    payload: &[u8],
+    point_count: usize,
+    start_idx: usize,
+    end_idx: usize,
+) -> Result<Vec<Value>> {
+    if point_count == 0 || start_idx >= end_idx {
+        return Ok(Vec::new());
+    }
+    if end_idx > point_count {
+        return Err(TsinkError::DataCorruption(format!(
+            "value index range [{start_idx}, {end_idx}) exceeds point count {point_count}",
+        )));
+    }
+    let decompressed: Vec<f64> = fastalp::decompress(payload)
+        .map_err(|e| TsinkError::DataCorruption(format!("fastalp decompression failed: {e}")))?;
+    if decompressed.len() != point_count {
+        return Err(TsinkError::DataCorruption(format!(
+            "fastalp decoded point count mismatch: expected {point_count}, got {}",
+            decompressed.len()
+        )));
+    }
+    Ok(decompressed[start_idx..end_idx]
+        .iter()
+        .copied()
+        .map(Value::F64)
+        .collect())
 }
 
 fn decode_values_i64_delta(payload: &[u8], point_count: usize) -> Result<Vec<Value>> {

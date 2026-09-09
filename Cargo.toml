@@ -35,6 +35,7 @@ chrono = "0.4"
 async-channel = "2.5"
 roaring = "0.11"
 zstd = "0.13"
+fastalp = "0.1.42"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -54,6 +55,10 @@ harness = false
 
 [[bench]]
 name = "workload"
+harness = false
+
+[[bench]]
+name = "f64_codec_bench"
 harness = false
 
 [profile.release]

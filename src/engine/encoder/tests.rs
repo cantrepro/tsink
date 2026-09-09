@@ -1,4 +1,7 @@
-use super::{decode_values_f64_xor, decode_values_f64_xor_range, encode_values_f64_xor, Encoder};
+use super::{
+    decode_values_f64_alp, decode_values_f64_alp_range, decode_values_f64_xor,
+    decode_values_f64_xor_range, encode_values_f64_alp, encode_values_f64_xor, Encoder,
+};
 use crate::engine::chunk::{ChunkPoint, TimestampCodecId, ValueCodecId, ValueLane};
 use crate::{
     DataPoint, HistogramBucketSpan, HistogramCount, HistogramResetHint, NativeHistogram,
@@ -119,6 +122,60 @@ fn gorilla_f64_range_decode_matches_full_decode_slice() {
     let ranged = decode_values_f64_xor_range(&payload, points.len(), start, end).unwrap();
 
     assert_eq!(ranged, full[start..end].to_vec());
+}
+
+#[test]
+fn alp_f64_roundtrip_and_compression() {
+    let values = (0..256)
+        .map(|idx| Value::F64(20.0 + (idx as f64) * 0.125))
+        .collect::<Vec<_>>();
+    let timestamps = (0..256).map(|idx| idx as i64).collect::<Vec<_>>();
+    let points = chunk_points(&timestamps, values);
+
+    let payload = encode_values_f64_alp(&points).unwrap();
+    assert!(
+        payload.len() < points.len().saturating_mul(8),
+        "expected ALP compression to beat raw 8-byte/value, got {} bytes for {} values",
+        payload.len(),
+        points.len()
+    );
+
+    let decoded = decode_values_f64_alp(&payload, points.len()).unwrap();
+    let expected = points
+        .iter()
+        .map(|point| point.value.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(decoded, expected);
+}
+
+#[test]
+fn alp_f64_range_decode_matches_full_decode_slice() {
+    let values = (0..128)
+        .map(|idx| Value::F64(1_000.0 + (idx as f64) * 0.25))
+        .collect::<Vec<_>>();
+    let timestamps = (0..128).map(|idx| idx as i64).collect::<Vec<_>>();
+    let points = chunk_points(&timestamps, values);
+
+    let payload = encode_values_f64_alp(&points).unwrap();
+    let full = decode_values_f64_alp(&payload, points.len()).unwrap();
+    let start = 11usize;
+    let end = 97usize;
+    let ranged = decode_values_f64_alp_range(&payload, points.len(), start, end).unwrap();
+
+    assert_eq!(ranged, full[start..end].to_vec());
+}
+
+#[test]
+fn adaptive_f64_chooses_alp_when_smaller() {
+    let points = (0..256)
+        .map(|idx| DataPoint::new(idx as i64, Value::F64(20.0 + (idx as f64) * 0.1)))
+        .collect::<Vec<_>>();
+
+    let encoded = Encoder::encode(&points).unwrap();
+    assert_eq!(encoded.value_codec, ValueCodecId::AlpF64);
+
+    let decoded = Encoder::decode(&encoded).unwrap();
+    assert_eq!(decoded, points);
 }
 
 #[test]

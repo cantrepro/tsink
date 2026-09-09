@@ -32,6 +32,7 @@ pub enum ValueCodecId {
     ConstantRle = 4,
     BoolBitpack = 5,
     BytesDeltaBlock = 6,
+    AlpF64 = 7,
 }
 
 #[derive(Debug, Clone)]

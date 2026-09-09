@@ -15,10 +15,11 @@ use self::timestamps::{
     decode_fixed_step_timestamp_block, decode_timestamps, split_chunk_payload,
 };
 use self::values::{
-    choose_best_value_codec, decode_values, decode_values_in_index_range, infer_value_family,
+    choose_best_value_codec, decode_values, decode_values_f64_alp, decode_values_f64_xor,
+    decode_values_in_index_range, encode_values_f64_alp, encode_values_f64_xor, infer_value_family,
 };
 #[cfg(test)]
-use self::values::{decode_values_f64_xor, decode_values_f64_xor_range, encode_values_f64_xor};
+use self::values::{decode_values_f64_alp_range, decode_values_f64_xor_range};
 
 #[derive(Debug, Clone)]
 pub struct EncodedChunk {
@@ -204,6 +205,22 @@ impl Encoder {
                 .map(|point| DataPoint::new(point.ts, point.value))
                 .collect()
         })
+    }
+
+    pub fn encode_f64_gorilla(points: &[DataPoint]) -> Result<Vec<u8>> {
+        encode_values_f64_xor(points)
+    }
+
+    pub fn decode_f64_gorilla(payload: &[u8], point_count: usize) -> Result<Vec<Value>> {
+        decode_values_f64_xor(payload, point_count)
+    }
+
+    pub fn encode_f64_alp(points: &[DataPoint]) -> Result<Vec<u8>> {
+        encode_values_f64_alp(points)
+    }
+
+    pub fn decode_f64_alp(payload: &[u8], point_count: usize) -> Result<Vec<Value>> {
+        decode_values_f64_alp(payload, point_count)
     }
 
     pub fn encode_chunk_points(points: &[ChunkPoint], lane: ValueLane) -> Result<EncodedChunk> {
