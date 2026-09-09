@@ -35,7 +35,7 @@ chrono = "0.4"
 async-channel = "2.5"
 roaring = "0.11"
 zstd = "0.13"
-fastalp = "0.1.41"
+fastalp = "0.1.42"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
